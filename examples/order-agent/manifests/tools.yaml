@@ -1,0 +1,41 @@
+# What each tool does to the world, and how to undo it.
+- tool: lookup_customer
+  effect: read_only
+  permission: customers:read
+
+- tool: create_order
+  description: Create an order in the shop backend
+  effect: reversible
+  permission: orders:write
+  compensation:
+    tool: cancel_order
+    argument_map:
+      order_id: $result.order_id
+
+- tool: cancel_order
+  effect: idempotent
+  permission: orders:write
+
+- tool: charge_card
+  description: Charge the customer. A refund undoes the money movement but leaves a line on the statement.
+  effect: compensable
+  permission: payments:write
+  requires: [create_order]
+  compensation:
+    tool: refund
+    argument_map:
+      charge_id: $result.charge_id
+      amount: $args.amount
+
+- tool: refund
+  effect: idempotent
+  permission: payments:write
+
+- tool: send_confirmation_email
+  description: Email the customer. Once sent, it cannot be recalled.
+  effect: irreversible
+  permission: mail:send
+
+- tool: delete_customer
+  effect: irreversible
+  permission: customers:admin

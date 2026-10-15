@@ -1,0 +1,11 @@
+dev-plan/
+dev-plan/*
+node_modules/
+dist/
+out/
+__pycache__/
+*.egg-info/
+.DS_Store
+CLAUDE.md
+CLAUDE.local.md
+.claude/

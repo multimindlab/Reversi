@@ -1,0 +1,36 @@
+---
+title: Security model
+description: Who can do what, and what Reversi assumes.
+---
+
+## Two planes
+
+| Plane | Who | Can |
+|---|---|---|
+| **Agent** | agent keys | open runs, request tool calls (`intents`), report outcomes, read own runs |
+| **Operator** | operator keys | plan, roll back, grant approvals, export, verify |
+
+An agent cannot approve its own irreversible call or trigger a rollback. The server enforces this by key role, and
+the agent key's name becomes the ledger `actor`; a request body cannot choose another actor. Agents only see runs they opened.
+
+## Approvals
+
+Calls to tools with `approval: always` (all irreversible tools) are blocked until an operator posts a **single-use
+grant** for that run and tool. Grants live in server memory: a restart revokes them, which fails safe.
+
+## Scopes
+
+A run is opened with a set of permissions, sealed with a SHA-256 digest. Each call checks the tool's `permission`
+against the scope. A key may carry `max_permissions`, capping what runs it opens can request. Narrowing a scope is
+allowed; the child seal records its parent. If stored run state is edited, the seal no longer matches and calls block.
+
+## Observe mode
+
+`mode: observe` journals policy violations as `would_block` and lets the call run. Use it to learn what an agent does
+before you enforce anything.
+
+## Assumptions you must own
+
+- The server's data directory and key file are protected from the agent.
+- Manifests are written by someone who understands the tool; MCP-style self-declared hints are not trusted.
+- API keys are sent over TLS (the server speaks HTTP; terminate TLS in front of it).

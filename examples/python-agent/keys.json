@@ -1,0 +1,4 @@
+[
+  { "name": "python-agent", "role": "agent", "key": "agent-demo-key" },
+  { "name": "operator", "role": "operator", "key": "operator-demo-key" }
+]

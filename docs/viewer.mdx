@@ -1,0 +1,10 @@
+---
+title: Trace viewer
+description: A single HTML file that verifies a ledger and shows the timeline.
+---
+
+Open `viewer/index.html` in a browser, then drop a `ledger.jsonl`. It runs entirely locally with WebCrypto, so
+nothing is uploaded. It verifies the chain, flags the first bad record, and filters by run or to problems only
+(`blocked`, `would_block`, `failed`, `uncertain`, `unrecoverable`, `deferred`).
+
+It needs a secure context for `crypto.subtle`; opening the file directly or serving it over HTTPS works.

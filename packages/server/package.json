@@ -1,0 +1,20 @@
+{
+  "name": "@multimindlab/reversi-server",
+  "version": "0.1.0",
+  "description": "HTTP API for Reversi: journal tool calls, plan and run rollbacks, export evidence",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/multimindlab/reversi.git", "directory": "packages/server" },
+  "homepage": "https://reversi.multimind.dev",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "bin": { "reversi-server": "dist/main.js" },
+  "files": ["dist"],
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@hono/node-server": "^1.19.0",
+    "@multimindlab/reversi": "0.1.0",
+    "hono": "^4.9.0"
+  }
+}

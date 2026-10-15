@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reversi-sdk"
+version = "0.1.0"
+description = "Python SDK for Reversi: reversibility, approvals and tamper-evident audit evidence for AI agent tool calls"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://reversi.multimind.dev"
+Documentation = "https://reversi-docs.multimind.dev"
+Repository = "https://github.com/multimindlab/reversi"
+
+[tool.setuptools]
+packages = ["reversi_sdk"]

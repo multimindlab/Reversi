@@ -1,0 +1,100 @@
+[
+  {
+    "value": null,
+    "hash": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+    "value": true,
+    "hash": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b"
+  },
+  {
+    "value": false,
+    "hash": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+  },
+  {
+    "value": 0,
+    "hash": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  },
+  {
+    "value": -1,
+    "hash": "1bad6b8cf97131fceab8543e81f7757195fbb1d36b376ee994ad1cf17699c464"
+  },
+  {
+    "value": 42,
+    "hash": "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"
+  },
+  {
+    "value": 1.5,
+    "hash": "9f29a130438b81170b92a42650f9a94291ecad60bd47af2a3886e75f7f728725"
+  },
+  {
+    "value": 0.1,
+    "hash": "14be4b45f18e0d8c67b4f719b5144eee88497e413709d11d85b096d8e2346310"
+  },
+  {
+    "value": 100,
+    "hash": "ad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306"
+  },
+  {
+    "value": "",
+    "hash": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+  },
+  {
+    "value": "abc",
+    "hash": "6cc43f858fbb763301637b5af970e2a46b46f461f27e5a0f41e009c59b827b25"
+  },
+  {
+    "value": "héllo ✓ 😀",
+    "hash": "8915200086f20c01297fd89616f5861b70f5727cd32dfcc34677b86b8bcba5fa"
+  },
+  {
+    "value": "quote \" back \\ nl \n tab \t ctl \u0001",
+    "hash": "fcbdf01ad121fe53dd271407af39ea0b8dc4d35fbfaf422eae7fd6ed5a2166a9"
+  },
+  {
+    "value": [],
+    "hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  {
+    "value": {},
+    "hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+    "value": [
+      1,
+      "a",
+      null
+    ],
+    "hash": "6f9c54658fdbc2f155e7105e0ad633c8c03e83b677a6b8a5dfb7541264b83622"
+  },
+  {
+    "value": {
+      "b": 1,
+      "a": {
+        "d": [
+          3,
+          {
+            "z": 1,
+            "y": 2
+          }
+        ],
+        "c": "x"
+      }
+    },
+    "hash": "16e087361bff74c7fa7f7910fb9b56dedab630d1a3706fea9acb0a4477f69785"
+  },
+  {
+    "value": {
+      "ключ": 1,
+      "a": 2
+    },
+    "hash": "ed6d36f2c0d583e15eda2a8eeb5f25f667c56ecbe6fdba89d29e2ed1ae8a63eb"
+  },
+  {
+    "value": {
+      "😀": 1,
+      "￿": 2
+    },
+    "hash": "c6b1b96b618d8be475f379fe69c6646b44d7a5d3c01630c43509562f09d1024b"
+  }
+]

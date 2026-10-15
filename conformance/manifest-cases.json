@@ -1,0 +1,330 @@
+[
+  {
+    "input": {
+      "tool": "read_order",
+      "effect": "read_only",
+      "permission": "orders:read"
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "read_order",
+      "effect": "read_only",
+      "permission": "orders:read",
+      "approval": "never",
+      "requires": []
+    }
+  },
+  {
+    "input": {
+      "tool": "put_flag",
+      "effect": "idempotent",
+      "permission": "flags:write"
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "put_flag",
+      "effect": "idempotent",
+      "permission": "flags:write",
+      "approval": "never",
+      "requires": []
+    }
+  },
+  {
+    "input": {
+      "tool": "charge_card",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "compensation": {
+        "tool": "refund",
+        "argument_map": {
+          "charge_id": "$result.charge_id",
+          "amt": "$args.amount"
+        }
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "charge_card",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "approval": "never",
+      "requires": [],
+      "compensation": {
+        "tool": "refund",
+        "argument_map": {
+          "charge_id": "$result.charge_id",
+          "amt": "$args.amount"
+        },
+        "requires_approval": false
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "create_draft",
+      "effect": "reversible",
+      "permission": "docs:write",
+      "compensation": {
+        "tool": "delete_draft",
+        "argument_map": {}
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "create_draft",
+      "effect": "reversible",
+      "permission": "docs:write",
+      "approval": "never",
+      "requires": [],
+      "compensation": {
+        "tool": "delete_draft",
+        "argument_map": {},
+        "requires_approval": false
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "send_email",
+      "effect": "irreversible",
+      "permission": "mail:send"
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "send_email",
+      "effect": "irreversible",
+      "permission": "mail:send",
+      "approval": "always",
+      "requires": []
+    }
+  },
+  {
+    "input": {
+      "tool": "send_email",
+      "effect": "irreversible",
+      "permission": "mail:send",
+      "approval": "always"
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "send_email",
+      "effect": "irreversible",
+      "permission": "mail:send",
+      "approval": "always",
+      "requires": []
+    }
+  },
+  {
+    "input": {
+      "tool": "b",
+      "effect": "read_only",
+      "permission": "p",
+      "requires": [
+        "a"
+      ]
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "b",
+      "effect": "read_only",
+      "permission": "p",
+      "approval": "never",
+      "requires": [
+        "a"
+      ]
+    }
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "compensable",
+      "permission": "p"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {}
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "irreversible",
+      "permission": "p",
+      "approval": "never"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "magic",
+      "permission": "p"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "",
+      "effect": "read_only",
+      "permission": "p"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "a b"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "colour": "red"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "compensable",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {
+          "a": "args.id"
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "compensable",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {
+          "a": "$args"
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "requires": [
+        "a",
+        "a"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "approval": "sometimes"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "a",
+      "effect": "reversible",
+      "permission": "p",
+      "compensation": {
+        "tool": "a",
+        "argument_map": {}
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "a",
+      "effect": "read_only",
+      "permission": "p",
+      "requires": [
+        "a"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "charge",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "compensation": {
+        "tool": "refund"
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "charge",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "approval": "never",
+      "requires": [],
+      "compensation": {
+        "tool": "refund",
+        "argument_map": {},
+        "requires_approval": false
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "description": 5
+    },
+    "valid": false
+  },
+  {
+    "input": [],
+    "valid": false
+  },
+  {
+    "input": "tool",
+    "valid": false
+  },
+  {
+    "input": null,
+    "valid": false
+  }
+]

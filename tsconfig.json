@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/reversi" },
+    { "path": "packages/server" },
+    { "path": "packages/cli" }
+  ]
+}

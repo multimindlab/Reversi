@@ -1,0 +1,34 @@
+---
+title: API overview
+description: HTTP API conventions.
+---
+
+Start the server:
+
+```bash
+REVERSI_MANIFESTS=./tools.yaml REVERSI_KEYS=./keys.json node packages/server/dist/main.js
+# optional: REVERSI_DATA=./reversi-data PORT=7421 HOST=127.0.0.1
+```
+
+`keys.json`:
+
+```json
+[
+  { "name": "support-agent", "role": "agent", "key": "…", "max_permissions": ["orders:write"] },
+  { "name": "ops", "role": "operator", "key_sha256": "<hex sha256 of the key>" }
+]
+```
+
+All `/v1` routes need `Authorization: Bearer <key>`. `GET /healthz` is open.
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid body or id |
+| 401 | Missing or unknown key |
+| 403 | Role or permission cap forbids it |
+| 404 | Unknown run (also for another agent's run) |
+| 409 | State conflict (duplicate run id, outcome already reported) |
+| 413 | Body over 1 MB |
+| 503 | Ledger unavailable; the request was refused (fail closed) |
+
+Policy refusals are **not** errors: `POST …/intents` returns 200 with `"decision": "block"`.

@@ -1,0 +1,46 @@
+---
+title: Rollback
+description: How Reversi undoes a run, and what it refuses to claim.
+---
+
+## Write-ahead journaling
+
+Before a tool runs, Reversi appends an `intended` record. After it runs, it appends the outcome. If journaling
+fails, the call **does not run**. If the process dies in between, the dangling `intended` shows exactly which
+effect needs reconciling. Such steps (and `uncertain` ones) are *unresolved*: rollback reports them and does not
+guess.
+
+## Order and dependencies
+
+Rollback walks steps newest first. A step is **never undone while a step that depends on it is still standing**:
+if the refund for a charge fails, the order that the charge `requires` is left alone, reported as *deferred*, and
+everything independent is still undone. Dependencies come from `requires` and from an explicit `depends_on` on a call.
+
+## Idempotent and resumable
+
+Running rollback again skips what is already compensated and retries failures. Each step has a stable
+**idempotency key** (`sha256` of run, step and tool) that you pass downstream so a retried refund does not refund twice.
+
+## The report
+
+| Bucket | Meaning |
+|---|---|
+| `compensated` | Undone |
+| `skipped` | Needed no undo |
+| `failed` | Undo attempted and failed; will be retried |
+| `deferred` | Waiting for a dependent step |
+| `unrecoverable` | Irreversible, or compensation arguments were unavailable |
+| `unresolved` | Outcome unknown; reconcile with the downstream system |
+| `unmanifested` | No manifest existed, so the effect is unknown |
+| `awaiting_approval` | Compensation needs an operator grant |
+
+`complete` is true only if every bucket except `compensated` and `skipped` is empty.
+
+<Warning>
+Compensation is business-level undo, not a database rollback. A refund after an email went out does not unsend the email.
+</Warning>
+
+## Plan first
+
+`plan` simulates the rollback assuming every compensation succeeds and executes nothing:
+`reversi plan <run_id>` or `GET /v1/runs/{id}/plan`.
