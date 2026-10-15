@@ -1,0 +1,42 @@
+---
+title: MCP gateway
+description: Journal an MCP server's tool calls without changing the agent or the server. Observe mode only.
+---
+
+`reversi-gateway` is an MCP server that forwards to one upstream MCP server and journals every `tools/call`.
+Point your MCP client at the gateway instead of the upstream.
+
+```sh
+reversi-gateway --manifests ./manifests --data ./reversi-data \
+  --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+# or: --upstream-url https://example.com/mcp   (Streamable HTTP)
+```
+
+The gateway speaks MCP on stdio, so logs go to stderr.
+
+## What it does
+
+- `tools/list` is forwarded unchanged.
+- `tools/call`: the intent is journaled **before** the call is forwarded, the outcome after. The upstream result is
+  returned unchanged, including `isError` results (journaled as `failed`).
+- If the upstream call errors in transit, the step is `uncertain`, so rollback reports it as unresolved.
+- One gateway process is one run. Its data is the same `ledger.jsonl` and `runs/` the CLI reads, so
+  `reversi plan <run>` and `reversi rollback` work on it.
+- Compensation arguments (`$result.*`) resolve from `structuredContent`, or from a single text content block that
+  holds a JSON object.
+
+## Why a call was made
+
+MCP has no field for a reason, and every ledger record needs one. A client may send it in the call's
+`_meta["reversi/reason"]`. Otherwise the record says `MCP tools/call <tool>`.
+
+## Observe mode
+
+Nothing is blocked. A tool with no manifest, or a call outside the run's scope, is journaled as `would_block` and
+still runs. By default the scope is every permission named in your manifests. Enforcement and approvals are not
+built yet.
+
+## Limits
+
+One upstream per gateway, no tool namespacing, no approvals, no HTTP listener (stdio only), and no rollback tools
+exposed over MCP.

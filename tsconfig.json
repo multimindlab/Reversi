@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/reversi" },
     { "path": "packages/server" },
-    { "path": "packages/cli" }
+    { "path": "packages/cli" },
+    { "path": "packages/gateway" }
   ]
 }
