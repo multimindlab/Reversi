@@ -3,12 +3,25 @@ title: Limits
 description: What Reversi does not do. Read this before relying on it.
 ---
 
-- **Manifests are trusted.** Reversi cannot inspect what a tool really does. Wrong manifest, wrong guarantees.
-- **Compensation is not time travel.** Refunds leave statements, deletions can lose data. Irreversible stays irreversible.
-- **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not detectable from the file alone.
-- **Single writer.** The file-backed and SQLite ledgers and run stores assume one server process. Do not point two at the same directory or database.
-- **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path to the tools.
-- **No automatic discovery of side effects**, no semantic firewall (intent graphs, encoding detection). The [MCP gateway](/gateway) only observes: it does not enforce or ask for approval yet.
-- **Approvals are in memory** in the server and expire on restart.
-- **HTTP only.** Terminate TLS in front of the server.
-- **Python SDK** reads JSON manifests only and rejects some floats when hashing payloads (see its page).
+- **Manifests are trusted.** Reversi cannot inspect what a tool really does. Wrong manifest, wrong guarantees. It also cannot
+  discover side effects nobody declared.
+- **Compensation is not time travel.** Refunds leave statements, deletions can lose data, a Slack message may already have been
+  read. Irreversible stays irreversible, and compensation can fail: the report says so.
+- **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not
+  detectable from the data alone ([evidence](/concepts/evidence)).
+- **Policy regular expressions** are run against agent-supplied values. A pathological pattern written by a policy author can stall the process; keep patterns simple (policy files are trusted input).
+- **The HTTP API trusts the agent's reported outcomes** (results feed compensation arguments). Use the gateway when results must come from the system, not the agent.
+- **Content checks are heuristics.** They catch obvious credentials, hidden payloads and injection phrasing. A determined
+  adversary can phrase around them. They are one layer, not a firewall.
+- **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path.
+- **One driver per run.** Several processes can share a SQLite or PostgreSQL store and append to one ledger safely, but run state is
+  last-write-wins: do not drive the same run from two processes. With the `files` store, share the directory only between processes on one host, never over a network filesystem.
+- **Gateway scope.** It proxies `tools/call` and `tools/list`, not resources, prompts or sampling, and one session is one run.
+- **HTTP only.** Terminate TLS in front of the server and gateway.
+- **Console cannot run compensations.** It shows the plan; execution happens through the CLI, API or gateway.
+- **No OpenTelemetry export, no retention or purge policy, no hosted multi-tenant service.** Metrics, JSON logs and the ledger are
+  the operational record. Retention is yours to define with the store's own tools, and the ledger is append-only by design.
+- **Connectors cover four systems** (filesystem, GitHub, Slack, Stripe) and were tested against fakes of those APIs, not live
+  services. Verify each against a sandbox account before trusting it ([connectors](/connectors)).
+- **Python SDK** reads JSON manifests only, rejects some floats when hashing payloads, and cannot verify Ed25519 bundles.
+- **Docker and CI files** were written but not executed in the project's own test pass.

@@ -1,1 +1,3 @@
-export { createApp, Grants, type ApiKey, type AppOptions, type Role } from "./app.js";
+export { createApp, type AppOptions, type LogEntry } from "./app.js";
+export { KeyRing, OidcVerifier, ROLES, can, isAgent, type ApiKey, type Capability, type OidcOptions, type Principal, type Role } from "@multimindlab/reversi";
+export { Metrics } from "./metrics.js";

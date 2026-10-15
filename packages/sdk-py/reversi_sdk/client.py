@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import random
+import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
@@ -26,6 +29,15 @@ class Blocked(Exception):
     def __init__(self, reasons: List[str]):
         super().__init__("; ".join(reasons))
         self.reasons = reasons
+
+    @property
+    def approval_id(self) -> Optional[str]:
+        """The id of the pending approval request, if the call was blocked waiting for one.
+
+        Ask an approver to decide it, then retry the call: an approval is used exactly once.
+        """
+        m = re.search(r"request (apr_[0-9a-f-]+) is pending", "; ".join(self.reasons))
+        return m.group(1) if m else None
 
 
 class ReversiClient:
@@ -66,9 +78,33 @@ class ReversiClient:
     def run(self, run_id: str) -> "RunHandle":
         return RunHandle(self, run_id)
 
-    # --- operator plane ---
+    # --- read / approver / operator / admin plane (each needs a key with that role) ---
     def verify_ledger(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/ledger/verify")
+
+    def status(self) -> Dict[str, Any]:
+        return self._request("GET", "/v1/status")
+
+    def approvals(self, status: Optional[str] = None, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        q = "&".join(f"{k}={v}" for k, v in (("status", status), ("run_id", run_id)) if v)
+        return self._request("GET", "/v1/approvals" + (f"?{q}" if q else ""))["approvals"]
+
+    def approve(self, approval_id: str, note: Optional[str] = None) -> Dict[str, Any]:
+        return self._request("POST", f"/v1/approvals/{approval_id}/approve", {"note": note} if note else {})
+
+    def deny(self, approval_id: str, note: Optional[str] = None) -> Dict[str, Any]:
+        return self._request("POST", f"/v1/approvals/{approval_id}/deny", {"note": note} if note else {})
+
+    def halt(self, reason: str) -> Dict[str, Any]:
+        """Kill switch (admin): block every new call until resume()."""
+        return self._request("POST", "/v1/halt", {"reason": reason})
+
+    def resume(self) -> Dict[str, Any]:
+        return self._request("POST", "/v1/resume", {})
+
+    def ledger_bundle(self) -> Dict[str, Any]:
+        """Signed evidence bundle of the whole ledger. Verify it with `reversi verify-bundle`."""
+        return self._request("GET", "/v1/ledger/bundle")
 
 
 class RunHandle:
@@ -138,3 +174,71 @@ class RunHandle:
 
     def export_jsonl(self) -> str:
         return self._c._request("GET", self._p("/export"), raw=True)
+
+    def bundle(self) -> Dict[str, Any]:
+        return self._c._request("GET", self._p("/bundle"))
+
+    def report_html(self) -> str:
+        return self._c._request("GET", self._p("/report"), raw=True)
+
+    def resolve(self, step: int, status: str, note: str, result: Any = None, error: Optional[str] = None) -> Dict[str, Any]:
+        """Settle a step whose outcome was unknown, after checking the downstream system (operator)."""
+        body: Dict[str, Any] = {"status": status, "note": note}
+        if result is not None:
+            body["result"] = result
+        if error:
+            body["error"] = error
+        return self._c._request("POST", self._p(f"/steps/{step}/resolve"), body)
+
+    def tool(self, tool: str, reason: str) -> Callable[[Callable[[Any], Any]], Callable[..., Any]]:
+        """Decorator: every call to the function goes through this run.
+
+            @run.tool("create_order", "customer asked")
+            def create_order(args): ...
+            create_order(args={"sku": "A1"})
+        """
+        def deco(fn: Callable[[Any], Any]) -> Callable[..., Any]:
+            def wrapper(args: Any = None, **kw: Any) -> Any:
+                return self.call(tool, kw.pop("reason", reason), fn, args=args, **kw)
+            wrapper.__name__ = getattr(fn, "__name__", tool)
+            return wrapper
+        return deco
+
+    def rollback(self, compensate: Callable[[Dict[str, Any]], None], attempts: int = 3, base_delay: float = 0.25,
+                 sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
+        """Undo the run, newest step first (operator). `compensate(call)` performs one undo and raises on failure.
+
+        Failed compensations are retried with exponential backoff and the same idempotency key
+        (`call["idempotency_key"]`: pass it to the downstream API). Returns a report; `complete` is True
+        only if nothing was left undone or unexplained.
+        """
+        report: Dict[str, Any] = {"compensated": [], "failed": [], "deferred": [], "awaiting_approval": [],
+                                  "not_undoable": [], "complete": False}
+        for step in sorted((s["step"] for s in self.state()["steps"]), reverse=True):
+            start = self.begin_compensation(step)
+            d = start["decision"]
+            if d == "go":
+                err: Optional[str] = None
+                for attempt in range(1, max(1, attempts) + 1):
+                    try:
+                        compensate(start["call"])
+                        err = None
+                        break
+                    except Exception as e:  # noqa: BLE001 - any failure of the undo is reported, not hidden
+                        err = str(e)[:300]
+                        if attempt < attempts:
+                            sleep(min(5.0, base_delay * 2 ** (attempt - 1)) * (0.5 + random.random() / 2))
+                if err is None:
+                    self.complete_compensation(step, ok=True)
+                    report["compensated"].append(step)
+                else:
+                    self.complete_compensation(step, ok=False, error=err)
+                    report["failed"].append({"step": step, "error": err})
+            elif d == "defer":
+                report["deferred"].append(step)
+            elif d == "awaiting_approval":
+                report["awaiting_approval"].append(step)
+            elif d == "not_actionable" and start.get("kind") != "skip":
+                report["not_undoable"].append({"step": step, "kind": start.get("kind"), "note": start.get("note")})
+        report["complete"] = not (report["failed"] or report["deferred"] or report["awaiting_approval"] or report["not_undoable"])
+        return report

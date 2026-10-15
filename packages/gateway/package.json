@@ -1,19 +1,35 @@
 {
   "name": "@multimindlab/reversi-gateway",
   "version": "0.1.0",
-  "description": "MCP gateway for Reversi: journals tool calls to an upstream MCP server (observe mode)",
+  "description": "MCP gateway for Reversi: journals, polices and rolls back tool calls to upstream MCP servers",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/multimindlab/reversi.git", "directory": "packages/gateway" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/multimindlab/reversi.git",
+    "directory": "packages/gateway"
+  },
   "homepage": "https://reversi.multimind.dev",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "bin": { "reversi-gateway": "dist/main.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "reversi-gateway": "dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@multimindlab/reversi": "0.1.0"
+    "@multimindlab/reversi": "0.1.0",
+    "yaml": "^2.8.0"
   }
 }

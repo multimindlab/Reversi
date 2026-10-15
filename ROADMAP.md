@@ -1,5 +1,6 @@
 # Roadmap
 
-See [docs/roadmap.mdx](docs/roadmap.mdx). Built: manifests, write-ahead ledger, dependency-aware
-rollback, scopes, approvals, observe mode, CLI, HTTP API, Python SDK, trace viewer. Next: validate
-with MCP tool authors, then an MCP gateway (observe mode first).
+See [docs/roadmap.mdx](docs/roadmap.mdx) for what is built and what is not. In short: the engine, policy, approvals,
+content checks, signed evidence, three stores, the server with console, the MCP gateway, four connectors, the CLI and the
+Python SDK are built. Not built: OpenTelemetry traces, risk scoring and delegated approval, retention tooling, more
+connectors, framework adapters, a hosted service.

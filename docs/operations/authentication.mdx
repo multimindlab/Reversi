@@ -1,0 +1,55 @@
+---
+title: Authentication and roles
+description: API keys with rotation, OIDC bearer tokens, and what each role may do.
+---
+
+| Role | Capabilities |
+|---|---|
+| `agent` | Open runs, journal calls, read own runs |
+| `auditor` | Read runs, plans, ledger, evidence, metrics |
+| `approver` | Auditor + decide approvals |
+| `operator` | Approver + rollback, resolve |
+| `admin` | Operator + kill switch |
+
+A principal may have several roles. Agents are scoped to their own runs; every other role sees all runs.
+
+## API keys
+
+```json keys.json
+[
+  { "name": "support-agent", "role": "agent", "key_sha256": "<hex sha256 of the key>", "max_permissions": ["orders:write"] },
+  { "name": "alice", "role": "approver", "key_sha256": "…" },
+  { "name": "ops", "roles": ["operator"], "key_sha256": "…", "not_before": "2026-11-01T00:00:00Z", "expires_at": "2027-05-01T00:00:00Z" }
+]
+```
+
+`max_permissions` caps what an agent's runs may request. Agents open runs in `enforce` mode only; set `allow_observe: true` on a key to let it open `observe` runs (which let violating calls proceed, so keep it for lab agents).
+
+Hash keys (`printf '%s' "$KEY" | shasum -a 256`) rather than storing them. Generate keys with at least 128 bits of entropy
+(`openssl rand -hex 24`). Keys are compared in constant time across all entries.
+
+**Rotation without downtime:** add the new key under the same `name` with a `not_before`, give the old one an `expires_at`,
+hand out the new key, and remove the old entry later. The server reloads the file on `SIGHUP` or when it changes (checked
+every two seconds); a reload that fails to parse keeps the old keys. `disabled: true` switches a key off immediately.
+
+## OIDC
+
+Bearer JWTs from your identity provider:
+
+```bash
+REVERSI_OIDC_ISSUER=https://id.example.com/realm
+REVERSI_OIDC_AUDIENCE=reversi
+REVERSI_OIDC_ROLE_MAP='{"reversi-ops":"operator","reversi-approvers":"approver","bots":"agent"}'
+REVERSI_OIDC_ROLE_CLAIM=realm_access.roles     # default: roles
+```
+
+Checked on every request: signature against the issuer's JWKS (fetched from the discovery document, cached, refreshed at most
+every 10 seconds when an unknown `kid` appears), **RS256 or ES256 only** (never `none`, never HMAC), `iss`, `aud` containing your
+audience, `exp` and `nbf` (60 s skew). The principal's name is `sub`, or the claim named by `REVERSI_OIDC_ACTOR_CLAIM`. Tokens with no mapped role are rejected. The audience check is what stops a token minted for another service
+from working here: set it.
+
+The server also accepts API keys at the same time, which is handy for service accounts.
+
+## Console login
+
+Paste a key or token into the [console](/console) login form. A session is a signed cookie, re-checked against the key ring on every request: disabling, expiring or demoting the key ends or narrows the session at once. An OIDC session never outlives its token. Logging out invalidates the cookie.

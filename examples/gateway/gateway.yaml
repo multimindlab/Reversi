@@ -1,0 +1,11 @@
+# Run:  reversi-gateway --config examples/gateway/gateway.yaml --manifests examples/gateway/manifests \
+#         --policy examples/gateway/policy.yaml --data ./reversi-data
+# Point your MCP client (Claude Code, Cursor, ...) at the gateway instead of the filesystem server.
+mode: enforce          # observe first if you want to see what would be blocked
+actor: dev-laptop
+upstreams:
+  - name: fs
+    command: node
+    args: ["packages/connectors/dist/main.js", "serve", "fs", "--root", "./sandbox"]
+    namespace: false   # tools are already named fs.<tool>
+deny: ["fs.remove_dir"]

@@ -21,8 +21,41 @@ except Blocked as e:
 ```
 
 `call` journals the intent **before** running your function and the outcome after. Raise `EffectUncertain` when you
-cannot tell whether the effect happened. Operator methods (`plan`, `approve`, `begin_compensation`,
-`complete_compensation`, `export_jsonl`) need an operator key.
+cannot tell whether the effect happened.
+
+Decorate tools so every call goes through the run:
+
+```python
+@run.tool("create_order", "customer asked")
+def create_order(args): ...
+
+create_order({"sku": "BOOK-1"})
+```
+
+## Approvals
+
+When a call needs approval, `Blocked.approval_id` holds the request id. Ask an approver to decide it, then retry the same call:
+
+```python
+try:
+    run.call("refund", "customer asked", do_refund, args={"amount": 500})
+except Blocked as e:
+    notify(e.approval_id)
+
+approver = ReversiClient(url, "approver-key")
+approver.approvals(status="pending")
+approver.approve(approval_id, "checked the ticket")        # or approver.deny(...)
+```
+
+## Operator methods
+
+With an operator key: `run.plan()`, `run.rollback(compensate, attempts=3)` (retries with backoff and the **same**
+`call["idempotency_key"]`; returns a report whose `complete` is true only if nothing was left undone), `run.resolve(step,
+"succeeded", note, result=…)` for unknown outcomes, `run.begin_compensation` / `complete_compensation` for custom workers,
+`run.export_jsonl()`, `run.report_html()`, `run.bundle()` (signed evidence). With an admin key: `client.halt(reason)` and
+`client.resume()`. Auditors can use `client.approvals()`, `client.status()`, `client.verify_ledger()`, `client.ledger_bundle()`.
+
+Verify bundles with `reversi verify-bundle`: Ed25519 is not in the Python standard library.
 
 ## Offline tools (no server)
 

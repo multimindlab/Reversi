@@ -1,0 +1,42 @@
+# Policy for the filesystem example. Test it with:  reversi policy test examples/gateway/policy.yaml
+version: 1
+default: allow
+rules:
+  - id: no-secrets-dir
+    description: nothing may touch the secrets directory
+    match: { tool: "fs.*" }
+    when: [{ path: $args.path, op: matches, value: "^secrets/" }]
+    action: deny
+    reason: secrets/ is off limits
+  - id: big-writes-need-approval
+    match: { tool: fs.write_file }
+    when: [{ path: $args.path, op: matches, value: "\\.(env|pem|key)$" }]
+    action: require_approval
+    reason: credential-like file
+limits:
+  - id: write-burst
+    match: { tool: "fs.write_file" }
+    max_calls: 50
+    window_seconds: 60
+    per: run
+content:
+  secrets: flag
+  encoded_payloads: require_approval
+  injection: require_approval
+  cumulative:
+    - id: read-then-send
+      sources: ["fs.read_file"]
+      egress: ["slack.post_message", "github.add_comment"]
+      action: require_approval
+tests:
+  - name: ordinary write is allowed
+    input: { tool: fs.write_file, args: { path: notes/a.txt } }
+    expect: allow
+  - name: secrets directory is denied
+    input: { tool: fs.read_file, args: { path: secrets/token } }
+    expect: deny
+    rule: no-secrets-dir
+  - name: pem files need approval
+    input: { tool: fs.write_file, args: { path: deploy/server.pem } }
+    expect: require_approval
+    rule: big-writes-need-approval

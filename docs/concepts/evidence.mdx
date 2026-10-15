@@ -1,0 +1,47 @@
+---
+title: Evidence
+description: Signed bundles, auditor reports and independent verification.
+---
+
+## Signed bundles
+
+A bundle holds ledger records (the whole ledger, or one run), the ledger head at export time and an **Ed25519
+signature** over a canonical summary.
+
+```bash
+reversi keygen ./signing                      # writes signing.key (private) and signing.pub
+reversi bundle -d ./reversi-data --key signing.key --out ledger.json
+reversi bundle -d ./reversi-data --key signing.key --out run.json --run run_123
+reversi verify-bundle ledger.json --pub signing.pub
+```
+
+`verify-bundle` recomputes every record hash, checks the chain where it applies and checks the signature.
+
+- **Whole-ledger bundle:** the full hash chain from genesis to the recorded head is verified.
+- **Single-run bundle:** each record's own hash and its link to its neighbour are verified. It is a subset, so it
+  cannot prove nothing else happened; keep the whole-ledger bundle for that.
+- **`--pub`** checks the signature against a key you already trust. Without it, a valid signature only proves the bundle
+  is self-consistent: anyone could re-sign an edited bundle with their own key.
+
+The server serves bundles (`GET /v1/runs/{id}/bundle`, `/v1/ledger/bundle`) when started with `REVERSI_SIGNING_KEY`, and
+publishes the public key at `/v1/evidence/key`. Give auditors the public key out of band.
+
+## Anchoring
+
+A hash chain detects edits, deletions and reordering. It cannot detect truncation of the tail or a rewrite of the whole
+file by someone who controls it. Publish the ledger head (`reversi verify` prints it; every bundle contains it) somewhere
+the operator cannot rewrite: a ticket, a signed commit, an external timestamp service.
+
+## Auditor report
+
+```bash
+reversi report run_123 -m tools.yaml -d ./reversi-data --out run_123.html
+```
+
+A self-contained HTML page: who ran what, step statuses, the rollback outlook (what stands, what cannot be undone and
+why) and the full event trail. The server and [console](/console) serve the same report.
+
+## Offline verification without Node
+
+The ledger format uses SHA-256 so anyone can verify it: `python -m reversi_sdk verify ledger.jsonl`, the browser viewer, or
+`sha256sum` and a short script. Bundle signatures need an Ed25519 verifier (OpenSSL 3, any crypto library).

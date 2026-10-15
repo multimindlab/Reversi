@@ -1,0 +1,47 @@
+---
+title: Storage
+description: JSON files, SQLite or PostgreSQL for the ledger, run state and approvals.
+---
+
+Pick with `REVERSI_STORE` (server, gateway, CLI) or `--store`.
+
+| Store | Use it for | Notes |
+|---|---|---|
+| `files` (default) | One process, development | `ledger.jsonl`, `runs/<id>.json`, `approvals.json` in `REVERSI_DATA`. Every append is fsynced |
+| `sqlite` | One host, several processes | `reversi.db` in `REVERSI_DATA`. Needs Node 22.13+. WAL, `synchronous=FULL`. Ledger UPDATE and DELETE are rejected by triggers |
+| `postgres` | Several hosts, durability | `REVERSI_DATABASE_URL`. Migrations run at start. Ledger UPDATE and DELETE are rejected by a trigger |
+
+## Sharing one store
+
+With SQLite and PostgreSQL the server, gateway and CLI can use the same database at once. The ledger's `seq` primary key makes
+forking the chain impossible; a writer that loses a race re-reads the tail and retries, and fails closed (the call does not run)
+if it cannot append. Run state is last-write-wins per run, so drive a given run from one process: the gateway session or the
+agent's server connection, with operators acting through steps, approvals and rollback.
+
+With `files`, several processes on **one host** may share the directory (server, gateway and CLI): the ledger takes a lock file for each append and re-reads lines others wrote, so the chain cannot fork. Do not share it over a network filesystem.
+
+## PostgreSQL
+
+```bash
+REVERSI_STORE=postgres REVERSI_DATABASE_URL=postgres://reversi:…@db:5432/reversi reversi-server
+```
+
+Tables: `ledger`, `runs`, `approvals`, and `reversi_migrations`. Give the application role CREATE on its schema for the
+first start; afterwards it only needs INSERT, UPDATE and SELECT (and no DELETE on `ledger`). Use TLS to the database
+(`?sslmode=verify-full`) outside a trusted network.
+
+Postgres access runs on a worker thread so the engine's write-ahead guarantee holds without an `await`: each query is one round
+trip, and the calling thread waits for it.
+
+## Migrations and upgrades
+
+Migrations are ordered and additive, applied once each and recorded in `reversi_migrations`; concurrent starters are safe.
+Upgrade by deploying the new version: it migrates on start. Take a backup first, and keep the previous release available: a
+newer schema may not be readable by an older release.
+
+## Backup and restore
+
+- **files / SQLite:** stop writers (or use `sqlite3 reversi.db ".backup out.db"`), copy the data directory.
+- **PostgreSQL:** `pg_dump` or continuous archiving, as for any database.
+- After a restore, run `reversi verify` to prove the ledger chain is intact, and compare its head with the one you
+  [anchored](/concepts/evidence): a restore from an older backup is a truncation.

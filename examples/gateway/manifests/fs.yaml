@@ -1,0 +1,65 @@
+- tool: fs.read_file
+  description: Read a UTF-8 text file under the root.
+  effect: read_only
+  permission: fs:read
+- tool: fs.list_dir
+  description: "List a directory under the root (default: the root itself)."
+  effect: read_only
+  permission: fs:read
+- tool: fs.write_file
+  description: Create or overwrite a text file. The previous content is saved so
+    rollback can restore it.
+  effect: reversible
+  permission: fs:write
+  compensation:
+    tool: fs.restore_file
+    argument_map:
+      path: $args.path
+      backup_id: $result.backup_id
+    requires_approval: false
+- tool: fs.delete_file
+  description: Delete a file. It is moved into the backup directory so rollback
+    can restore it.
+  effect: reversible
+  permission: fs:write
+  compensation:
+    tool: fs.restore_file
+    argument_map:
+      path: $args.path
+      backup_id: $result.backup_id
+    requires_approval: false
+- tool: fs.restore_file
+  description: "Undo write_file or delete_file from a backup: restores the prior
+    content, or deletes the file if it did not exist. Safe to repeat."
+  effect: idempotent
+  permission: fs:write
+- tool: fs.make_dir
+  description: Create a directory whose parent exists. Fails if it already exists.
+  effect: reversible
+  permission: fs:write
+  compensation:
+    tool: fs.remove_dir
+    argument_map:
+      path: $args.path
+    requires_approval: false
+- tool: fs.remove_dir
+  description: Remove an EMPTY directory. A missing directory counts as success.
+    Used to undo make_dir; as a forward tool it only ever removes an empty
+    directory, so no data is lost.
+  effect: idempotent
+  permission: fs:write
+- tool: fs.move_file
+  description: Move a file to a new path inside the root. Fails if the destination exists.
+  effect: reversible
+  permission: fs:write
+  compensation:
+    tool: fs.unmove_file
+    argument_map:
+      from: $args.from
+      to: $args.to
+    requires_approval: false
+- tool: fs.unmove_file
+  description: "Undo move_file: move the file at `to` back to `from`. If it is
+    already back, nothing happens. Safe to repeat."
+  effect: idempotent
+  permission: fs:write

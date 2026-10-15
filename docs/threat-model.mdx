@@ -1,0 +1,50 @@
+---
+title: Threat model
+description: What Reversi defends against, what it assumes, and what it does not cover.
+---
+
+## Assets
+
+The ledger (what happened and who decided), approvals, run state, API keys and the signing key, and the downstream systems
+the tools act on.
+
+## Actors
+
+| Actor | Trust |
+|---|---|
+| The agent (and the model behind it) | **Untrusted.** It may be confused, manipulated by injected content, or malicious |
+| Tool results and upstream MCP servers | Untrusted input. A result can carry injection text |
+| Approvers, operators, admins | Trusted to decide, accountable through the ledger |
+| Whoever controls the host, database or key files | Fully trusted. Reversi cannot defend against them |
+
+## Threats and mitigations
+
+| Threat | Mitigation | Residual risk |
+|---|---|---|
+| Agent calls a tool it should not | Manifest required, scope check, policy, allow/deny lists; enforce mode blocks | An unmanifested tool in observe mode runs. A wrong manifest grants too much |
+| Agent reports false outcomes over the HTTP API (a made-up `result` becomes a compensation argument; a false `failed` hides a step from rollback) | Use the [gateway](/gateway): there the results come from the upstream, not the agent. Over HTTP, operators should review the plan before rolling back | **Accepted risk on the HTTP plane**: it trusts the agent's own reports |
+| Agent chooses `observe` mode to dodge enforcement | Agent keys open `enforce` runs only unless `allow_observe` is set | A lab key with `allow_observe` |
+| Agent approves its own call or triggers a rollback | Role separation; operator tools on a separate endpoint with separate credentials | Compromised operator credentials |
+| Approved call swapped for another | Approvals bound to the argument hash (calls whose arguments cannot be canonicalized are blocked), single use, claimed atomically in the store, expiring; every decision is written to the ledger with the approver's name | Approvers who approve without reading |
+| Privilege escalation through scope | Scope sealed with a digest; key `max_permissions` caps | Over-broad caps |
+| Prompt injection or exfiltration through arguments | Content checks (secrets, encoded payloads, injection, cumulative intent) with flag, approval or deny | Heuristics can be bypassed by creative encoding or paraphrase |
+| Credentials leak into the audit trail | Arguments and results are hashed, not stored; free text redacted | Unusual credential formats not matched by the patterns |
+| Ledger edited or deleted | Hash chain; append-only triggers in SQLite/PostgreSQL; signed bundles | Tail truncation and whole-store rewrite by a privileged actor: anchor the head externally |
+| Crash between intent and outcome | Write-ahead intent; unresolved steps reported, never guessed | Needs a human to reconcile |
+| Failed or partial compensation | Reported honestly, retried with the same idempotency key, optional verification probe | Some effects cannot be undone |
+| Stolen API key | Hashed at rest, rotation windows, expiry, disable, constant-time compare | A key is a bearer credential: use TLS and short lives |
+| Forged or confused OIDC token | Signature against JWKS, RS256/ES256 only, `iss`, `aud`, `exp`, `nbf`; unmapped roles rejected | Trust in the identity provider |
+| Web page driving a local gateway or console | Host and Origin validation; SameSite=Strict cookies; CSRF tokens; strict CSP | Misconfigured `allowed_hosts`/`allowed_origins` |
+| Console session theft or forgery | Signed HttpOnly cookies, 8 h lifetime, re-validated against the key ring every request, revoked on logout, per-session CSRF | XSS in a future page: output is escaped everywhere today |
+| Runaway agent | Kill switch (API, console, file), rate and budget limits | Latency until an operator notices |
+| Two writers fork the ledger | `seq` primary key; losers retry or fail closed | None known |
+| Upstream MCP server compromised | Nothing: it is a trusted tool provider. Its results are content-checked for injection | A malicious upstream can lie about results |
+| Supply chain | Lockfile, dependency audit and SBOM in CI, provenance on release | Not independently reviewed |
+
+## Out of scope
+
+Defending the host, the database or the signing key from their administrators. Discovering what a tool really does. Preventing
+an agent from using a path to the tools that does not go through Reversi. Denial of service by authenticated principals beyond
+the body-size limit and configured rate limits.
+
+Report vulnerabilities as described in `SECURITY.md`.

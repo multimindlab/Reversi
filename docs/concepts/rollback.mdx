@@ -1,46 +1,69 @@
 ---
 title: Rollback
-description: How Reversi undoes a run, and what it refuses to claim.
+description: Saga rollback with dependency ordering, retries, verification and honest reporting.
 ---
 
-## Write-ahead journaling
+Rollback undoes a run's standing steps with their declared compensations: **newest first**, one at a time, journaling
+`compensating` before the compensation runs and `compensated` or `compensation_failed` after.
 
-Before a tool runs, Reversi appends an `intended` record. After it runs, it appends the outcome. If journaling
-fails, the call **does not run**. If the process dies in between, the dangling `intended` shows exactly which
-effect needs reconciling. Such steps (and `uncertain` ones) are *unresolved*: rollback reports them and does not
-guess.
+## Rules
 
-## Order and dependencies
+- A step is never undone while a step that depends on it is still standing. Dependencies come from the manifest's
+  `requires` and from `depends_on` on a call. A stuck step is reported as `deferred`; everything independent is still undone.
+- Irreversible steps are reported as **cannot be undone**. Reversi never claims otherwise.
+- Steps whose outcome was never reported (`intended`, `uncertain`) are **unresolved**: Reversi will not guess. See
+  [reconciliation](#reconciliation).
+- Calls with no manifest (observe mode only) are reported as `unmanifested`.
+- Re-running a rollback is safe: compensated steps are skipped, failed ones retried with the **same idempotency key**,
+  which you pass to the downstream API so retries deduplicate.
 
-Rollback walks steps newest first. A step is **never undone while a step that depends on it is still standing**:
-if the refund for a charge fails, the order that the charge `requires` is left alone, reported as *deferred*, and
-everything independent is still undone. Dependencies come from `requires` and from an explicit `depends_on` on a call.
+`reversi plan <run>` (or `GET /v1/runs/{id}/plan`, or `reversi.plan_rollback` over MCP) is a dry run. It exits 2 when
+the run is not fully reversible.
 
-## Idempotent and resumable
+## Retries and verification
 
-Running rollback again skips what is already compensated and retries failures. Each step has a stable
-**idempotency key** (`sha256` of run, step and tool) that you pass downstream so a retried refund does not refund twice.
+```bash
+reversi rollback run_123 -m tools.yaml --compensator-cmd ./undo.sh --retries 4 --verify-cmd ./check-undone.sh
+```
 
-## The report
+- `--retries n` retries a failing compensation with exponential backoff (and jitter) and the same idempotency key. A
+  step that still fails is `compensation_failed`, with the error and the attempt count.
+- `--verify-cmd` runs after each successful compensation with the same JSON on stdin. Exit 0 confirms the undo is
+  visible downstream; anything else makes the compensation fail. This catches APIs that say "ok" and do nothing.
 
-| Bucket | Meaning |
+In code: `run.rollback({ compensate, retry: { attempts, base_ms, max_ms }, verify })`.
+
+## Reconciliation
+
+A timeout or crash leaves a step whose effect is unknown. An operator checks the downstream system and settles it:
+
+```bash
+reversi resolve run_123 4 -m tools.yaml --status succeeded --result '{"id":7}' \
+  --note "found order 7 in the admin UI" --actor dana
+```
+
+The note is required and stored in the ledger with the actor. Passing `--result` lets the step be rolled back. Over
+HTTP: `POST /v1/runs/{id}/steps/{n}/resolve`; in the [console](/console), the **Resolve** form on the run page.
+In code, `run.reconcile(probe)` asks a probe function about each unresolved step and settles those it can answer.
+
+## Compensation approval
+
+A compensation with `requires_approval: true` waits for an [approval](/concepts/approvals). The requirement is
+snapshotted when the step runs, so editing a manifest later cannot change what a past step's rollback needs.
+`--approve-compensations` (CLI) or `approve_compensations: true` (gateway) approves them in one go: an operator decision.
+
+## Who runs the compensation
+
+| Way | How |
 |---|---|
-| `compensated` | Undone |
-| `skipped` | Needed no undo |
-| `failed` | Undo attempted and failed; will be retried |
-| `deferred` | Waiting for a dependent step |
-| `unrecoverable` | Irreversible, or compensation arguments were unavailable |
-| `unresolved` | Outcome unknown; reconcile with the downstream system |
-| `unmanifested` | No manifest existed, so the effect is unknown |
-| `awaiting_approval` | Compensation needs an operator grant |
+| CLI | `--compensator-cmd` receives the call as JSON on stdin |
+| Gateway | `reversi.execute_rollback` on the operator endpoint calls the compensation tool on the upstream |
+| Your code | `run.rollback({ compensate })`, or `beginCompensation` / `completeCompensation` for remote workers |
+| Connectors | `reversi-connectors compensate` is a ready-made `--compensator-cmd` |
 
-`complete` is true only if every bucket except `compensated` and `skipped` is empty.
+The call JSON:
 
-<Warning>
-Compensation is business-level undo, not a database rollback. A refund after an email went out does not unsend the email.
-</Warning>
-
-## Plan first
-
-`plan` simulates the rollback assuming every compensation succeeds and executes nothing:
-`reversi plan <run_id>` or `GET /v1/runs/{id}/plan`.
+```json
+{"run_id":"…","step":2,"tool":"stripe.cancel_payment_intent","original_tool":"stripe.create_payment_intent",
+ "args":{"payment_intent":"pi_1"},"idempotency_key":"…"}
+```

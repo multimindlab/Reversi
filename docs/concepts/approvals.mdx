@@ -1,0 +1,49 @@
+---
+title: Approvals
+description: Human decisions bound to the exact call, used once, expiring, and visible to everyone who needs them.
+---
+
+A call needs approval when the manifest says `approval: always` (always true for irreversible tools), when a
+[policy rule](/concepts/policy) says `require_approval`, or when a [content check](/concepts/content-checks) does.
+Compensations can also require approval (`compensation.requires_approval`).
+
+## The flow
+
+1. The agent makes the call. Reversi queues an **approval request** and blocks the call. The message names the
+   request id: `approval required: request apr_… is pending an operator decision; retry after it is approved`.
+2. An approver decides it: in the [console](/console), with `reversi approvals approve <id>`, over the
+   [HTTP API](/api-reference/admin), or through the gateway's operator endpoint. A webhook can tell them first.
+3. The agent retries the **same call**. The approval is consumed, the call runs, and the ledger records `approved`.
+
+## What an approval is bound to
+
+- **The arguments.** A call approval carries the hash of the arguments it was requested for. Approve a refund of 5 and
+  a retry for 500 is a different call and needs its own approval.
+- **One use.** After the call runs the approval is `consumed`.
+- **A time limit.** Pending and approved requests expire (default one hour).
+- **A decision record.** Who decided, when, and the note, in the approval store **and in the ledger** (an `approved` record for approvals, a `blocked` record for denials, with the approver as actor).
+- **Claimed atomically.** Consuming or deciding a request is a compare-and-swap in the store, so two processes sharing a database cannot both use one approval.
+- **A denial sticks** for that call, with the reason shown to the agent.
+
+A request stores the names of the arguments, never their values, so approvals do not become a second copy of
+sensitive data.
+
+## Pre-approval
+
+An operator can grant standing approval for a tool in a run (`POST /v1/runs/{id}/approvals`, `count` uses, any
+arguments). Use it for compensations you know you will want to run, not for agent calls.
+
+## Notifications
+
+Set `REVERSI_APPROVAL_WEBHOOK` to an http(s) URL. Each new request is POSTed as JSON with a `text` field, so a Slack or
+Teams incoming-webhook URL works as is, plus the structured request. Set `REVERSI_CONSOLE_URL` to link the console in
+the message. Delivery is best effort with a 5 s timeout and never changes the decision.
+
+## Who can decide
+
+The `approver` role and up. Agents cannot approve anything, including their own calls. See [roles](/operations/authentication).
+
+## Storage
+
+Requests live in the data store (`approvals.json` for files, a table for SQLite and PostgreSQL), so the CLI, server
+and gateway see the same queue and a restart does not lose it.

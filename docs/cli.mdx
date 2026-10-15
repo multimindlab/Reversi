@@ -1,27 +1,65 @@
 ---
 title: CLI
-description: reversi validate, verify, runs, plan, rollback, export.
+description: Validate manifests, inspect and roll back runs, decide approvals, test policy, sign evidence.
 ---
 
 ```bash
 npm install -g @multimindlab/reversi-cli
 ```
 
+**Storage options** (every command that reads runs or the ledger): `-d, --data <dir>` (default `./reversi-data`),
+`--store files|sqlite|postgres` (default `REVERSI_STORE` or `files`), `--database-url <url>` (default
+`REVERSI_DATABASE_URL`). See [storage](/operations/storage). Commands marked **m** also need `-m, --manifests <path>`.
+
+## Inspect and undo
+
 | Command | Does |
 |---|---|
 | `reversi validate <path>` | Check manifests, including that every compensation and required tool exists |
-| `reversi verify <ledger>` | Verify the hash chain. Exit 1 if broken |
-| `reversi runs -m <manifests> -d <data>` | List runs, flag unresolved steps |
-| `reversi plan <run> -m … -d … [--json]` | Show what rollback would do. Exit 2 if not fully reversible |
-| `reversi rollback <run> -m … -d … --compensator-cmd <cmd>` | Undo. `<cmd>` gets the compensation call as JSON on stdin; exit 0 = undone. Exit 2 if incomplete |
-| `reversi export -d <data> [--run <id>]` | Print ledger records as JSON Lines |
+| `reversi verify [ledger]` | Verify the hash chain of a file, or of the ledger in the store. Exit 1 if broken |
+| `reversi runs` **m** | List runs; flags unresolved steps |
+| `reversi plan <run> [--json]` **m** | Dry run of the rollback. Exit 2 if not fully reversible |
+| `reversi rollback <run>` **m** | Undo. `--compensator-cmd <cmd>` (JSON call on stdin, exit 0 = undone), `--verify-cmd <cmd>`, `--retries <n>`, `--approve-compensations`, `--timeout-ms`, `--json`. Exit 2 if incomplete |
+| `reversi resolve <run> <step>` **m** | Settle a step whose outcome was unknown: `--status succeeded\|failed`, `--note <text>` (required), `--result <json>`, `--actor` |
+| `reversi export [--run <id>]` | Print ledger records as JSON Lines |
 
-`--approve-compensations` approves compensations marked `requires_approval`. That is an operator decision.
-The default data directory is `./reversi-data` (`ledger.jsonl` and `runs/`).
+## Approvals
 
-The compensation JSON on stdin:
+| Command | Does |
+|---|---|
+| `reversi approvals list [--status pending]` | Show requests (shared with the gateway and server through the store) |
+| `reversi approvals approve <id> [--note] [--as <name>]` | Approve a pending request |
+| `reversi approvals deny <id> [--note] [--as <name>]` | Deny it |
+
+Over `files` storage the CLI and a running server share `approvals.json`; for several machines use SQLite on a shared
+volume or PostgreSQL.
+
+## Policy and kill switch
+
+| Command | Does |
+|---|---|
+| `reversi policy check <file>` | Validate a policy file |
+| `reversi policy test <file> [cases]` | Run inline `tests:` and an optional extra file of cases. Exit 1 on failure |
+| `reversi kill-switch on\|off <file>` | Create or remove the file named by `REVERSI_KILL_FILE`. While it exists, new calls are blocked |
+
+## Evidence
+
+| Command | Does |
+|---|---|
+| `reversi keygen <prefix>` | Write `<prefix>.key` (private, mode 600) and `<prefix>.pub`. Never overwrites |
+| `reversi bundle --key <key> --out <file> [--run <id>]` | Signed evidence bundle |
+| `reversi verify-bundle <file> [--pub <key>]` | Verify a bundle; `--pub` checks against a key you trust |
+| `reversi report <run> --out <file>` **m** | Self-contained HTML report |
+
+## Exit codes
+
+`0` ok, `1` error or failed check, `2` rollback or plan incomplete / not fully reversible, `64` usage error.
+
+## The compensation call
 
 ```json
 {"run_id":"…","step":2,"tool":"refund","original_tool":"charge_card",
  "args":{"charge_id":"ch_1","amount":25},"idempotency_key":"…"}
 ```
+
+Pass `idempotency_key` to the downstream API so a retried compensation does nothing twice.

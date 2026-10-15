@@ -2,15 +2,77 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "Reversi",
-  "colors": { "primary": "#1F5FD6", "light": "#6E9BFF", "dark": "#1F5FD6" },
+  "colors": {
+    "primary": "#1F5FD6",
+    "light": "#6E9BFF",
+    "dark": "#1F5FD6"
+  },
   "navigation": {
     "groups": [
-      { "group": "Get started", "pages": ["index", "quickstart"] },
-      { "group": "Concepts", "pages": ["concepts/manifests", "concepts/rollback", "concepts/ledger", "concepts/security-model"] },
-      { "group": "Use it", "pages": ["cli", "gateway", "sdks/typescript", "sdks/python", "viewer"] },
-      { "group": "API reference", "pages": ["api-reference/overview", "api-reference/runs", "api-reference/operator"] },
-      { "group": "Project", "pages": ["limits", "roadmap"] }
+      {
+        "group": "Get started",
+        "pages": [
+          "index",
+          "quickstart",
+          "testing"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "concepts/manifests",
+          "concepts/rollback",
+          "concepts/ledger",
+          "concepts/policy",
+          "concepts/approvals",
+          "concepts/content-checks",
+          "concepts/evidence",
+          "concepts/security-model"
+        ]
+      },
+      {
+        "group": "Use it",
+        "pages": [
+          "gateway",
+          "connectors",
+          "console",
+          "cli",
+          "sdks/typescript",
+          "sdks/python",
+          "viewer"
+        ]
+      },
+      {
+        "group": "Operate",
+        "pages": [
+          "operations/deployment",
+          "operations/storage",
+          "operations/authentication",
+          "operations/monitoring"
+        ]
+      },
+      {
+        "group": "API reference",
+        "pages": [
+          "api-reference/overview",
+          "api-reference/runs",
+          "api-reference/operator",
+          "api-reference/admin"
+        ]
+      },
+      {
+        "group": "Project",
+        "pages": [
+          "threat-model",
+          "limits",
+          "roadmap"
+        ]
+      }
     ]
   },
-  "footer": { "socials": { "github": "https://github.com/multimindlab/reversi" } }
+  "footer": {
+    "socials": {
+      "github": "https://github.com/multimindlab/reversi"
+    }
+  }
 }

@@ -1,0 +1,42 @@
+---
+title: Monitoring
+description: Health, readiness, Prometheus metrics and structured logs.
+---
+
+## Health
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /healthz` | The process is up |
+| `GET /readyz` (server) | The store answers and the ledger head can be read; 503 otherwise. Also reports whether the kill switch is on |
+| `GET /readyz` (gateway) | Every upstream answers a ping, with per-upstream status |
+
+## Metrics
+
+`GET /metrics` on the server, in Prometheus text format. It needs an `auditor` credential (a bearer token in your scrape
+config), unless `REVERSI_METRICS_PUBLIC=1` (only on a private network).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `reversi_http_requests_total{method,route,status}` | counter | Requests, by matched route (ids never become labels) |
+| `reversi_http_request_duration_seconds` | summary | Handling time |
+| `reversi_ledger_events_total{event}` | counter | Ledger records by event: `intended` is calls, `blocked`, `failed`, `compensated`, `compensation_failed`... |
+| `reversi_ledger_records` | gauge | Ledger length |
+| `reversi_runs` | gauge | Runs in the store |
+| `reversi_approvals{status}` | gauge | Approvals by status |
+| `reversi_approval_latency_seconds` | summary | Request to decision |
+| `reversi_halted` | gauge | 1 while the kill switch is on |
+| `reversi_uptime_seconds` | gauge | |
+
+Useful alerts: `reversi_halted == 1`, a rising rate of `reversi_ledger_events_total{event="compensation_failed"}`,
+`reversi_approvals{status="pending"}` above zero for longer than your approval SLA, and `readyz` failing.
+
+## Logs
+
+`REVERSI_LOG=json` writes one line per request: `{"ts","method","path","status","ms","principal"}`. Bodies, headers and
+credentials are never logged. The ledger itself is the audit log.
+
+## Tracing
+
+OpenTelemetry export is not built. The ledger and metrics cover audit and operations; the structured request log carries
+the principal and timings for correlation.

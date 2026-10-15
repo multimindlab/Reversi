@@ -11,9 +11,11 @@ reports within a few working days.
 
 ## Scope notes
 
-- The ledger detects tampering; it does not prevent a writer who controls the whole file from
-  forging a consistent one, or from cutting off the end. Anchor the head hash externally. See
-  [docs/concepts/ledger.mdx](docs/concepts/ledger.mdx); this is a known limitation, not a vulnerability.
-- Content checks (intent graphs, encoding detection) are not implemented. Do not rely on Reversi
-  to block prompt injection today.
-- Approval grants are held in server memory and are revoked on restart by design.
+- The ledger detects tampering; it does not prevent a writer who controls the whole file or database
+  from forging a consistent one, or from cutting off the end. Anchor the head hash externally. See
+  [docs/concepts/evidence.mdx](docs/concepts/evidence.mdx); this is a known limitation, not a vulnerability.
+- Content checks are heuristics (credentials, encoded payloads, injection phrasing, cumulative intent). Bypassing them with
+  creative phrasing is a known limitation; a bypass of a *documented* pattern is a bug worth reporting.
+- Approvals, API-key handling, OIDC validation, the console session and CSRF protection, Host/Origin validation on the
+  gateway and the role separation between agent and operator endpoints are in scope. See
+  [docs/threat-model.mdx](docs/threat-model.mdx).

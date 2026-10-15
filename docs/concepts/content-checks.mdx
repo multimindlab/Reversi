@@ -1,0 +1,45 @@
+---
+title: Content checks
+description: Heuristics for credentials, hidden payloads, prompt-injection phrasing and data exfiltration.
+---
+
+Content checks run on every call's arguments (and on results, for injection phrasing). They are **heuristics**: they
+raise the cost of obvious abuse and give operators a reason to look. They do not prove a call is safe.
+
+| Check | Looks for | Default action |
+|---|---|---|
+| `secrets` | AWS keys, GitHub, Slack and Stripe tokens, private keys, JWTs, bearer tokens, `password=` assignments | `flag` |
+| `encoded_payloads` | The same secrets, or injection phrasing, hidden in base64, hex, percent-encoding or `\u` escapes, decoded up to three layers deep | `require_approval` |
+| `injection` | Instruction-override phrasing ("ignore previous instructions", "reveal your system prompt", chat-template tokens) | `require_approval` |
+| `cumulative` | A run that read sensitive data and then calls an egress tool | not configured |
+
+Actions: `flag` (note it in the ledger and let the call run), `require_approval`, `deny`.
+
+```yaml
+content:
+  secrets: deny
+  injection: require_approval
+  cumulative:
+    - id: read-then-send
+      sources: ["db.*", "fs.read_file"]       # tools whose success marks the run
+      egress: ["slack.post_message", "email.*"]
+      action: require_approval
+```
+
+The `content:` section lives in the [policy file](/concepts/policy). Without a policy file, content checks are off.
+
+## Cumulative intent
+
+Each call looks fine alone; the sequence is the problem. A `cumulative` rule fires when a tool matching `egress` is
+called in a run where a tool matching `sources` has already succeeded.
+
+## Results
+
+When a tool result contains injection-like text or an encoded payload, the `succeeded` record notes it
+(`result content check (injection): …`). The result is still returned: Reversi does not rewrite what tools say.
+
+## Secrets never reach the ledger
+
+Independent of these checks, every free-text ledger field (reason, detail, error text) is run through secret
+redaction before it is written, so a token pasted into an error message is stored as `[REDACTED:github_token]`.
+Arguments and results are never stored at all, only hashed.

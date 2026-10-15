@@ -10,3 +10,5 @@ CLAUDE.md
 CLAUDE.local.md
 .claude/
 *.tsbuildinfo
+deploy/keys.json
+try/

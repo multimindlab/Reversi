@@ -1,0 +1,35 @@
+---
+title: Approvals, evidence and admin endpoints
+description: Decide approvals, download signed bundles, check status, flip the kill switch.
+---
+
+## Approvals
+
+### `GET /v1/approvals?status=&run_id=` (auditor+)
+`{"approvals":[{"id","run_id","step","kind","tool","reason","triggers":[…],"arg_keys":[…],"args_hash","status","requested_ms","expires_ms","decided_by","decided_ms","decision_note"}]}`.
+`status`: `pending`, `approved`, `denied`, `consumed`, `expired`. Only argument **names** are stored.
+
+### `POST /v1/approvals/{id}/approve` and `/deny` (approver+)
+Optional body `{"note":"…"}`. Returns the updated record. 409 if it is no longer pending, 404 if unknown.
+
+## Evidence
+
+### `GET /v1/runs/{id}/bundle` and `GET /v1/ledger/bundle` (auditor+)
+A signed [evidence bundle](/concepts/evidence). 404 unless the server has `REVERSI_SIGNING_KEY`.
+
+### `GET /v1/evidence/key` (auditor+)
+`{"alg":"ed25519","key_id":"…","public_key_pem":"…"}`.
+
+## Status and kill switch
+
+### `GET /v1/status` (auditor+)
+`{"halted": null | "reason","environment","runs","pending_approvals"}`.
+
+### `POST /v1/halt` (admin)
+`{"reason":"incident 42"}`. Every new call is blocked until resumed; rollbacks still work. The caller's name is appended to the reason.
+
+### `POST /v1/resume` (admin)
+
+## Operational
+
+`GET /healthz`, `GET /readyz`, `GET /metrics`: see [monitoring](/operations/monitoring).

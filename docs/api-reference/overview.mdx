@@ -1,34 +1,33 @@
 ---
 title: API overview
-description: HTTP API conventions.
+description: HTTP API conventions, roles and status codes.
 ---
 
-Start the server:
+Start the server (see [deployment](/operations/deployment) for every option):
 
 ```bash
 REVERSI_MANIFESTS=./tools.yaml REVERSI_KEYS=./keys.json node packages/server/dist/main.js
-# optional: REVERSI_DATA=./reversi-data PORT=7421 HOST=127.0.0.1
 ```
 
-`keys.json`:
+All `/v1` routes need `Authorization: Bearer <API key or OIDC token>`. `GET /healthz` and `GET /readyz` are open;
+`GET /metrics` needs an auditor credential. [Roles](/operations/authentication) gate each route:
 
-```json
-[
-  { "name": "support-agent", "role": "agent", "key": "…", "max_permissions": ["orders:write"] },
-  { "name": "ops", "role": "operator", "key_sha256": "<hex sha256 of the key>" }
-]
-```
-
-All `/v1` routes need `Authorization: Bearer <key>`. `GET /healthz` is open.
+| Plane | Role needed | Routes |
+|---|---|---|
+| Agent | `agent` | [runs](/api-reference/runs): open a run, `intents`, `outcome` |
+| Read | `auditor`+ | plan, export, report, bundle, ledger verify, status, list approvals |
+| Approve | `approver`+ | approve, deny, pre-approve |
+| Operate | `operator`+ | compensation, resolve ([operator](/api-reference/operator)) |
+| Admin | `admin` | halt, resume ([admin](/api-reference/admin)) |
 
 | Status | Meaning |
 |---|---|
 | 400 | Invalid body or id |
-| 401 | Missing or unknown key |
+| 401 | Missing or invalid credential |
 | 403 | Role or permission cap forbids it |
-| 404 | Unknown run (also for another agent's run) |
-| 409 | State conflict (duplicate run id, outcome already reported) |
+| 404 | Unknown run (also for another agent's run), approval, or a feature that is not enabled |
+| 409 | State conflict (duplicate run id, outcome already reported, approval already decided) |
 | 413 | Body over 1 MB |
 | 503 | Ledger unavailable; the request was refused (fail closed) |
 
-Policy refusals are **not** errors: `POST …/intents` returns 200 with `"decision": "block"`.
+Policy refusals are **not** errors: `POST …/intents` returns 200 with `"decision": "block"` and `reasons`.

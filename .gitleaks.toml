@@ -1,0 +1,4 @@
+# Test fixtures contain deliberately fake credential-shaped strings (they exercise redaction and content checks).
+[allowlist]
+description = "fake credentials in tests and docs"
+paths = ['''packages/.*/test/.*''', '''docs/.*''']

@@ -8,8 +8,9 @@
  * This detects tampering; it does not prevent a writer who controls the whole file from forging a
  * consistent chain. Anchor `head()` somewhere the writer cannot reach for stronger guarantees.
  */
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
+import { redactSecrets } from "./redact.js";
 
 export const GENESIS_HASH = "0".repeat(64);
 
@@ -50,6 +51,14 @@ export class LedgerError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "LedgerError";
+  }
+}
+
+/** A store refused an append because another writer took that sequence number. The ledger retries. */
+export class LedgerConflictError extends LedgerError {
+  constructor(message = "another writer appended first") {
+    super(message);
+    this.name = "LedgerConflictError";
   }
 }
 
@@ -101,7 +110,9 @@ export function verifyRecords(records: readonly LedgerRecord[]): VerifyResult {
 }
 
 export interface LedgerStore {
+  /** Every record, oldest first. Shared stores refresh from the backend on each call. */
   all(): readonly LedgerRecord[];
+  /** Must throw {@link LedgerConflictError} if `record.seq` is already taken. */
   append(record: LedgerRecord): void;
 }
 
@@ -136,25 +147,82 @@ export function toJsonl(records: readonly LedgerRecord[]): string {
 
 /**
  * JSONL file store. Every append is fsynced so a journaled intent survives a crash.
- * Single writer: two processes appending to one file will fork the chain.
+ *
+ * Several processes on one host may share the file (a server, a gateway and the CLI): each call to
+ * `all()` picks up lines other processes appended, and `append` takes a lock file and refuses to
+ * write if the file grew since this process last read it, so the chain cannot fork. A stale lock
+ * (a crashed holder) is broken after 30 seconds. Not safe over network filesystems; use SQLite or
+ * PostgreSQL to share across hosts.
  */
 export class JsonlLedgerStore implements LedgerStore {
-  private readonly items: LedgerRecord[];
+  private readonly items: LedgerRecord[] = [];
+  private offset = 0;
   constructor(private readonly path: string) {
-    this.items = existsSync(path) ? parseJsonl(readFileSync(path, "utf8")) : [];
+    this.sync();
   }
-  all(): readonly LedgerRecord[] {
-    return this.items;
-  }
-  append(record: LedgerRecord): void {
-    const fd = openSync(this.path, "a");
+
+  /** Read whole lines appended since the last read. A half-written last line is left for next time. */
+  private sync(): void {
+    if (!existsSync(this.path)) return;
+    const size = statSync(this.path).size;
+    if (size <= this.offset) return;
+    const fd = openSync(this.path, "r");
     try {
-      writeSync(fd, JSON.stringify(record) + "\n");
-      fsyncSync(fd);
+      const buf = Buffer.alloc(size - this.offset);
+      readSync(fd, buf, 0, buf.length, this.offset);
+      const text = buf.toString("utf8");
+      const end = text.lastIndexOf("\n");
+      if (end === -1) return;
+      this.items.push(...parseJsonl(text.slice(0, end + 1)));
+      this.offset += Buffer.byteLength(text.slice(0, end + 1));
     } finally {
       closeSync(fd);
     }
-    this.items.push(record);
+  }
+
+  all(): readonly LedgerRecord[] {
+    this.sync();
+    return this.items;
+  }
+
+  append(record: LedgerRecord): void {
+    const lock = `${this.path}.lock`;
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        closeSync(openSync(lock, "wx"));
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        try {
+          if (Date.now() - statSync(lock).mtimeMs > 30_000) unlinkSync(lock); // holder crashed
+        } catch {
+          /* it was released meanwhile */
+        }
+        if (Date.now() > deadline) throw new LedgerError("could not lock the ledger file; another process is holding it");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    }
+    try {
+      const size = existsSync(this.path) ? statSync(this.path).size : 0;
+      if (size !== this.offset) throw new LedgerConflictError(); // someone appended since we last read
+      const line = JSON.stringify(record) + "\n";
+      const fd = openSync(this.path, "a");
+      try {
+        writeSync(fd, line);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      this.items.push(record);
+      this.offset += Buffer.byteLength(line);
+    } finally {
+      try {
+        unlinkSync(lock);
+      } catch {
+        /* already gone */
+      }
+    }
   }
 }
 
@@ -183,24 +251,31 @@ export class Ledger {
     if (!input.reason || !input.reason.trim()) {
       throw new LedgerError("every ledger record needs a non-empty reason");
     }
-    const all = this.store.all();
-    const last = all[all.length - 1];
-    const body: Omit<LedgerRecord, "hash"> = {
-      seq: all.length,
-      ts_ms: input.ts_ms,
-      run_id: input.run_id,
-      step: input.step ?? null,
-      actor: input.actor,
-      tool: input.tool,
-      payload_hash: hashPayload(input.payload),
-      reason: input.reason,
-      event: input.event,
-      detail: input.detail ?? "",
-      prev_hash: last ? last.hash : GENESIS_HASH,
-    };
-    const record: LedgerRecord = { ...body, hash: hashOf(body) };
-    this.store.append(record);
-    return record;
+    for (let attempt = 1; ; attempt++) {
+      const all = this.store.all();
+      const last = all[all.length - 1];
+      const body: Omit<LedgerRecord, "hash"> = {
+        seq: all.length,
+        ts_ms: input.ts_ms,
+        run_id: input.run_id,
+        step: input.step ?? null,
+        actor: input.actor,
+        tool: input.tool,
+        payload_hash: hashPayload(input.payload),
+        reason: redactSecrets(input.reason),
+        event: input.event,
+        detail: redactSecrets(input.detail ?? ""),
+        prev_hash: last ? last.hash : GENESIS_HASH,
+      };
+      const record: LedgerRecord = { ...body, hash: hashOf(body) };
+      try {
+        this.store.append(record);
+        return record;
+      } catch (e) {
+        if (e instanceof LedgerConflictError && attempt < 8) continue; // re-read the tail and try again
+        throw e;
+      }
+    }
   }
 
   records(): readonly LedgerRecord[] {

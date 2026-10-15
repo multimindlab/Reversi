@@ -1,0 +1,72 @@
+---
+title: Policy as code
+description: Rules, limits and tests that add restrictions on top of manifests and scopes.
+---
+
+A policy file adds rules to what manifests and scopes already enforce. It can **deny** a call, **require
+approval** for it, or (with `default: deny`) turn the rules into an allowlist. It can never grant a permission
+the run's scope lacks.
+
+```yaml policy.yaml
+version: 1
+default: allow                # deny: only calls matched by an allow rule may run
+rules:
+  - id: big-refunds
+    description: refunds over 500 need a human
+    match: { tool: "stripe.create_refund", environment: prod }
+    when: [{ path: $args.amount, op: gt, value: 50000 }]
+    action: require_approval
+    reason: large refund
+  - id: nothing-in-secrets
+    match: { tool: "fs.*" }
+    when: [{ path: $args.path, op: matches, value: "^secrets/" }]
+    action: deny
+limits:
+  - id: write-burst
+    match: { effect: [reversible, compensable] }
+    max_calls: 50
+    window_seconds: 60
+    per: run                  # run | actor | global
+tests:
+  - name: small refund is fine
+    input: { tool: stripe.create_refund, environment: prod, args: { amount: 100 } }
+    expect: allow
+```
+
+## Matching
+
+`match` fields (all optional, all must hold): `tool`, `permission`, `actor`, `environment` (globs: `*` any
+run of characters, `?` one), and `effect` (an exact effect class or a list). `when` conditions then look at the call
+arguments with `$args.path.to.value`:
+
+`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `matches` (regular expression), `exists`, `contains`.
+
+A comparison on a missing or mistyped value is simply false, so a rule never fires by accident on bad input.
+
+## Precedence
+
+`deny` beats `require_approval` beats `allow`. Every matching rule is evaluated and reported. Limits are sliding
+windows counted per run, per actor or globally; only calls that actually started count.
+
+## Environments
+
+`environment` comes from `REVERSI_ENV` (or `--environment`). Use one policy file with rules per environment, so
+production can be stricter than staging.
+
+## Test it
+
+```bash
+reversi policy check policy.yaml
+reversi policy test policy.yaml [more-cases.yaml]
+```
+
+`policy test` runs the inline `tests:` and any extra file of cases, and exits 1 on a failure. Put it in CI.
+A case may name the `rule` that must have fired.
+
+## What a block looks like
+
+In enforce mode a violation journals a `blocked` record naming the rule, and the call is refused. In observe mode it
+is journaled as `would_block` and the call proceeds. The [gateway](/gateway) turns a block into an MCP error result
+the agent can read.
+
+Combining files: the gateway compiles its `allow` and `deny` lists into rules and merges them with your policy file.

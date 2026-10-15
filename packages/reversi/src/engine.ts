@@ -12,9 +12,13 @@
  * is still standing. Stuck steps are reported, everything independent is still undone.
  */
 import { randomUUID } from "node:crypto";
-import { canonicalize, sha256Hex } from "./canonical.js";
+import { existsSync } from "node:fs";
+import { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
+import type { ContentChecker } from "./content.js";
 import { Ledger, type LedgerEvent } from "./ledger.js";
+import { redactSecrets } from "./redact.js";
 import { Registry, resolveRef } from "./manifest.js";
+import type { Policy, PolicyInput } from "./policy.js";
 import { SealedScope } from "./scope.js";
 import {
   MemoryRunStore,
@@ -33,6 +37,17 @@ export class ReversiError extends Error {
   }
 }
 
+/** Thrown by {@link Run.wrap} when a call is blocked. The tool was not executed. */
+export class BlockedError extends Error {
+  constructor(
+    readonly tool: string,
+    readonly reasons: string[],
+  ) {
+    super(`call to \`${tool}\` blocked: ${reasons.join("; ")}`);
+    this.name = "BlockedError";
+  }
+}
+
 /** Throw from a tool executor when it is unknown whether the effect happened (timeout, dropped connection). */
 export class EffectUncertainError extends Error {
   constructor(message = "outcome of the call is unknown") {
@@ -47,8 +62,16 @@ export interface ApprovalRequest {
   tool: string;
   reason: string;
   kind: "call" | "compensation";
+  /** Hash of the call's arguments, so an approval can be bound to them. */
+  args_hash?: string;
+  /** Why approval is needed: manifest, policy rule, content check. */
+  triggers?: string[];
+  /** Names of the arguments (never values). */
+  arg_keys?: string[];
 }
-export type Approver = (req: ApprovalRequest) => boolean | Promise<boolean>;
+/** `true`/`false`, or a decision with a message that is shown to the caller when not approved. */
+export type ApprovalDecision = boolean | { approved: boolean; message?: string };
+export type Approver = (req: ApprovalRequest) => ApprovalDecision | Promise<ApprovalDecision>;
 
 export interface ReversiOptions {
   registry: Registry;
@@ -56,6 +79,13 @@ export interface ReversiOptions {
   runs?: RunStore;
   approver?: Approver;
   now?: () => number;
+  /** Extra restrictions on top of manifests and scopes. */
+  policy?: Policy;
+  content?: ContentChecker;
+  /** dev, staging, prod... matched by policy rules. Default `default`. */
+  environment?: string;
+  /** If this file exists, every new call is blocked (rollback still works). */
+  kill_switch_file?: string;
 }
 
 export interface StartRunOptions {
@@ -149,9 +179,14 @@ export function idempotencyKey(run_id: string, step: number, tool: string): stri
   return sha256Hex(canonicalize([run_id, step, tool]));
 }
 
+function isArgObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+const MANIFEST_TRIGGER = "manifest requires approval";
 const ERROR_LIMIT = 300;
 function messageOf(e: unknown): string {
-  const m = e instanceof Error ? e.message : String(e);
+  const m = redactSecrets(e instanceof Error ? e.message : String(e)); // error text is stored in run state and shown in the console
   return m.length > ERROR_LIMIT ? m.slice(0, ERROR_LIMIT) + "…" : m;
 }
 
@@ -219,10 +254,19 @@ export class Reversi {
   readonly registry: Registry;
   readonly ledger: Ledger;
   readonly runs: RunStore;
+  readonly policy: Policy | undefined;
+  readonly content: ContentChecker | undefined;
+  readonly environment: string;
   private readonly approver: Approver | undefined;
   private readonly clock: () => number;
+  private readonly killFile: string | undefined;
+  private haltReason: string | null = null;
 
   constructor(opts: ReversiOptions) {
+    this.policy = opts.policy;
+    this.content = opts.content;
+    this.environment = opts.environment ?? "default";
+    this.killFile = opts.kill_switch_file;
     this.registry = opts.registry;
     this.ledger = opts.ledger;
     this.runs = opts.runs ?? new MemoryRunStore();
@@ -267,6 +311,20 @@ export class Reversi {
 
   runIds(): string[] {
     return this.runs.list();
+  }
+
+  /** Emergency stop: block every new call until {@link Reversi.resume}. Rollbacks are not affected. */
+  halt(reason: string): void {
+    this.haltReason = reason || "halted by operator";
+  }
+  resume(): void {
+    this.haltReason = null;
+  }
+  /** The reason new calls are blocked, or null. Also true while the kill-switch file exists. */
+  halted(): string | null {
+    if (this.haltReason !== null) return this.haltReason;
+    if (this.killFile && existsSync(this.killFile)) return `kill switch file ${this.killFile} exists`;
+    return null;
   }
 
   /** @internal */
@@ -353,6 +411,45 @@ export class Run {
       else violations.push(`depends_on step ${d} does not exist`);
     }
 
+    // Arguments with no canonical form (Infinity, NaN, BigInt...) would all share one hash, which would let an
+    // approval granted for one call cover another. Treat them as a violation and never match an approval.
+    let argsHash: string;
+    try {
+      argsHash = sha256Hex(canonicalize(call.args === undefined ? null : call.args));
+    } catch (e) {
+      argsHash = `unhashable-${randomUUID()}`;
+      violations.push(`arguments cannot be canonicalized: ${e instanceof Error ? e.message : "unsupported value"}`);
+    }
+    const triggers: string[] = [];
+    const notes: string[] = [];
+    const halted = this.rv.halted();
+    if (halted) violations.push(`kill switch: ${halted}`);
+    const policyInput: PolicyInput = {
+      tool: call.tool,
+      effect: manifest ? manifest.effect : null,
+      permission: manifest ? manifest.permission : null,
+      actor: state.actor,
+      run_id: this.run_id,
+      environment: this.rv.environment,
+      args: call.args,
+    };
+    if (this.rv.policy) {
+      const d = this.rv.policy.evaluate(policyInput);
+      violations.push(...d.deny);
+      triggers.push(...d.approve);
+    }
+    if (this.rv.content) {
+      const succeeded = state.steps.filter((x) => x.status === "succeeded").map((x) => x.tool);
+      const findings = [...this.rv.content.inspect(call.args), ...this.rv.content.cumulative(call.tool, succeeded)];
+      for (const f of findings) {
+        const text = `content check (${f.kind}): ${f.detail}`;
+        if (f.action === "deny") violations.push(text);
+        else if (f.action === "require_approval") triggers.push(text);
+        else notes.push(text);
+      }
+    }
+    if (manifest && manifest.approval === "always") triggers.push(MANIFEST_TRIGGER);
+
     const enforce = state.mode === "enforce";
     if (violations.length && enforce) {
       this.emit("blocked", null, call.tool, call.args, call.reason, violations.join("; "));
@@ -360,22 +457,38 @@ export class Run {
     }
     const observed = [...violations];
 
-    if (manifest && manifest.approval === "always") {
+    if (triggers.length) {
       const approver = this.rv.internals.approver;
-      const approved = approver
-        ? await approver({ run_id: this.run_id, step: null, tool: call.tool, reason: call.reason, kind: "call" })
+      const decision = approver
+        ? await approver({
+            run_id: this.run_id,
+            step: null,
+            tool: call.tool,
+            reason: call.reason,
+            kind: "call",
+            args_hash: argsHash,
+            triggers,
+            arg_keys: isArgObject(call.args) ? Object.keys(call.args).slice(0, 50) : [],
+          })
         : false;
+      const approved = typeof decision === "boolean" ? decision : decision.approved;
       if (approved) {
-        this.emit("approved", null, call.tool, call.args, call.reason, "call approved; intent follows");
+        this.emit("approved", null, call.tool, call.args, call.reason, `call approved; intent follows${triggers.length === 1 && triggers[0] === MANIFEST_TRIGGER ? "" : ` [${triggers.join("; ")}]`}`);
       } else {
-        const msg = approver ? "approval denied" : "approval required but no approver is configured";
+        const msg =
+          typeof decision === "object" && decision.message
+            ? decision.message
+            : approver
+              ? "approval denied"
+              : "approval required but no approver is configured";
         if (enforce) {
-          this.emit("blocked", null, call.tool, call.args, call.reason, msg);
+          this.emit("blocked", null, call.tool, call.args, call.reason, `${msg} [${triggers.join("; ")}]`);
           return { decision: "block", reasons: [msg] };
         }
         observed.push(msg);
       }
     }
+    this.rv.policy?.record(policyInput);
 
     // Everything from here to the save is synchronous, so concurrent calls cannot share a step number.
     const st = this.load();
@@ -383,7 +496,7 @@ export class Run {
     if (observed.length) {
       this.emit("would_block", step, call.tool, call.args, call.reason, observed.join("; "));
     }
-    this.emit("intended", step, call.tool, call.args, call.reason); // write-ahead: before the tool runs
+    this.emit("intended", step, call.tool, call.args, call.reason, notes.join("; ")); // write-ahead: before the tool runs
 
     const partial: Record<string, unknown> = {};
     const missing: string[] = [];
@@ -416,12 +529,63 @@ export class Run {
 
   /** Record the outcome of a call that {@link Run.begin} allowed. */
   complete(step: number, outcome: Outcome): { step: number; status: StepStatus } {
+    return this.applyOutcome(step, outcome, ["intended"]);
+  }
+
+  /**
+   * Operator reconciliation: settle a step whose outcome was unknown (`intended` or `uncertain`)
+   * after checking the downstream system. The ledger records who resolved it and why.
+   */
+  resolve(step: number, outcome: Outcome, by: { actor: string; note: string }): { step: number; status: StepStatus } {
+    if (!by.note.trim()) throw new ReversiError("resolving a step needs a note saying how the outcome was established");
+    return this.applyOutcome(step, outcome, ["intended", "uncertain"], by);
+  }
+
+  /** Ask `probe` about each unresolved step; settle those it can answer, leave the rest. */
+  async reconcile(
+    probe: (s: { step: number; tool: string; reason: string }) => Outcome | null | Promise<Outcome | null>,
+    actor = "reconciler",
+  ): Promise<{ resolved: number[]; still_unknown: number[] }> {
+    const resolved: number[] = [];
+    const still: number[] = [];
+    for (const s of this.load().steps) {
+      if (s.status !== "intended" && s.status !== "uncertain") continue;
+      let o: Outcome | null = null;
+      try {
+        o = await probe({ step: s.step, tool: s.tool, reason: s.reason });
+      } catch {
+        o = null;
+      }
+      if (o && o.status !== "uncertain") {
+        this.resolve(s.step, o, { actor, note: "established by automatic reconciliation probe" });
+        resolved.push(s.step);
+      } else still.push(s.step);
+    }
+    return { resolved, still_unknown: still };
+  }
+
+  /** Wrap a tool function so every call goes through this run. Throws {@link BlockedError} when blocked. */
+  wrap<A, R>(tool: string, fn: (args: A) => R | Promise<R>, reason: string | ((args: A) => string)): (args: A) => Promise<R> {
+    return async (args: A) => {
+      const r = await this.call<R>({ tool, args, reason: typeof reason === "function" ? reason(args) : reason, execute: (a) => fn(a as A) });
+      if (r.status === "blocked") throw new BlockedError(tool, r.reasons);
+      return r.result;
+    };
+  }
+
+  private applyOutcome(
+    step: number,
+    outcome: Outcome,
+    allowed: StepStatus[],
+    by?: { actor: string; note: string },
+  ): { step: number; status: StepStatus } {
     const st = this.load();
     const s = st.steps.find((x) => x.step === step);
     if (!s) throw new ReversiError(`unknown step ${step}`);
-    if (s.status !== "intended") {
+    if (!allowed.includes(s.status)) {
       throw new ReversiError(`step ${step} is \`${s.status}\`, not awaiting an outcome`);
     }
+    const who = by ? `resolved by ${by.actor}: ${by.note}` : "";
     if (outcome.status === "succeeded") {
       const handle: Record<string, unknown> = { ...s.partial_handle };
       const missing = [...s.handle_missing];
@@ -431,20 +595,19 @@ export class Run {
         if (v === undefined) missing.push(key);
         else handle[key] = v;
       }
-      this.emit(
-        "succeeded",
-        step,
-        s.tool,
-        outcome.result,
-        s.reason,
+      const flagged = this.rv.content?.inspect(outcome.result).filter((f) => f.kind === "injection" || f.kind === "encoded_payload") ?? [];
+      const detail = [
         missing.length ? `compensation arguments unavailable: ${missing.join(", ")}` : "",
-      );
+        ...flagged.map((f) => `result content check (${f.kind}): ${f.detail}`),
+        who,
+      ].filter(Boolean);
+      this.emit("succeeded", step, s.tool, outcome.result, s.reason, detail.join("; "), by?.actor);
       s.handle = handle;
       s.handle_missing = missing;
       s.status = "succeeded";
     } else {
       const error = outcome.error ? messageOf(outcome.error) : "";
-      this.emit(outcome.status, step, s.tool, null, s.reason, error);
+      this.emit(outcome.status, step, s.tool, null, s.reason, [error, who].filter(Boolean).join("; "), by?.actor);
       s.status = outcome.status;
       s.error = error || null;
     }
@@ -550,9 +713,19 @@ export class Run {
     const compTool = a.compensation_tool as string;
     if (a.needs_approval) {
       const approver = this.rv.internals.approver;
-      const ok = approver
-        ? await approver({ run_id: this.run_id, step: step_no, tool: compTool, reason, kind: "compensation" })
+      const decision = approver
+        ? await approver({
+            run_id: this.run_id,
+            step: step_no,
+            tool: compTool,
+            reason,
+            kind: "compensation",
+            args_hash: hashPayload(a.args ?? {}),
+            triggers: ["manifest requires approval for this compensation"],
+            arg_keys: Object.keys(a.args ?? {}).slice(0, 50),
+          })
         : false;
+      const ok = typeof decision === "boolean" ? decision : decision.approved;
       if (!ok) {
         this.emit(
           "blocked",
@@ -560,7 +733,11 @@ export class Run {
           compTool,
           a.args,
           reason,
-          approver ? "compensation approval denied" : "compensation needs approval but no approver is configured",
+          typeof decision === "object" && decision.message
+            ? decision.message
+            : approver
+              ? "compensation approval denied"
+              : "compensation needs approval but no approver is configured",
           actor,
         );
         return { decision: "awaiting_approval", step: step_no };
@@ -620,7 +797,18 @@ export class Run {
    * depending on it is still standing. Failures do not stop independent steps. Safe to call again:
    * compensated steps are skipped, failed ones are retried with the same idempotency key.
    */
-  async rollback(opts: { compensate: Compensator; actor?: string }): Promise<RollbackReport> {
+  async rollback(opts: {
+    compensate: Compensator;
+    actor?: string;
+    /** Retry a failing compensation with exponential backoff and the same idempotency key. */
+    retry?: { attempts?: number; base_ms?: number; max_ms?: number; sleep?: (ms: number) => Promise<void> };
+    /** After a compensation reports success, confirm the undo is visible downstream. `false` or a throw counts as failure. */
+    verify?: (call: CompensationCall) => boolean | Promise<boolean>;
+  }): Promise<RollbackReport> {
+    const attempts = Math.max(1, opts.retry?.attempts ?? 1);
+    const base = opts.retry?.base_ms ?? 200;
+    const cap = opts.retry?.max_ms ?? 5000;
+    const sleep = opts.retry?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const report: RollbackReport = {
       run_id: this.run_id,
       compensated: [],
@@ -640,14 +828,27 @@ export class Run {
       const start = await this.beginCompensation(n, { actor: opts.actor });
       switch (start.decision) {
         case "go":
-          try {
-            await opts.compensate(start.call);
-            this.completeCompensation(n, { status: "compensated" }, { actor: opts.actor });
-            report.compensated.push(n);
-          } catch (e) {
-            const error = messageOf(e);
-            this.completeCompensation(n, { status: "failed", error }, { actor: opts.actor });
-            report.failed.push({ step: n, error });
+          {
+            let error: string | null = null;
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+              try {
+                await opts.compensate(start.call);
+                if (opts.verify && !(await opts.verify(start.call))) throw new Error("verification failed: the undo is not visible downstream");
+                error = null;
+                break;
+              } catch (e) {
+                error = messageOf(e);
+                if (attempt < attempts) await sleep(Math.min(cap, base * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2));
+              }
+            }
+            if (error === null) {
+              this.completeCompensation(n, { status: "compensated" }, { actor: opts.actor });
+              report.compensated.push(n);
+            } else {
+              const msg = attempts > 1 ? `${error} (after ${attempts} attempts)` : error;
+              this.completeCompensation(n, { status: "failed", error: msg }, { actor: opts.actor });
+              report.failed.push({ step: n, error: msg });
+            }
           }
           break;
         case "defer":

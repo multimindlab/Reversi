@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { Ledger, Registry, Reversi, parseJsonl, verifyRecords } from "@multimindlab/reversi";
-import { Grants, createApp } from "../src/index.js";
+import { Approvals } from "@multimindlab/reversi";
+import { createApp } from "../src/index.js";
 
 const MANIFESTS = [
   { tool: "create_order", effect: "reversible", permission: "orders:write", compensation: { tool: "cancel_order", argument_map: { id: "$result.id" } } },
@@ -12,11 +13,11 @@ const MANIFESTS = [
 ];
 
 function make() {
-  const grants = new Grants();
-  const reversi = new Reversi({ registry: Registry.from(MANIFESTS), ledger: new Ledger(), approver: grants.asApprover() });
+  const approvals = new Approvals();
+  const reversi = new Reversi({ registry: Registry.from(MANIFESTS), ledger: new Ledger(), approver: approvals.asApprover() });
   const app = createApp({
     reversi,
-    grants,
+    approvals,
     keys: [
       { name: "agent-a", role: "agent", key: "ka", max_permissions: ["orders:write", "mail:send"] },
       { name: "agent-b", role: "agent", key: "kb" },
