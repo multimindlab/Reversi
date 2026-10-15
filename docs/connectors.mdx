@@ -1,0 +1,144 @@
+---
+title: Connectors
+description: Ready-made tools for the filesystem, GitHub, Slack and Stripe, each with a Reversi manifest and a compensation that really undoes it.
+---
+
+`@multimindlab/reversi-connectors` ships four connectors. Every tool has a [manifest](/concepts/manifests), and every
+compensation named in a manifest is itself a tool in the same package that accepts exactly the arguments the
+`argument_map` produces. Rollback therefore works end to end, with no glue code.
+
+Tool names are `<connector>.<tool>`, such as `fs.write_file` or `stripe.create_refund`.
+
+## Run a connector behind the gateway
+
+Print the manifests, then serve the connector over MCP and put the [gateway](/gateway) in front of it.
+
+```sh
+reversi-connectors manifests github --format yaml > manifests/github.yaml
+
+export GITHUB_TOKEN=...   # credentials come from the environment, never from flags
+reversi-gateway --manifests ./manifests --data ./reversi-data \
+  --upstream-cmd reversi-connectors --upstream-arg serve --upstream-arg github
+```
+
+Undo a run with the same package as the compensator:
+
+```sh
+reversi rollback <run> --compensator-cmd "reversi-connectors compensate --root ."
+```
+
+`compensate` reads one compensation call as JSON on stdin, runs the matching tool and exits 0 when the undo
+succeeded. It enables each connector whose credential is in the environment; the filesystem connector is always
+enabled, rooted at `--root`. The call's `idempotency_key` is passed to Stripe as the `Idempotency-Key` header, so a
+retried rollback never repeats a side effect.
+
+| Command | Purpose |
+|---|---|
+| `serve <fs\|github\|slack\|stripe> [--root dir] [--backup-dir dir]` | MCP server on stdio |
+| `manifests <name\|all> [--format json\|yaml]` | Print manifests |
+| `compensate [--root dir] [--backup-dir dir]` | Run one compensation call from stdin |
+
+| Connector | Environment variable |
+|---|---|
+| `fs` | none; `--root` is the only directory it can touch |
+| `github` | `GITHUB_TOKEN` |
+| `slack` | `SLACK_BOT_TOKEN` |
+| `stripe` | `STRIPE_SECRET_KEY` |
+
+Secrets are redacted from every error message.
+
+In code:
+
+```ts
+import { allConnectors, compensatorFor } from "@multimindlab/reversi-connectors";
+
+const connectors = allConnectors({ fs: { root: "./work" }, github: { token: process.env.GITHUB_TOKEN! } });
+const registry = Registry.from(connectors.flatMap((c) => c.manifests));
+// ... run.call({ tool, args, reason, execute: (a) => connectors[0].tools[tool](a, {}) })
+await run.rollback({ compensate: compensatorFor(connectors) });
+```
+
+A failure that leaves the outcome unknown (a network error or timeout on a call that writes) throws
+`EffectUncertainError`, so the step is journaled `uncertain` and rollback reports it instead of guessing.
+
+## Filesystem (`fs`)
+
+Every path is relative to `--root`. Absolute paths, `..`, and symlinks that lead outside the root are rejected. The
+backup directory (default `<root>/.reversi-backups`) is reserved and hidden from `fs.list_dir`.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `fs.read_file`, `fs.list_dir` | read_only | `fs:read` | |
+| `fs.write_file` | reversible | `fs:write` | `fs.restore_file` (previous content, or deletes a new file) |
+| `fs.delete_file` | reversible | `fs:write` | `fs.restore_file` (file is moved into backups first) |
+| `fs.make_dir` | reversible | `fs:write` | `fs.remove_dir` |
+| `fs.move_file` | reversible | `fs:write` | `fs.unmove_file` |
+| `fs.restore_file`, `fs.remove_dir`, `fs.unmove_file` | idempotent | `fs:write` | |
+
+Running a compensation a second time succeeds and changes nothing. `fs.remove_dir` only removes empty directories.
+
+## GitHub (`github`)
+
+Calls `https://api.github.com` (override with `baseUrl`) with a bearer token and API version `2022-11-28`.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `github.get_issue` | read_only | `github:issues:read` | |
+| `github.create_issue` | reversible | `github:issues:write` | `github.close_issue` |
+| `github.add_comment` | reversible | `github:issues:write` | `github.delete_comment` (404 is success) |
+| `github.add_labels` | reversible | `github:issues:write` | `github.remove_labels` (only labels this call added) |
+| `github.create_branch` | reversible | `github:branch:write` | `github.delete_branch` (404 is success) |
+| `github.close_issue`, `github.delete_comment`, `github.remove_labels` | idempotent | `github:issues:write` | |
+| `github.delete_branch` | idempotent | `github:branch:delete` | |
+
+Limits:
+
+- Issues cannot be deleted through the API, so undoing `create_issue` closes it. The issue stays visible.
+- `github.delete_branch` is declared `idempotent` because it must be callable as a compensation. That also means an
+  agent that deletes a branch itself is not undone by rollback. Leave `github:branch:delete` out of the agent's
+  scope; compensations run outside the agent's scope.
+- Recreating a deleted branch needs its SHA, which the connector does not keep.
+
+## Slack (`slack`)
+
+Calls `https://slack.com/api`. Slack answers HTTP 200 with `{ "ok": false, "error": "..." }` on failure; the connector
+treats that as a failure.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `slack.list_channels` | read_only | `slack:channels:read` | |
+| `slack.post_message` | reversible | `slack:messages:write` | `slack.delete_message` |
+| `slack.add_reaction` | reversible | `slack:reactions:write` | `slack.remove_reaction` |
+| `slack.delete_message` | idempotent | `slack:messages:delete` | |
+| `slack.remove_reaction` | idempotent | `slack:reactions:write` | |
+
+`message_not_found`, `already_reacted` and `no_reaction` count as success where the goal is already met.
+
+Limits:
+
+- A bot can only delete messages it posted, and the workspace may forbid deletion. Then rollback reports the step as
+  failed.
+- People may have replied or seen the message before it is deleted.
+- If the bot had already reacted with the same emoji, `add_reaction` succeeds without changing anything, and rollback
+  still removes that reaction.
+
+## Stripe (`stripe`)
+
+Calls `https://api.stripe.com` with form-encoded bodies. Each write carries an `Idempotency-Key`: the engine's key when
+running a compensation, otherwise a fresh random one (so two deliberate identical calls are not merged).
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `stripe.retrieve_charge` | read_only | `stripe:charges:read` | |
+| `stripe.create_customer` | reversible | `stripe:customers:write` | `stripe.delete_customer` |
+| `stripe.create_payment_intent` | reversible | `stripe:payments:write` | `stripe.cancel_payment_intent` |
+| `stripe.delete_customer`, `stripe.cancel_payment_intent` | idempotent | `stripe:customers:write`, `stripe:payments:write` | |
+| `stripe.create_refund` | irreversible, approval always | `stripe:refund:write` | nothing |
+
+Limits:
+
+- Refunds move money and cannot be recalled. Rollback lists them as unrecoverable and a human must approve each one.
+- A payment intent that has already succeeded cannot be canceled; rollback fails that step. Create intents unconfirmed
+  and confirm them outside the agent.
+- A deleted Stripe customer cannot be restored, and its saved payment methods are gone. Rollback only deletes customers
+  the run created.

@@ -7,7 +7,7 @@
     "groups": [
       { "group": "Get started", "pages": ["index", "quickstart"] },
       { "group": "Concepts", "pages": ["concepts/manifests", "concepts/rollback", "concepts/ledger", "concepts/security-model"] },
-      { "group": "Use it", "pages": ["cli", "gateway", "sdks/typescript", "sdks/python", "viewer"] },
+      { "group": "Use it", "pages": ["cli", "gateway", "connectors", "sdks/typescript", "sdks/python", "viewer"] },
       { "group": "API reference", "pages": ["api-reference/overview", "api-reference/runs", "api-reference/operator"] },
       { "group": "Project", "pages": ["limits", "roadmap"] }
     ]

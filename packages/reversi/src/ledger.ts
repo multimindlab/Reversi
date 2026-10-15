@@ -54,6 +54,14 @@ export class LedgerError extends Error {
   }
 }
 
+/** A store refused an append because another writer took that sequence number. The ledger retries. */
+export class LedgerConflictError extends LedgerError {
+  constructor(message = "another writer appended first") {
+    super(message);
+    this.name = "LedgerConflictError";
+  }
+}
+
 export type VerifyResult = { ok: true; records: number; head: string } | { ok: false; seq: number; error: string };
 
 const RECORD_FIELDS: Array<[keyof LedgerRecord, "string" | "number" | "number|null"]> = [
@@ -102,7 +110,9 @@ export function verifyRecords(records: readonly LedgerRecord[]): VerifyResult {
 }
 
 export interface LedgerStore {
+  /** Every record, oldest first. Shared stores refresh from the backend on each call. */
   all(): readonly LedgerRecord[];
+  /** Must throw {@link LedgerConflictError} if `record.seq` is already taken. */
   append(record: LedgerRecord): void;
 }
 
@@ -184,24 +194,31 @@ export class Ledger {
     if (!input.reason || !input.reason.trim()) {
       throw new LedgerError("every ledger record needs a non-empty reason");
     }
-    const all = this.store.all();
-    const last = all[all.length - 1];
-    const body: Omit<LedgerRecord, "hash"> = {
-      seq: all.length,
-      ts_ms: input.ts_ms,
-      run_id: input.run_id,
-      step: input.step ?? null,
-      actor: input.actor,
-      tool: input.tool,
-      payload_hash: hashPayload(input.payload),
-      reason: redactSecrets(input.reason),
-      event: input.event,
-      detail: redactSecrets(input.detail ?? ""),
-      prev_hash: last ? last.hash : GENESIS_HASH,
-    };
-    const record: LedgerRecord = { ...body, hash: hashOf(body) };
-    this.store.append(record);
-    return record;
+    for (let attempt = 1; ; attempt++) {
+      const all = this.store.all();
+      const last = all[all.length - 1];
+      const body: Omit<LedgerRecord, "hash"> = {
+        seq: all.length,
+        ts_ms: input.ts_ms,
+        run_id: input.run_id,
+        step: input.step ?? null,
+        actor: input.actor,
+        tool: input.tool,
+        payload_hash: hashPayload(input.payload),
+        reason: redactSecrets(input.reason),
+        event: input.event,
+        detail: redactSecrets(input.detail ?? ""),
+        prev_hash: last ? last.hash : GENESIS_HASH,
+      };
+      const record: LedgerRecord = { ...body, hash: hashOf(body) };
+      try {
+        this.store.append(record);
+        return record;
+      } catch (e) {
+        if (e instanceof LedgerConflictError && attempt < 8) continue; // re-read the tail and try again
+        throw e;
+      }
+    }
   }
 
   records(): readonly LedgerRecord[] {

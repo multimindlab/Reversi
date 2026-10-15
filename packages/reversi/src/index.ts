@@ -15,6 +15,7 @@ export {
   GENESIS_HASH,
   JsonlLedgerStore,
   Ledger,
+  LedgerConflictError,
   LedgerError,
   MemoryLedgerStore,
   parseJsonl,
@@ -102,3 +103,4 @@ export {
   type EvidenceBundle,
   type SigningKey,
 } from "./evidence.js";
+export { dataOptionsFromEnv, openData, storeKindFrom, type Data, type DataOptions, type StoreKind } from "./data.js";

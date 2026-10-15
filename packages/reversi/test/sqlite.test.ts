@@ -80,3 +80,20 @@ describe("SQLite stores", () => {
     second.db.close();
   });
 });
+
+describe("SQLite shared by two processes", () => {
+  it("a second store sees and extends the first one's chain", () => {
+    const path = dbPath();
+    const a = openSqliteStores(path);
+    const b = openSqliteStores(path);
+    const la = new Ledger(a.ledger);
+    const lb = new Ledger(b.ledger);
+    la.append({ ts_ms: 1, run_id: "r", actor: "a", tool: "t", reason: "one", event: "run_started" });
+    lb.append({ ts_ms: 2, run_id: "r", actor: "b", tool: "t", reason: "two", event: "intended" });
+    la.append({ ts_ms: 3, run_id: "r", actor: "a", tool: "t", reason: "three", event: "succeeded" });
+    expect(lb.verify()).toMatchObject({ ok: true, records: 3 });
+    expect(la.records().map((r) => r.reason)).toEqual(["one", "two", "three"]);
+    a.db.close();
+    b.db.close();
+  });
+});

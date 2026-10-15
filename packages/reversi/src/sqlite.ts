@@ -8,7 +8,8 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { LedgerRecord, LedgerStore } from "./ledger.js";
+import type { ApprovalRecord, ApprovalStore } from "./approvals.js";
+import { LedgerConflictError, type LedgerRecord, type LedgerStore } from "./ledger.js";
 import { RUN_ID_PATTERN, type RunState, type RunStore } from "./store.js";
 
 export function openDatabase(path: string): DatabaseSync {
@@ -30,21 +31,35 @@ export function openDatabase(path: string): DatabaseSync {
       run_id TEXT PRIMARY KEY,
       state TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS approvals (
+      id TEXT PRIMARY KEY,
+      record TEXT NOT NULL
+    );
   `);
   return db;
 }
 
 export class SqliteLedgerStore implements LedgerStore {
-  private readonly items: LedgerRecord[];
+  private readonly items: LedgerRecord[] = [];
   constructor(private readonly db: DatabaseSync) {
-    const rows = db.prepare("SELECT record FROM ledger ORDER BY seq").all() as Array<{ record: string }>;
-    this.items = rows.map((r) => JSON.parse(r.record) as LedgerRecord);
+    this.sync();
+  }
+  /** Pick up records another process appended since the last call. */
+  private sync(): void {
+    const rows = this.db.prepare("SELECT record FROM ledger WHERE seq >= ? ORDER BY seq").all(this.items.length) as Array<{ record: string }>;
+    for (const r of rows) this.items.push(JSON.parse(r.record) as LedgerRecord);
   }
   all(): readonly LedgerRecord[] {
+    this.sync();
     return this.items;
   }
   append(record: LedgerRecord): void {
-    this.db.prepare("INSERT INTO ledger (seq, record) VALUES (?, ?)").run(record.seq, JSON.stringify(record));
+    try {
+      this.db.prepare("INSERT INTO ledger (seq, record) VALUES (?, ?)").run(record.seq, JSON.stringify(record));
+    } catch (e) {
+      if (/UNIQUE constraint failed|PRIMARY KEY/i.test(e instanceof Error ? e.message : "")) throw new LedgerConflictError();
+      throw e;
+    }
     this.items.push(record);
   }
 }
@@ -74,8 +89,29 @@ export class SqliteRunStore implements RunStore {
   }
 }
 
-/** Open one database file and return both stores over it. */
-export function openSqliteStores(path: string): { db: DatabaseSync; ledger: SqliteLedgerStore; runs: SqliteRunStore } {
+export class SqliteApprovalStore implements ApprovalStore {
+  constructor(private readonly db: DatabaseSync) {}
+  get(id: string): ApprovalRecord | undefined {
+    const row = this.db.prepare("SELECT record FROM approvals WHERE id = ?").get(id) as { record: string } | undefined;
+    return row ? (JSON.parse(row.record) as ApprovalRecord) : undefined;
+  }
+  put(rec: ApprovalRecord): void {
+    this.db
+      .prepare("INSERT INTO approvals (id, record) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET record = excluded.record")
+      .run(rec.id, JSON.stringify(rec));
+  }
+  list(): ApprovalRecord[] {
+    return (this.db.prepare("SELECT record FROM approvals").all() as Array<{ record: string }>).map((r) => JSON.parse(r.record) as ApprovalRecord);
+  }
+}
+
+/** Open one database file and return the stores over it. */
+export function openSqliteStores(path: string): {
+  db: DatabaseSync;
+  ledger: SqliteLedgerStore;
+  runs: SqliteRunStore;
+  approvals: SqliteApprovalStore;
+} {
   const db = openDatabase(path);
-  return { db, ledger: new SqliteLedgerStore(db), runs: new SqliteRunStore(db) };
+  return { db, ledger: new SqliteLedgerStore(db), runs: new SqliteRunStore(db), approvals: new SqliteApprovalStore(db) };
 }
