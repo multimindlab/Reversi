@@ -34,6 +34,8 @@ jobs:
       - run: npm run test:py
       - name: Fixtures are in sync
         run: node scripts/gen-fixtures.mjs --check
+      - name: Docs compile (Mintlify refuses to deploy on a syntax error)
+        run: npm run check:docs
   supply-chain:
     runs-on: ubuntu-latest
     steps:
