@@ -29,4 +29,6 @@ const run = reversi.startRun({ actor: "agent", scope: SealedScope.seal(["orders:
 | `EffectUncertainError` | Throw from `execute` when you do not know whether the effect happened |
 
 `loadRegistry(path)` and `openLocal(dir, registry)` load YAML/JSON manifests and open a file-backed engine.
+
+For SQLite (Node 22.13+), import from `@multimindlab/reversi/sqlite`: `openSqliteStores(path)` returns `{ db, ledger, runs }` to pass to `new Ledger(ledger)` and `new Reversi({ runs })`. The ledger table rejects UPDATE and DELETE. The server uses it with `REVERSI_STORE=sqlite` (database at `$REVERSI_DATA/reversi.db`); the CLI still reads the file layout.
 Stores are interfaces (`LedgerStore`, `RunStore`); SQLite and Postgres implementations are on the roadmap.
