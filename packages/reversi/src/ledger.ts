@@ -10,6 +10,7 @@
  */
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
 import { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
+import { redactSecrets } from "./redact.js";
 
 export const GENESIS_HASH = "0".repeat(64);
 
@@ -193,9 +194,9 @@ export class Ledger {
       actor: input.actor,
       tool: input.tool,
       payload_hash: hashPayload(input.payload),
-      reason: input.reason,
+      reason: redactSecrets(input.reason),
       event: input.event,
-      detail: input.detail ?? "",
+      detail: redactSecrets(input.detail ?? ""),
       prev_hash: last ? last.hash : GENESIS_HASH,
     };
     const record: LedgerRecord = { ...body, hash: hashOf(body) };
