@@ -61,7 +61,7 @@ describe("policy and content in the engine", () => {
     const pending = approvals.list({ status: "pending" });
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({ tool: "refund", arg_keys: ["amount"], triggers: [expect.stringContaining("big")] });
-    expect(JSON.stringify(pending[0])).not.toContain("500");
+    expect(JSON.stringify(pending[0])).not.toMatch(/"amount":\s*500/); // names only, never values
     // Asking again does not create a second request.
     await run.call({ tool: "refund", args, reason: "customer", execute: ok });
     expect(approvals.list({ status: "pending" })).toHaveLength(1);

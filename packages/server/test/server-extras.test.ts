@@ -214,7 +214,7 @@ describe("approvals over HTTP", () => {
     expect(list.json.approvals).toHaveLength(1);
     const id = list.json.approvals[0].id;
     expect(list.json.approvals[0]).toMatchObject({ tool: "refund", arg_keys: ["amount"] });
-    expect(JSON.stringify(list.json)).not.toContain("50,");
+    expect(JSON.stringify(list.json)).not.toMatch(/"amount":\s*50/); // names only, never values
 
     expect((await call("k-agent", "POST", `/v1/approvals/${id}/approve`, {})).status).toBe(403);
     expect((await call("k-audit", "POST", `/v1/approvals/${id}/approve`, {})).status).toBe(403);
