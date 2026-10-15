@@ -1,70 +1,52 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import {
+  ApprovalError,
   LedgerError,
   RUN_ID_PATTERN,
   Reversi,
   ReversiError,
   SealedScope,
+  createBundle,
+  keyId,
+  renderReport,
   toJsonl,
-  type Approver,
+  type Approvals,
   type Mode,
   type Outcome,
+  type SigningKey,
 } from "@multimindlab/reversi";
+import { KeyRing, OidcVerifier, can, isAgent, type ApiKey, type Capability, type Principal } from "./auth.js";
+import { mountConsole } from "./console.js";
+import { Metrics } from "./metrics.js";
 
-export type Role = "agent" | "operator";
-
-export interface ApiKey {
-  /** Identifies the caller. For agent keys this is the `actor` recorded in the ledger. */
-  name: string;
-  role: Role;
-  /** Plain key. Prefer `key_sha256` in files you keep around. */
-  key?: string;
-  /** Lowercase hex SHA-256 of the key. */
-  key_sha256?: string;
-  /** Agent keys only: the most permissions a run opened with this key may request. Omit for no cap. */
-  max_permissions?: string[];
+export interface LogEntry {
+  ts: string;
+  method: string;
+  path: string;
+  status: number;
+  ms: number;
+  principal: string | null;
 }
 
 export interface AppOptions {
-  /** The engine's approver is replaced by the server's grant mechanism; do not pass one in `reversi`. */
+  /** The engine's approver should be `approvals.asApprover()`. */
   reversi: Reversi;
-  keys: ApiKey[];
-  grants: Grants;
+  approvals: Approvals;
+  keys: ApiKey[] | KeyRing;
+  oidc?: OidcVerifier;
+  /** Enables signed evidence bundles. */
+  signing_key?: SigningKey;
   maxBodyBytes?: number;
-}
-
-/** Operator-issued, single-use approvals. In memory by design: a restart revokes them (fails safe). */
-export class Grants {
-  private readonly counts = new Map<string, number>();
-  private k(run: string, kind: string, tool: string) {
-    return JSON.stringify([run, kind, tool]);
-  }
-  add(run: string, kind: "call" | "compensation", tool: string, count = 1): void {
-    const k = this.k(run, kind, tool);
-    this.counts.set(k, (this.counts.get(k) ?? 0) + count);
-  }
-  /** Consume one grant if present. */
-  take(run: string, kind: string, tool: string): boolean {
-    const k = this.k(run, kind, tool);
-    const n = this.counts.get(k) ?? 0;
-    if (n <= 0) return false;
-    if (n === 1) this.counts.delete(k);
-    else this.counts.set(k, n - 1);
-    return true;
-  }
-  asApprover(): Approver {
-    return (r) => this.take(r.run_id, r.kind, r.tool);
-  }
-}
-
-const sha = (s: string) => createHash("sha256").update(s).digest();
-
-interface Principal {
-  name: string;
-  role: Role;
-  max_permissions?: string[];
+  /** One call per request, after the response. Default: none. Never receives bodies or credentials. */
+  logger?: (e: LogEntry) => void;
+  /** Serve /metrics without credentials (otherwise an auditor-or-higher key is required). */
+  metrics_public?: boolean;
+  /** Signs console session cookies. Random per process by default, so sessions end on restart. */
+  session_secret?: string;
+  secure_cookies?: boolean;
+  now?: () => number;
 }
 
 class HttpError extends Error {
@@ -91,44 +73,77 @@ function stepParam(c: Context): number {
   return n;
 }
 
-export function createApp(opts: AppOptions): Hono {
-  const { reversi, grants } = opts;
-  const keys = opts.keys.map((k) => {
-    if (!k.key && !k.key_sha256) throw new Error(`key \`${k.name}\` needs \`key\` or \`key_sha256\``);
-    return { ...k, digest: k.key_sha256 ? Buffer.from(k.key_sha256, "hex") : sha(k.key as string) };
-  });
-  for (const k of keys) if (k.digest.length !== 32) throw new Error(`key \`${k.name}\`: key_sha256 must be 64 hex chars`);
+type Env = { Variables: { who: Principal } };
 
-  const authenticate = (header: string | undefined): Principal | null => {
+export function createApp(opts: AppOptions): Hono {
+  const { reversi, approvals } = opts;
+  const ring = opts.keys instanceof KeyRing ? opts.keys : new KeyRing(opts.keys, opts.now);
+  const metrics = new Metrics();
+  const now = opts.now ?? Date.now;
+
+  const authenticate = async (header: string | undefined): Promise<Principal | null> => {
     const m = /^Bearer (.+)$/.exec(header ?? "");
-    if (!m) return null;
-    const d = sha(m[1] as string);
-    let found: Principal | null = null;
-    for (const k of keys) {
-      // Compare every key so timing does not reveal which one matched.
-      if (timingSafeEqual(d, k.digest) && !found) found = { name: k.name, role: k.role, max_permissions: k.max_permissions };
-    }
-    return found;
+    return m ? authenticateToken(m[1] as string) : null;
+  };
+  const authenticateToken = async (token: string): Promise<Principal | null> => {
+    const k = ring.authenticate(token);
+    if (k) return k;
+    // JWTs have two dots; skip the issuer round trip for anything else.
+    return opts.oidc && token.split(".").length === 3 ? opts.oidc.authenticate(token) : null;
   };
 
-  const app = new Hono<{ Variables: { who: Principal } }>();
+  const app = new Hono<Env>();
+
+  // Request log and metrics. Route labels use the matched pattern, so ids never create new series.
+  app.use("*", async (c, next) => {
+    const t0 = performance.now();
+    await next();
+    const ms = performance.now() - t0;
+    const route = c.req.routePath === "/*" ? "unmatched" : c.req.routePath;
+    metrics.request(c.req.method, route, c.res.status, ms);
+    const who = c.get("who") as Principal | undefined;
+    opts.logger?.({ ts: new Date(now()).toISOString(), method: c.req.method, path: c.req.path, status: c.res.status, ms: Math.round(ms * 10) / 10, principal: who?.name ?? null });
+  });
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+  app.get("/readyz", (c) => {
+    try {
+      reversi.runIds();
+      const head = reversi.ledger.head();
+      return c.json({ ok: true, ledger_head: head, halted: reversi.halted() });
+    } catch {
+      return c.json({ ok: false }, 503);
+    }
+  });
+
+  app.get("/metrics", async (c) => {
+    if (!opts.metrics_public) {
+      const who = await authenticate(c.req.header("authorization"));
+      if (!who) return c.json({ error: "missing or invalid API key" }, 401, { "WWW-Authenticate": "Bearer" });
+      if (!can(who, "read")) return c.json({ error: "auditor role required" }, 403);
+    }
+    return c.text(metrics.render({ ledger: reversi.ledger, approvals, halted: reversi.halted(), runs: reversi.runIds().length }), 200, {
+      "Content-Type": "text/plain; version=0.0.4",
+    });
+  });
 
   app.use("/v1/*", bodyLimit({ maxSize: opts.maxBodyBytes ?? 1_000_000, onError: (c) => c.json({ error: "body too large" }, 413) }));
   app.use("/v1/*", async (c, next) => {
-    const who = authenticate(c.req.header("authorization"));
+    const who = await authenticate(c.req.header("authorization"));
     if (!who) return c.json({ error: "missing or invalid API key" }, 401, { "WWW-Authenticate": "Bearer" });
     c.set("who", who);
     await next();
   });
 
-  const operatorOnly = (c: Context<{ Variables: { who: Principal } }>) => {
-    if (c.get("who").role !== "operator") throw new HttpError(403, "operator key required");
+  const need = (c: Context<Env>, cap: Capability) => {
+    if (!can(c.get("who"), cap)) {
+      const label = { "runs:own": "agent", read: "auditor", approve: "approver", rollback: "operator", halt: "admin" }[cap];
+      throw new HttpError(403, `${label} role required`);
+    }
   };
 
-  /** Agents may only touch runs they opened; operators may touch any. */
-  const openRun = (c: Context<{ Variables: { who: Principal } }>, id: string) => {
+  /** Agents may only touch runs they opened; anyone with a read role may see any. */
+  const openRun = (c: Context<Env>, id: string, write = false) => {
     let run;
     try {
       run = reversi.openRun(id);
@@ -136,7 +151,8 @@ export function createApp(opts: AppOptions): Hono {
       throw new HttpError(404, `run \`${id}\` not found`);
     }
     const who = c.get("who");
-    if (who.role === "agent" && run.state().actor !== who.name) throw new HttpError(404, `run \`${id}\` not found`);
+    if (isAgent(who) && run.state().actor !== who.name) throw new HttpError(404, `run \`${id}\` not found`);
+    if (write && !can(who, "runs:own") && !can(who, "rollback")) throw new HttpError(403, "agent or operator role required");
     return run;
   };
 
@@ -151,8 +167,19 @@ export function createApp(opts: AppOptions): Hono {
     return v;
   };
 
+  const evidenceBundle = (run_id: string | null) => {
+    if (!opts.signing_key) throw new HttpError(404, "signed bundles are not enabled on this server");
+    const records = run_id ? reversi.ledger.forRun(run_id) : reversi.ledger.records();
+    return createBundle({ records, ledger_head: reversi.ledger.head(), run_id, key: opts.signing_key, now: now() });
+  };
+  const runReport = (run_id: string) => {
+    const run = reversi.openRun(run_id);
+    return renderReport({ run: run.state(), records: reversi.ledger.forRun(run_id), plan: run.plan(), ledger_head: reversi.ledger.head(), generated_ms: now() });
+  };
+
   // ---- runs ----
   app.post("/v1/runs", async (c) => {
+    need(c, "runs:own");
     const who = c.get("who");
     const b = await body(c);
     const run_id = str(b, "run_id", { optional: true });
@@ -180,7 +207,7 @@ export function createApp(opts: AppOptions): Hono {
 
   app.get("/v1/runs", (c) => {
     const who = c.get("who");
-    const ids = reversi.runIds().filter((id) => who.role === "operator" || reversi.openRun(id).state().actor === who.name);
+    const ids = reversi.runIds().filter((id) => !isAgent(who) || reversi.openRun(id).state().actor === who.name);
     return c.json({ runs: ids });
   });
 
@@ -191,6 +218,7 @@ export function createApp(opts: AppOptions): Hono {
 
   // ---- agent plane: journal intent, then outcome ----
   app.post("/v1/runs/:id/intents", async (c) => {
+    need(c, "runs:own");
     const run = openRun(c, c.req.param("id"));
     const b = await body(c);
     const deps = b.depends_on;
@@ -207,6 +235,7 @@ export function createApp(opts: AppOptions): Hono {
   });
 
   app.post("/v1/runs/:id/steps/:n/outcome", async (c) => {
+    need(c, "runs:own");
     const run = openRun(c, c.req.param("id"));
     const n = stepParam(c);
     const b = await body(c);
@@ -219,32 +248,96 @@ export function createApp(opts: AppOptions): Hono {
     return c.json(run.complete(n, outcome));
   });
 
-  // ---- operator plane ----
+  // ---- read plane (auditor and up) ----
   app.get("/v1/runs/:id/plan", (c) => {
-    operatorOnly(c);
+    need(c, "read");
     return c.json(openRun(c, c.req.param("id")).plan());
   });
 
+  app.get("/v1/runs/:id/export", (c) => {
+    need(c, "read");
+    openRun(c, c.req.param("id"));
+    return c.body(toJsonl(reversi.ledger.forRun(c.req.param("id"))), 200, { "Content-Type": "application/x-ndjson" });
+  });
+
+  app.get("/v1/runs/:id/report", (c) => {
+    need(c, "read");
+    openRun(c, c.req.param("id"));
+    return c.html(runReport(c.req.param("id")));
+  });
+
+  app.get("/v1/runs/:id/bundle", (c) => {
+    need(c, "read");
+    openRun(c, c.req.param("id"));
+    return c.json(evidenceBundle(c.req.param("id")));
+  });
+
+  app.get("/v1/ledger/bundle", (c) => {
+    need(c, "read");
+    return c.json(evidenceBundle(null));
+  });
+
+  app.get("/v1/ledger/verify", (c) => {
+    need(c, "read");
+    return c.json(reversi.ledger.verify());
+  });
+
+  app.get("/v1/evidence/key", (c) => {
+    need(c, "read");
+    if (!opts.signing_key) throw new HttpError(404, "signed bundles are not enabled on this server");
+    return c.json({ alg: "ed25519", key_id: keyId(opts.signing_key.public_pem), public_key_pem: opts.signing_key.public_pem });
+  });
+
+  app.get("/v1/status", (c) => {
+    need(c, "read");
+    return c.json({ halted: reversi.halted(), environment: reversi.environment, runs: reversi.runIds().length, pending_approvals: approvals.list({ status: "pending" }).length });
+  });
+
+  // ---- approvals ----
+  app.get("/v1/approvals", (c) => {
+    need(c, "read");
+    const status = c.req.query("status");
+    if (status && !["pending", "approved", "denied", "consumed", "expired"].includes(status)) throw new HttpError(400, "unknown status");
+    return c.json({ approvals: approvals.list({ status: status as never, run_id: c.req.query("run_id") }) });
+  });
+
+  for (const decision of ["approve", "deny"] as const) {
+    app.post(`/v1/approvals/:id/${decision}`, async (c) => {
+      need(c, "approve");
+      const b = c.req.header("content-length") === "0" ? {} : await body(c).catch(() => ({}));
+      const note = typeof b.note === "string" && b.note.trim() ? b.note : undefined;
+      const by = c.get("who").name;
+      try {
+        return c.json(decision === "approve" ? approvals.approve(c.req.param("id"), by, note) : approvals.deny(c.req.param("id"), by, note));
+      } catch (e) {
+        if (e instanceof ApprovalError) throw new HttpError(/not found/.test(e.message) ? 404 : 409, e.message);
+        throw e;
+      }
+    });
+  }
+
+  /** Pre-approve a tool in a run, for any arguments (counts down per use). */
   app.post("/v1/runs/:id/approvals", async (c) => {
-    operatorOnly(c);
+    need(c, "approve");
     const run = openRun(c, c.req.param("id"));
     const b = await body(c);
     const kind = b.kind ?? "call";
     if (kind !== "call" && kind !== "compensation") throw new HttpError(400, "`kind` must be call or compensation");
     const count = b.count ?? 1;
     if (!Number.isInteger(count) || (count as number) < 1 || (count as number) > 100) throw new HttpError(400, "`count` must be 1..100");
-    grants.add(run.run_id, kind, str(b, "tool") as string, count as number);
+    approvals.add(run.run_id, kind, str(b, "tool") as string, count as number, c.get("who").name);
     return c.json({ ok: true }, 201);
   });
 
+  // ---- rollback and reconciliation (operator and up) ----
   app.post("/v1/runs/:id/steps/:n/compensation", async (c) => {
-    operatorOnly(c);
+    need(c, "rollback");
     const run = openRun(c, c.req.param("id"));
     return c.json(await run.beginCompensation(stepParam(c), { actor: c.get("who").name }));
   });
 
   app.post("/v1/runs/:id/steps/:n/compensation/outcome", async (c) => {
-    operatorOnly(c);
+    need(c, "rollback");
     const run = openRun(c, c.req.param("id"));
     const b = await body(c);
     if (b.status === "compensated") run.completeCompensation(stepParam(c), { status: "compensated" }, { actor: c.get("who").name });
@@ -258,15 +351,40 @@ export function createApp(opts: AppOptions): Hono {
     return c.json({ ok: true });
   });
 
-  app.get("/v1/runs/:id/export", (c) => {
-    operatorOnly(c);
-    openRun(c, c.req.param("id"));
-    return c.body(toJsonl(reversi.ledger.forRun(c.req.param("id"))), 200, { "Content-Type": "application/x-ndjson" });
+  /** Settle a step whose outcome was unknown, after checking the downstream system. */
+  app.post("/v1/runs/:id/steps/:n/resolve", async (c) => {
+    need(c, "rollback");
+    const run = openRun(c, c.req.param("id"));
+    const b = await body(c);
+    if (b.status !== "succeeded" && b.status !== "failed") throw new HttpError(400, "`status` must be succeeded or failed");
+    const outcome: Outcome = b.status === "succeeded" ? { status: "succeeded", result: b.result } : { status: "failed", error: typeof b.error === "string" ? b.error : undefined };
+    return c.json(run.resolve(stepParam(c), outcome, { actor: c.get("who").name, note: str(b, "note") as string }));
   });
 
-  app.get("/v1/ledger/verify", (c) => {
-    operatorOnly(c);
-    return c.json(reversi.ledger.verify());
+  // ---- kill switch (admin) ----
+  app.post("/v1/halt", async (c) => {
+    need(c, "halt");
+    const b = await body(c);
+    reversi.halt(`${str(b, "reason")} (by ${c.get("who").name})`);
+    return c.json({ halted: reversi.halted() });
+  });
+  app.post("/v1/resume", (c) => {
+    need(c, "halt");
+    reversi.resume();
+    return c.json({ halted: reversi.halted() });
+  });
+
+  mountConsole(app as unknown as Hono, {
+    reversi,
+    approvals,
+    authenticate: authenticateToken,
+    session_secret: opts.session_secret ?? randomBytes(32).toString("hex"),
+    secure_cookies: opts.secure_cookies ?? false,
+    session_ttl_ms: 8 * 3600_000,
+    signing_available: !!opts.signing_key,
+    report: runReport,
+    bundle: evidenceBundle,
+    now,
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));

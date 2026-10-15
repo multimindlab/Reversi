@@ -703,9 +703,19 @@ export class Run {
     const compTool = a.compensation_tool as string;
     if (a.needs_approval) {
       const approver = this.rv.internals.approver;
-      const ok = approver
-        ? await approver({ run_id: this.run_id, step: step_no, tool: compTool, reason, kind: "compensation" })
+      const decision = approver
+        ? await approver({
+            run_id: this.run_id,
+            step: step_no,
+            tool: compTool,
+            reason,
+            kind: "compensation",
+            args_hash: hashPayload(a.args ?? {}),
+            triggers: ["manifest requires approval for this compensation"],
+            arg_keys: Object.keys(a.args ?? {}).slice(0, 50),
+          })
         : false;
+      const ok = typeof decision === "boolean" ? decision : decision.approved;
       if (!ok) {
         this.emit(
           "blocked",
@@ -713,7 +723,11 @@ export class Run {
           compTool,
           a.args,
           reason,
-          approver ? "compensation approval denied" : "compensation needs approval but no approver is configured",
+          typeof decision === "object" && decision.message
+            ? decision.message
+            : approver
+              ? "compensation approval denied"
+              : "compensation needs approval but no approver is configured",
           actor,
         );
         return { decision: "awaiting_approval", step: step_no };

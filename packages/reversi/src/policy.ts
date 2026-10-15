@@ -4,6 +4,7 @@
  * on top of the manifest and the run's scope; it cannot grant a permission the scope lacks.
  */
 import { globAny } from "./glob.js";
+import type { CheckAction, ContentConfig } from "./content.js";
 import { EFFECTS, resolveRef, type Effect } from "./manifest.js";
 
 export type PolicyAction = "allow" | "deny" | "require_approval";
@@ -57,6 +58,8 @@ export interface PolicyDoc {
   rules: PolicyRule[];
   limits: Limit[];
   tests: PolicyTestCase[];
+  /** Content-check settings, if the file has a `content:` section. */
+  content?: Partial<ContentConfig>;
 }
 
 export interface PolicyInput {
@@ -118,10 +121,48 @@ function validateCondition(c: unknown, where: string, errors: string[]): void {
   if (c.op !== "exists" && c.value === undefined) errors.push(`${where}: condition needs a value`);
 }
 
+const CHECK_ACTIONS: CheckAction[] = ["flag", "require_approval", "deny"];
+
+function parseContent(raw: unknown, errors: string[]): Partial<ContentConfig> | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRec(raw)) {
+    errors.push("`content` must be an object");
+    return undefined;
+  }
+  const out: Partial<ContentConfig> = {};
+  for (const k of Object.keys(raw)) {
+    if (!["secrets", "encoded_payloads", "injection", "cumulative", "max_string_bytes"].includes(k)) errors.push(`content: unknown field \`${k}\``);
+  }
+  for (const k of ["secrets", "encoded_payloads", "injection"] as const) {
+    if (raw[k] === undefined) continue;
+    if (!CHECK_ACTIONS.includes(raw[k] as CheckAction)) errors.push(`content.${k} must be ${CHECK_ACTIONS.join(", ")}`);
+    else out[k] = raw[k] as CheckAction;
+  }
+  if (raw.max_string_bytes !== undefined) {
+    if (!Number.isInteger(raw.max_string_bytes) || (raw.max_string_bytes as number) < 1) errors.push("content.max_string_bytes must be a positive integer");
+    else out.max_string_bytes = raw.max_string_bytes as number;
+  }
+  if (raw.cumulative !== undefined) {
+    if (!Array.isArray(raw.cumulative)) errors.push("content.cumulative must be a list");
+    else {
+      out.cumulative = [];
+      raw.cumulative.forEach((c: unknown, i: number) => {
+        const w = `content.cumulative[${i}]`;
+        if (!isRec(c) || typeof c.id !== "string" || !c.id) return void errors.push(`${w}: id is required`);
+        if (!Array.isArray(c.sources) || !c.sources.length || !c.sources.every((x) => typeof x === "string")) errors.push(`${w}: sources must be a non-empty list of tool globs`);
+        if (!Array.isArray(c.egress) || !c.egress.length || !c.egress.every((x) => typeof x === "string")) errors.push(`${w}: egress must be a non-empty list of tool globs`);
+        if (!CHECK_ACTIONS.includes(c.action as CheckAction)) errors.push(`${w}: action must be ${CHECK_ACTIONS.join(", ")}`);
+        out.cumulative?.push(c as unknown as ContentConfig["cumulative"][number]);
+      });
+    }
+  }
+  return out;
+}
+
 export function parsePolicy(raw: unknown): PolicyDoc {
   const errors: string[] = [];
   if (!isRec(raw)) throw new PolicyError(["policy must be an object"]);
-  for (const k of Object.keys(raw)) if (!["version", "default", "rules", "limits", "tests"].includes(k)) errors.push(`unknown field \`${k}\``);
+  for (const k of Object.keys(raw)) if (!["version", "default", "rules", "limits", "tests", "content"].includes(k)) errors.push(`unknown field \`${k}\``);
   if (raw.version !== undefined && raw.version !== 1) errors.push("`version` must be 1");
   const def = raw.default ?? "allow";
   if (def !== "allow" && def !== "deny") errors.push("`default` must be allow or deny");
@@ -157,8 +198,9 @@ export function parsePolicy(raw: unknown): PolicyDoc {
     limits.push({ ...(l as unknown as Limit), per: (l.per as Limit["per"]) ?? "run", match: validateMatch(l.match, where, errors) });
   }
   const tests = raw.tests === undefined ? [] : Array.isArray(raw.tests) ? (raw.tests as PolicyTestCase[]) : (errors.push("`tests` must be a list"), []);
+  const content = parseContent(raw.content, errors);
   if (errors.length) throw new PolicyError(errors);
-  return { version: 1, default: def as "allow" | "deny", rules, limits, tests };
+  return { version: 1, default: def as "allow" | "deny", rules, limits, tests, ...(content ? { content } : {}) };
 }
 
 function matches(m: Match, i: PolicyInput): boolean {
