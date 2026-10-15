@@ -1,0 +1,41 @@
+---
+title: Python SDK
+description: reversi-sdk: a client for the Reversi server, plus offline verification. Standard library only.
+---
+
+```bash
+pip install reversi-sdk
+```
+
+```python
+from reversi_sdk import ReversiClient, Blocked, EffectUncertain
+
+client = ReversiClient("http://127.0.0.1:7421", api_key="agent-key")
+run = client.start_run(["orders:write"], reason="support chat 4821")
+
+try:
+    order = run.call("create_order", "customer asked for BOOK-1",
+                     lambda args: shop.create_order(**args), args={"sku": "BOOK-1"})
+except Blocked as e:
+    print("refused:", e.reasons)       # the tool never ran
+```
+
+`call` journals the intent **before** running your function and the outcome after. Raise `EffectUncertain` when you
+cannot tell whether the effect happened. Operator methods (`plan`, `approve`, `begin_compensation`,
+`complete_compensation`, `export_jsonl`) need an operator key.
+
+## Offline tools (no server)
+
+```python
+from reversi_sdk import verify_file, validate_manifest
+print(verify_file("ledger.jsonl"))
+manifest, errors = validate_manifest({"tool": "x", "effect": "read_only", "permission": "p"})
+```
+
+`python -m reversi_sdk verify ledger.jsonl` works from a shell. The Python validator and verifier are tested against
+the TypeScript implementation on shared fixtures. Manifests are read from JSON; convert YAML first.
+
+<Note>
+Canonical JSON for payload hashing rejects non-whole floats outside 1e-4 to 1e16, where Python and JavaScript format
+numbers differently. Pass such values as strings.
+</Note>

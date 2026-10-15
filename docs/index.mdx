@@ -1,0 +1,37 @@
+---
+title: Reversi
+description: Reversibility, approvals and tamper-evident evidence for every tool an AI agent can touch.
+---
+
+Agents now write to real systems: orders, payments, tickets, email. When a run goes wrong, teams need
+three answers: **what changed, why, and how do we undo it?**
+
+Reversi sits between an agent and its tools and gives you:
+
+<CardGroup cols={2}>
+  <Card title="Tool manifests" icon="file-code" href="/concepts/manifests">
+    Declare per tool: how reversible it is, what undoes it, which permission it needs.
+  </Card>
+  <Card title="Saga rollback" icon="rotate-left" href="/concepts/rollback">
+    Undo a run newest-first, idempotently, and never claim an irreversible step was undone.
+  </Card>
+  <Card title="Hash-chained ledger" icon="link" href="/concepts/ledger">
+    Who did what and why. Edits, deletions and reordering are detectable with the Python standard library.
+  </Card>
+  <Card title="Approvals and scopes" icon="shield-check" href="/concepts/security-model">
+    Irreversible calls need a human. Rollback and approval are operator actions, never the agent's.
+  </Card>
+</CardGroup>
+
+## What you get today
+
+- A TypeScript core library and CLI (`@multimindlab/reversi`, `@multimindlab/reversi-cli`)
+- An HTTP API server (`@multimindlab/reversi-server`) for agents in any language
+- A stdlib-only Python SDK (`reversi-sdk`)
+- A browser trace viewer that verifies the ledger locally
+- Not yet: an MCP gateway, a hosted dashboard, Postgres storage. See the [roadmap](/roadmap) and [limits](/limits).
+
+<Warning>
+Reversi records and enforces what manifests declare. It cannot discover what a tool really does. A manifest that
+lies makes Reversi lie. See [limits](/limits).
+</Warning>

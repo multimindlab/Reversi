@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reversi.multimind.dev/schemas/manifest.schema.json",
+  "title": "Reversi tool manifest",
+  "description": "Declares how reversible one tool is, what undoes it, and which permission it needs. A manifest file is one of these or an array of them (JSON or YAML).",
+  "type": "object",
+  "required": ["tool", "effect", "permission"],
+  "additionalProperties": false,
+  "properties": {
+    "tool": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$" },
+    "description": { "type": "string" },
+    "effect": {
+      "enum": ["read_only", "idempotent", "reversible", "compensable", "irreversible"],
+      "description": "read_only: no external change. idempotent: safe to retry, no undo needed. reversible: a true inverse exists. compensable: a counteraction exists but leaves residue (a refund appears on a statement). irreversible: no safe undo."
+    },
+    "permission": { "type": "string", "pattern": "^\\S{1,128}$", "examples": ["orders:write"] },
+    "approval": {
+      "enum": ["never", "always"],
+      "default": "never",
+      "description": "always makes a human approve each call. Forced to always for irreversible tools."
+    },
+    "compensation": {
+      "type": "object",
+      "required": ["tool"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$" },
+        "argument_map": {
+          "type": "object",
+          "description": "Compensation argument name to a reference: $args.path (the original call) or $result.path (what the tool returned).",
+          "additionalProperties": { "type": "string", "pattern": "^\\$(args|result)(\\.[A-Za-z0-9_-]+)+$" }
+        },
+        "requires_approval": { "type": "boolean", "default": false }
+      }
+    },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Tools that must have succeeded earlier in the same run. Also creates rollback ordering edges."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "effect": { "enum": ["reversible", "compensable"] } }, "required": ["effect"] },
+      "then": { "required": ["compensation"] },
+      "else": { "not": { "required": ["compensation"] } }
+    },
+    {
+      "if": { "properties": { "effect": { "const": "irreversible" } }, "required": ["effect"] },
+      "then": { "properties": { "approval": { "const": "always" } } }
+    }
+  ]
+}

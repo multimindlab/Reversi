@@ -1,0 +1,87 @@
+---
+title: Quickstart
+description: Journal an agent's tool calls, then roll them back, in about five minutes.
+---
+
+## 1. Run the demo
+
+```bash
+git clone https://github.com/multimindlab/reversi && cd reversi
+npm install
+npm run example
+```
+
+An agent creates an order, charges a card, sends an email and tries a tool outside its scope. An operator
+reviews the plan and rolls the run back. The email stays in the report as *cannot be undone*.
+
+## 2. Look at the evidence
+
+```bash
+node packages/cli/dist/main.js verify examples/order-agent/out/ledger.jsonl
+```
+
+Open `viewer/index.html` in a browser and choose that file. The chain is verified in your browser.
+
+## 3. Describe your own tools
+
+```yaml tools.yaml
+- tool: create_order
+  effect: reversible
+  permission: orders:write
+  compensation:
+    tool: cancel_order
+    argument_map: { order_id: $result.order_id }
+- tool: cancel_order
+  effect: idempotent
+  permission: orders:write
+- tool: send_email
+  effect: irreversible        # forces human approval
+  permission: mail:send
+```
+
+```bash
+reversi validate tools.yaml
+```
+
+## 4. Wrap calls
+
+<CodeGroup>
+```ts TypeScript
+import { SealedScope, loadRegistry, openLocal } from "@multimindlab/reversi";
+
+const reversi = openLocal("./reversi-data", loadRegistry("./tools.yaml"));
+const run = reversi.startRun({
+  actor: "support-agent",
+  scope: SealedScope.seal(["orders:write"]),
+});
+
+const r = await run.call({
+  tool: "create_order",
+  args: { sku: "BOOK-1" },
+  reason: "customer asked to order BOOK-1",
+  execute: (args) => shop.createOrder(args),
+});
+if (r.status === "blocked") console.log(r.reasons);
+```
+
+```python Python
+from reversi_sdk import ReversiClient, Blocked
+
+client = ReversiClient("http://127.0.0.1:7421", api_key="…agent key…")
+run = client.start_run(["orders:write"])
+try:
+    run.call("create_order", "customer asked to order BOOK-1",
+             lambda args: shop.create_order(**args), args={"sku": "BOOK-1"})
+except Blocked as e:
+    print(e.reasons)
+```
+</CodeGroup>
+
+## 5. Plan and roll back (operator)
+
+```bash
+reversi plan  <run_id> -m tools.yaml -d ./reversi-data
+reversi rollback <run_id> -m tools.yaml -d ./reversi-data --compensator-cmd "./undo.sh"
+```
+
+`undo.sh` receives the compensation call as JSON on stdin; exit code 0 means it was undone.

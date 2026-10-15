@@ -1,0 +1,27 @@
+---
+title: CLI
+description: reversi validate, verify, runs, plan, rollback, export.
+---
+
+```bash
+npm install -g @multimindlab/reversi-cli
+```
+
+| Command | Does |
+|---|---|
+| `reversi validate <path>` | Check manifests, including that every compensation and required tool exists |
+| `reversi verify <ledger>` | Verify the hash chain. Exit 1 if broken |
+| `reversi runs -m <manifests> -d <data>` | List runs, flag unresolved steps |
+| `reversi plan <run> -m … -d … [--json]` | Show what rollback would do. Exit 2 if not fully reversible |
+| `reversi rollback <run> -m … -d … --compensator-cmd <cmd>` | Undo. `<cmd>` gets the compensation call as JSON on stdin; exit 0 = undone. Exit 2 if incomplete |
+| `reversi export -d <data> [--run <id>]` | Print ledger records as JSON Lines |
+
+`--approve-compensations` approves compensations marked `requires_approval`. That is an operator decision.
+The default data directory is `./reversi-data` (`ledger.jsonl` and `runs/`).
+
+The compensation JSON on stdin:
+
+```json
+{"run_id":"…","step":2,"tool":"refund","original_tool":"charge_card",
+ "args":{"charge_id":"ch_1","amount":25},"idempotency_key":"…"}
+```

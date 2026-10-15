@@ -1,0 +1,22 @@
+{
+  "name": "reversi-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Reversibility, approval and audit evidence for every tool an agent can touch",
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": ["packages/reversi", "packages/server", "packages/cli"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "npm run build && vitest run",
+    "test:py": "python3 -I -m unittest discover -s packages/sdk-py/tests -t packages/sdk-py -v",
+    "example": "npm run build && node examples/order-agent/run.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "ajv": "^8.17.1",
+    "typescript": "~5.9.3",
+    "vitest": "^5.0.4"
+  }
+}

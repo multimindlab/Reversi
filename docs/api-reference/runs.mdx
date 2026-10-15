@@ -1,0 +1,33 @@
+---
+title: Agent endpoints
+description: Open runs, request calls, report outcomes.
+---
+
+## `POST /v1/runs`
+
+```json
+{ "permissions": ["orders:write"], "run_id": "optional", "mode": "enforce", "reason": "why this run exists" }
+```
+→ `201 {"run_id","mode","scope_seal"}`. Permissions must fit within the key's `max_permissions`.
+
+## `POST /v1/runs/{id}/intents`
+
+Authorize a call and journal its intent. Execute the tool only on `allow` or `would_block`.
+
+```json
+{ "tool": "create_order", "args": {"sku": "BOOK-1"}, "reason": "customer asked", "depends_on": [0] }
+```
+→ `{"decision":"allow","step":3}` · `{"decision":"would_block","step":3,"reasons":[…]}` · `{"decision":"block","reasons":[…]}`
+
+## `POST /v1/runs/{id}/steps/{n}/outcome`
+
+```json
+{ "status": "succeeded", "result": {"order_id": "ord_1"} }
+{ "status": "failed", "error": "…" }
+{ "status": "uncertain", "error": "timeout" }
+```
+`result` is used only to build the compensation arguments named in the manifest. It is hashed, not stored in the ledger.
+
+## `GET /v1/runs`, `GET /v1/runs/{id}`
+
+Run state, including `unresolved` step numbers.

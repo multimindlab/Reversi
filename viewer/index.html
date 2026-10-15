@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reversi Trace Viewer</title>
+<style>
+  :root { --bg:#fafaf8; --fg:#1b1b18; --muted:#6b6b63; --card:#fff; --line:#e4e3dc; --ok:#1a7f4b; --bad:#b42318; --warn:#9a6700; --info:#2457c5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16160f; --fg:#ecebe4; --muted:#9a9a90; --card:#1e1e17; --line:#33332a; --ok:#4ac98a; --bad:#ff7b6f; --warn:#e0b050; --info:#7aa2ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  #drop { border:2px dashed var(--line); border-radius:12px; padding:22px; text-align:center; background:var(--card); }
+  #drop.over { border-color: var(--info); }
+  button, label.btn { font:inherit; padding:7px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button:hover, label.btn:hover { border-color: var(--info); }
+  #status { margin:18px 0; padding:12px 14px; border-radius:10px; border:1px solid var(--line); background:var(--card); display:none; }
+  #status.ok { border-color: var(--ok); } #status.bad { border-color: var(--bad); }
+  #status b.ok { color: var(--ok); } #status b.bad { color: var(--bad); }
+  code, .mono { font-family: ui-monospace, Menlo, monospace; font-size: .85em; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin: 14px 0; }
+  select { font:inherit; padding:6px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  ol.tl { list-style:none; margin:0; padding:0; border-left:2px solid var(--line); }
+  ol.tl li { position:relative; margin:0 0 10px 18px; padding:10px 12px; background:var(--card); border:1px solid var(--line); border-radius:10px; }
+  ol.tl li::before { content:""; position:absolute; left:-26px; top:16px; width:10px; height:10px; border-radius:50%; background:var(--dot, var(--muted)); border:2px solid var(--bg); }
+  .ev { font-weight:600; } .meta { color:var(--muted); font-size:.85em; }
+  .reason { margin-top:2px; } .detail { margin-top:2px; color:var(--muted); font-size:.9em; }
+  .succeeded, .compensated, .approved { --dot: var(--ok); } .succeeded .ev, .compensated .ev, .approved .ev { color: var(--ok); }
+  .blocked, .failed, .compensation_failed, .unrecoverable { --dot: var(--bad); } .blocked .ev, .failed .ev, .compensation_failed .ev, .unrecoverable .ev { color: var(--bad); }
+  .would_block, .uncertain, .deferred { --dot: var(--warn); } .would_block .ev, .uncertain .ev, .deferred .ev { color: var(--warn); }
+  .intended, .compensating, .run_started { --dot: var(--info); } .intended .ev, .compensating .ev, .run_started .ev { color: var(--info); }
+  .tamper { outline: 2px solid var(--bad); }
+  footer { margin-top: 28px; color: var(--muted); font-size: .85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reversi Trace Viewer</h1>
+  <p class="sub">Open a ledger (<code>ledger.jsonl</code>). Everything runs in your browser; nothing is uploaded. The hash chain is verified locally.</p>
+  <div id="drop">
+    <p>Drop a ledger file here</p>
+    <label class="btn">Choose file<input id="file" type="file" accept=".jsonl,.json,.txt" hidden></label>
+    <button id="demo" type="button">Load the demo ledger</button>
+  </div>
+  <div id="status" role="status"></div>
+  <div class="row" id="controls" hidden>
+    <label>Run <select id="run"></select></label>
+    <label>Show <select id="filter"><option value="all">all events</option><option value="problems">problems only</option></select></label>
+  </div>
+  <ol class="tl" id="tl"></ol>
+  <footer>A valid chain proves the log was not edited, reordered, or cut in the middle. It cannot prove nothing was dropped from the end: keep the head hash somewhere else.</footer>
+</main>
+<script>
+"use strict";
+const DEMO = "{\"seq\":0,\"ts_ms\":1700000000000,\"run_id\":\"golden-1\",\"step\":null,\"actor\":\"agent-\u00e9\",\"tool\":\"-\",\"payload_hash\":\"6c264d618aa042584b8e38b6634fd7d48099bcbc6baf7f2cc9f5698f51e4369b\",\"reason\":\"d\u00e9marrage \u2713\",\"event\":\"run_started\",\"detail\":\"mode=enforce scope_seal=af55d7fa7e4e1421b9de6cf0344baa10d5df731289722cc4998127504c12fd80\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"hash\":\"84a81ea76aec3ef7d3757bceef59c00249c14f1e45ce6aac6eb96ff8f9a4fa9b\"}\n{\"seq\":1,\"ts_ms\":1700000000001,\"run_id\":\"golden-1\",\"step\":0,\"actor\":\"agent-\u00e9\",\"tool\":\"create_order\",\"payload_hash\":\"82f3016940a9ea1db5513f25570d355278d0f56155bd85c86d931a2da7eb704d\",\"reason\":\"customer asked\",\"event\":\"intended\",\"detail\":\"\",\"prev_hash\":\"84a81ea76aec3ef7d3757bceef59c00249c14f1e45ce6aac6eb96ff8f9a4fa9b\",\"hash\":\"22625f0fe4d9d7f7c2f95db1426878f26aa0111b5926b22a9bf2273acdab1b5e\"}\n{\"seq\":2,\"ts_ms\":1700000000003,\"run_id\":\"golden-1\",\"step\":0,\"actor\":\"agent-\u00e9\",\"tool\":\"create_order\",\"payload_hash\":\"a3c90e3b7448d23d9eacebd0ebf15cae100e21f9b2c688f3f9d238edcd26d67f\",\"reason\":\"customer asked\",\"event\":\"succeeded\",\"detail\":\"\",\"prev_hash\":\"22625f0fe4d9d7f7c2f95db1426878f26aa0111b5926b22a9bf2273acdab1b5e\",\"hash\":\"1a9e8f7b802a5de821ba73a7d4a43f128dae7e65c04577279bcf4ca9d00e1674\"}\n{\"seq\":3,\"ts_ms\":1700000000004,\"run_id\":\"golden-1\",\"step\":null,\"actor\":\"agent-\u00e9\",\"tool\":\"send_email\",\"payload_hash\":\"eb96561c1460e4a21f1122ee257019d1a5b0f5b0af3e3ee627cbd510791a8a8c\",\"reason\":\"confirmation\",\"event\":\"approved\",\"detail\":\"call approved; intent follows\",\"prev_hash\":\"1a9e8f7b802a5de821ba73a7d4a43f128dae7e65c04577279bcf4ca9d00e1674\",\"hash\":\"b5735ad4d183e8f50580e3c64f069e9159190c89724ed8260a31d875df45e773\"}\n{\"seq\":4,\"ts_ms\":1700000000005,\"run_id\":\"golden-1\",\"step\":1,\"actor\":\"agent-\u00e9\",\"tool\":\"send_email\",\"payload_hash\":\"eb96561c1460e4a21f1122ee257019d1a5b0f5b0af3e3ee627cbd510791a8a8c\",\"reason\":\"confirmation\",\"event\":\"intended\",\"detail\":\"\",\"prev_hash\":\"b5735ad4d183e8f50580e3c64f069e9159190c89724ed8260a31d875df45e773\",\"hash\":\"c75fdf83471d21be2b967a646032387180e5eb442705b5cdc701b8149d23b436\"}\n{\"seq\":5,\"ts_ms\":1700000000007,\"run_id\":\"golden-1\",\"step\":1,\"actor\":\"agent-\u00e9\",\"tool\":\"send_email\",\"payload_hash\":\"0fedef6303aa64433946fdcc1ecf2d2c1c7b2e9ef5d6d95f246a83ee323a1c37\",\"reason\":\"confirmation\",\"event\":\"succeeded\",\"detail\":\"\",\"prev_hash\":\"c75fdf83471d21be2b967a646032387180e5eb442705b5cdc701b8149d23b436\",\"hash\":\"b7285d806b8b1f31e9752eea9cf02587d190ec9b95a0430826389b64dc2401a0\"}\n{\"seq\":6,\"ts_ms\":1700000000008,\"run_id\":\"golden-1\",\"step\":null,\"actor\":\"agent-\u00e9\",\"tool\":\"unknown_tool\",\"payload_hash\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"reason\":\"should be blocked\",\"event\":\"blocked\",\"detail\":\"no manifest registered for tool `unknown_tool`\",\"prev_hash\":\"b7285d806b8b1f31e9752eea9cf02587d190ec9b95a0430826389b64dc2401a0\",\"hash\":\"5af93198ed2da7b6080629444fc90d66f00adb7f7cc3ad9642ccedf9b9a85a2f\"}\n{\"seq\":7,\"ts_ms\":1700000000009,\"run_id\":\"golden-1\",\"step\":1,\"actor\":\"operator\",\"tool\":\"send_email\",\"payload_hash\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"reason\":\"rollback of run golden-1: undo step 1 (send_email)\",\"event\":\"unrecoverable\",\"detail\":\"irreversible: cannot be undone, needs human follow-up\",\"prev_hash\":\"5af93198ed2da7b6080629444fc90d66f00adb7f7cc3ad9642ccedf9b9a85a2f\",\"hash\":\"f806f49474efe81fa0cf87b3da2eaf61457afb229abd985b0f19a1211a7f9329\"}\n{\"seq\":8,\"ts_ms\":1700000000010,\"run_id\":\"golden-1\",\"step\":0,\"actor\":\"operator\",\"tool\":\"cancel_order\",\"payload_hash\":\"a3c90e3b7448d23d9eacebd0ebf15cae100e21f9b2c688f3f9d238edcd26d67f\",\"reason\":\"rollback of run golden-1: undo step 0 (create_order)\",\"event\":\"compensating\",\"detail\":\"idempotency_key=167fd38d80f55273ec7213b63df26f5fd813f2c21ba557ec84db41787eabe7c7\",\"prev_hash\":\"f806f49474efe81fa0cf87b3da2eaf61457afb229abd985b0f19a1211a7f9329\",\"hash\":\"364e14da0b9655deede1156c3b7c65ff4601995e45209552ab6f6dce49e5b1f0\"}\n{\"seq\":9,\"ts_ms\":1700000000011,\"run_id\":\"golden-1\",\"step\":0,\"actor\":\"operator\",\"tool\":\"cancel_order\",\"payload_hash\":\"a3c90e3b7448d23d9eacebd0ebf15cae100e21f9b2c688f3f9d238edcd26d67f\",\"reason\":\"rollback of run golden-1: undo step 0 (create_order)\",\"event\":\"compensated\",\"detail\":\"\",\"prev_hash\":\"364e14da0b9655deede1156c3b7c65ff4601995e45209552ab6f6dce49e5b1f0\",\"hash\":\"b7c53d816a833a30daa812d4830c5ba2934a9e421bf1ecb0f6de53a0a4bebec4\"}\n";
+const GENESIS = "0".repeat(64);
+const FIELDS = [["seq","n"],["ts_ms","n"],["run_id","s"],["step","n?"],["actor","s"],["tool","s"],["payload_hash","s"],["reason","s"],["event","s"],["detail","s"],["prev_hash","s"],["hash","s"]];
+const PROBLEM = new Set(["blocked","would_block","failed","uncertain","compensation_failed","unrecoverable","deferred"]);
+let records = [], badSeq = -1;
+
+const $ = (id) => document.getElementById(id);
+const canon = (o) => "{" + Object.keys(o).sort().map((k) => JSON.stringify(k) + ":" + JSON.stringify(o[k])).join(",") + "}";
+async function sha256(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function verify(recs) {
+  let prev = GENESIS;
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    if (typeof r !== "object" || r === null) return { ok:false, seq:i, error:"record is not an object" };
+    for (const [f, k] of FIELDS) {
+      const v = r[f];
+      const good = k === "n" ? Number.isInteger(v) : k === "n?" ? (v === null || Number.isInteger(v)) : typeof v === "string";
+      if (!good) return { ok:false, seq:i, error:"field `" + f + "` is missing or has the wrong type" };
+    }
+    if (r.seq !== i) return { ok:false, seq:r.seq, error:"sequence number out of order" };
+    if (r.prev_hash !== prev) return { ok:false, seq:r.seq, error:"prev_hash does not match the previous record" };
+    const { hash, ...body } = r;
+    if (await sha256(canon(body)) !== hash) return { ok:false, seq:r.seq, error:"stored hash does not match the record's contents" };
+    prev = hash;
+  }
+  return { ok:true, head:prev, count:recs.length };
+}
+function parse(text) {
+  const out = [];
+  text.split("\n").forEach((line, i) => {
+    if (!line.trim()) return;
+    try { out.push(JSON.parse(line)); } catch { throw new Error("line " + (i + 1) + " is not valid JSON"); }
+  });
+  return out;
+}
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+
+async function load(text) {
+  const st = $("status");
+  st.style.display = "block";
+  try { records = parse(text); } catch (e) { st.className = "bad"; st.innerHTML = "<b class='bad'>Cannot read file.</b> " + esc(e.message); $("tl").innerHTML = ""; $("controls").hidden = true; return; }
+  const v = await verify(records);
+  badSeq = v.ok ? -1 : v.seq;
+  if (v.ok) { st.className = "ok"; st.innerHTML = "<b class='ok'>Chain intact.</b> " + v.count + " records. Head <span class='mono'>" + v.head + "</span>"; }
+  else { st.className = "bad"; st.innerHTML = "<b class='bad'>TAMPERED or corrupt at record " + esc(v.seq) + ".</b> " + esc(v.error) + ". Records at and after this point cannot be trusted."; }
+  const runs = [...new Set(records.map((r) => r && r.run_id).filter((x) => typeof x === "string"))];
+  $("run").innerHTML = runs.map((r) => "<option>" + esc(r) + "</option>").join("");
+  $("controls").hidden = runs.length === 0;
+  render();
+}
+function render() {
+  const run = $("run").value, only = $("filter").value === "problems";
+  const rows = records.filter((r) => r && r.run_id === run && (!only || PROBLEM.has(r.event)));
+  $("tl").innerHTML = rows.map((r) => {
+    const t = new Date(r.ts_ms).toISOString().replace("T", " ").replace("Z", "");
+    return "<li class='" + esc(r.event) + (r.seq === badSeq ? " tamper" : "") + "'>" +
+      "<div><span class='ev'>" + esc(r.event) + "</span> &middot; <b>" + esc(r.tool) + "</b>" + (r.step === null ? "" : " <span class='meta'>step " + esc(r.step) + "</span>") + "</div>" +
+      "<div class='reason'>" + esc(r.reason) + "</div>" + (r.detail ? "<div class='detail'>" + esc(r.detail) + "</div>" : "") +
+      "<div class='meta'>#" + esc(r.seq) + " &middot; " + esc(r.actor) + " &middot; " + esc(t) + " &middot; payload <span class='mono'>" + esc(r.payload_hash.slice(0, 12)) + "</span></div></li>";
+  }).join("");
+}
+$("run").onchange = render; $("filter").onchange = render;
+$("file").onchange = async (e) => { const f = e.target.files[0]; if (f) load(await f.text()); };
+$("demo").onclick = () => load(DEMO);
+const drop = $("drop");
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = async (e) => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; if (f) load(await f.text()); };
+</script>
+</body>
+</html>

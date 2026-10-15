@@ -1,0 +1,53 @@
+---
+title: Tool manifests
+description: How a tool declares its reversibility, its undo, and the permission it needs.
+---
+
+A manifest is one JSON or YAML object per tool (or an array of them). The machine-readable schema is
+[`schemas/manifest.schema.json`](https://github.com/multimindlab/reversi/blob/main/schemas/manifest.schema.json).
+
+| Field | Meaning |
+|---|---|
+| `tool` | Tool name |
+| `effect` | `read_only`, `idempotent`, `reversible`, `compensable`, `irreversible` |
+| `permission` | Permission the run's scope must contain |
+| `approval` | `never` (default) or `always`. Forced to `always` for irreversible tools |
+| `compensation` | Required for `reversible` and `compensable`; forbidden otherwise |
+| `requires` | Tools that must have succeeded earlier in the run. Also creates rollback ordering |
+
+## Effects
+
+- **read_only**: changes nothing. Skipped on rollback.
+- **idempotent**: safe to repeat, no undo needed (often the compensation tools themselves).
+- **reversible**: a true inverse exists (delete the draft you created).
+- **compensable**: a counteraction exists but leaves residue (a refund still appears on a statement).
+- **irreversible**: no safe undo (an email). Always needs approval; rollback reports it as not undone.
+
+## Compensation arguments
+
+`argument_map` builds the undo call's arguments from references:
+
+- `$args.path`: from the original call's arguments
+- `$result.path`: from what the tool returned
+
+Arguments are **not stored in the ledger**. Reversi keeps only the values named by `argument_map`, in run state, so
+it can build the undo later. If a referenced value is missing when the tool returns, the step is marked
+*unrecoverable* rather than guessed.
+
+```yaml
+- tool: charge_card
+  effect: compensable
+  permission: payments:write
+  requires: [create_order]
+  compensation:
+    tool: refund
+    requires_approval: false
+    argument_map:
+      charge_id: $result.charge_id
+      amount: $args.amount
+```
+
+<Note>
+`approval` is deliberately separate from `effect`. A reversible tool can still need a human (large amounts), and
+irreversible tools always do.
+</Note>

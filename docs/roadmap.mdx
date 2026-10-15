@@ -1,0 +1,17 @@
+---
+title: Roadmap
+description: What is built and what is next.
+---
+
+**Built:** manifests, write-ahead ledger, dependency-aware rollback, scopes, approvals, observe mode, CLI, HTTP API,
+Python SDK, trace viewer, conformance fixtures.
+
+**Next (in this order):**
+1. Validate with real MCP tool authors (manifest ergonomics, missing fields).
+2. MCP gateway: proxy that journals and enforces over Streamable HTTP and stdio, observe mode first.
+3. Connector manifests and compensators for GitHub, Stripe, Slack, filesystem.
+4. SQLite and Postgres stores; API key rotation, OIDC.
+5. Approval UI, dashboard, richer policy language.
+6. Content checks (cumulative intent, encoded payloads).
+
+Nothing after "Built" exists yet.

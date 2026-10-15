@@ -1,0 +1,27 @@
+---
+title: Operator endpoints
+description: Plan, approve, compensate, export, verify. Operator keys only.
+---
+
+## `GET /v1/runs/{id}/plan`
+Simulated rollback: `{"run_id","actions":[{"step","tool","kind","compensation_tool?","args?","idempotency_key?","blocked_by?","note?"}],"fully_reversible"}`.
+`kind`: `compensate`, `skip`, `defer`, `unrecoverable`, `unresolved`, `unmanifested`.
+
+## `POST /v1/runs/{id}/approvals`
+```json
+{ "tool": "send_email", "kind": "call", "count": 1 }
+```
+Single-use grant. For compensations use `"kind": "compensation"` and the **compensation** tool's name.
+
+## `POST /v1/runs/{id}/steps/{n}/compensation`
+Journals `compensating` first, then returns what to run:
+`{"decision":"go","call":{"tool","args","idempotency_key",…}}`, or `defer`, `awaiting_approval`, `not_actionable`, `nothing_to_do`.
+
+## `POST /v1/runs/{id}/steps/{n}/compensation/outcome`
+`{"status":"compensated"}` or `{"status":"failed","error":"…"}`.
+
+## `GET /v1/runs/{id}/export`
+The run's ledger records as `application/x-ndjson`.
+
+## `GET /v1/ledger/verify`
+`{"ok":true,"records":42,"head":"…"}` or `{"ok":false,"seq":7,"error":"…"}`.

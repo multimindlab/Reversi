@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reversi.multimind.dev/schemas/ledger-record.schema.json",
+  "title": "Reversi ledger record",
+  "description": "One line of a ledger (JSON Lines). Records form a SHA-256 hash chain.",
+  "type": "object",
+  "required": ["seq", "ts_ms", "run_id", "step", "actor", "tool", "payload_hash", "reason", "event", "detail", "prev_hash", "hash"],
+  "additionalProperties": false,
+  "properties": {
+    "seq": { "type": "integer", "minimum": 0, "description": "0-based position in the ledger." },
+    "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the Unix epoch." },
+    "run_id": { "type": "string" },
+    "step": { "type": ["integer", "null"], "minimum": 0, "description": "Step within the run, or null for run-level and blocked events." },
+    "actor": { "type": "string" },
+    "tool": { "type": "string" },
+    "payload_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical JSON of the payload the event concerns. Payloads are never stored." },
+    "reason": { "type": "string", "minLength": 1, "description": "Why. Required." },
+    "event": {
+      "enum": [
+        "run_started", "intended", "approved", "blocked", "would_block", "succeeded", "failed",
+        "uncertain", "compensating", "compensated", "compensation_failed", "unrecoverable", "deferred"
+      ]
+    },
+    "detail": { "type": "string" },
+    "prev_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

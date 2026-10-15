@@ -1,0 +1,14 @@
+---
+title: Limits
+description: What Reversi does not do. Read this before relying on it.
+---
+
+- **Manifests are trusted.** Reversi cannot inspect what a tool really does. Wrong manifest, wrong guarantees.
+- **Compensation is not time travel.** Refunds leave statements, deletions can lose data. Irreversible stays irreversible.
+- **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not detectable from the file alone.
+- **Single writer.** The file-backed ledger and run store assume one server process. Do not point two at the same directory.
+- **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path to the tools.
+- **No automatic discovery of side effects**, no semantic firewall (intent graphs, encoding detection) and no MCP gateway yet.
+- **Approvals are in memory** in the server and expire on restart.
+- **HTTP only.** Terminate TLS in front of the server.
+- **Python SDK** reads JSON manifests only and rejects some floats when hashing payloads (see its page).

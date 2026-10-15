@@ -1,0 +1,32 @@
+---
+title: TypeScript SDK
+description: "@multimindlab/reversi: the engine, embedded in your process."
+---
+
+```bash
+npm install @multimindlab/reversi
+```
+
+```ts
+import { Ledger, JsonlLedgerStore, FileRunStore, Registry, Reversi, SealedScope } from "@multimindlab/reversi";
+
+const reversi = new Reversi({
+  registry: Registry.from([/* manifests */]),
+  ledger: new Ledger(new JsonlLedgerStore("./ledger.jsonl")),
+  runs: new FileRunStore("./runs"),
+  approver: async (req) => askAHuman(req),   // called for approval: always tools and compensations
+});
+const run = reversi.startRun({ actor: "agent", scope: SealedScope.seal(["orders:write"]) });
+```
+
+| API | Purpose |
+|---|---|
+| `run.call({tool, args, reason, execute})` | Authorize, journal, execute, journal. Rethrows executor errors |
+| `run.begin` / `run.complete` | The same in two steps, when execution happens elsewhere |
+| `run.plan()` | Simulate rollback |
+| `run.rollback({compensate})` | Undo; returns a report |
+| `run.unresolved()` | Steps with unknown outcome |
+| `EffectUncertainError` | Throw from `execute` when you do not know whether the effect happened |
+
+`loadRegistry(path)` and `openLocal(dir, registry)` load YAML/JSON manifests and open a file-backed engine.
+Stores are interfaces (`LedgerStore`, `RunStore`); SQLite and Postgres implementations are on the roadmap.
