@@ -19,9 +19,11 @@
     "build": "tsc -b",
     "test": "npm run build && vitest run",
     "test:py": "python3 -I -m unittest discover -s packages/sdk-py/tests -t packages/sdk-py -v",
-    "example": "npm run build && node examples/order-agent/run.mjs"
+    "example": "npm run build && node examples/order-agent/run.mjs",
+    "check:docs": "node scripts/check-docs.mjs"
   },
   "devDependencies": {
+    "@mdx-js/mdx": "^3.1.1",
     "@types/node": "^22.10.0",
     "ajv": "^8.17.1",
     "typescript": "~5.9.3",
