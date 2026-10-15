@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { can, type KeyRing, type OidcVerifier, type Principal } from "@multimindlab/reversi";
+import { RUN_ID_PATTERN, can, type KeyRing, type OidcVerifier, type Principal } from "@multimindlab/reversi";
 import type { Gateway } from "./gateway.js";
 import type { UpstreamPool } from "./upstream.js";
 
@@ -136,7 +136,16 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
     transport.onclose = () => {
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
-    const { server } = o.gateway.createSession({ principal: who, operator: kind === "operator" });
+    const wanted = req.headers["reversi-run-id"];
+    const runId = Array.isArray(wanted) ? wanted[0] : wanted;
+    if (runId !== undefined && !RUN_ID_PATTERN.test(runId)) return json(res, 400, { error: "invalid Reversi-Run-Id" });
+    let session;
+    try {
+      session = o.gateway.createSession({ principal: who, operator: kind === "operator", run_id: runId });
+    } catch (e) {
+      return json(res, 403, { error: e instanceof Error ? e.message : "cannot continue that run" });
+    }
+    const { server } = session;
     await server.connect(transport);
     return transport.handleRequest(req, res, body);
   };

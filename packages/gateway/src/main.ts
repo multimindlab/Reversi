@@ -23,6 +23,7 @@ Shortcuts instead of --config, for one upstream over stdio on stdio:
   --upstream-cmd <cmd> [--upstream-arg <arg>]...   or   --upstream-url <url>
   --mode observe|enforce   (default enforce)
   --actor <name>           actor recorded for unauthenticated sessions (default mcp-client)
+  --run-id <id>            stdio mode: the run id to use, or continue if it exists (HTTP clients send a Reversi-Run-Id header)
 
 Without a "listen" section the gateway speaks MCP on stdio, so logs go to stderr.`;
 
@@ -41,6 +42,7 @@ const { values: v } = parseArgs({
     "upstream-url": { type: "string" },
     mode: { type: "string" },
     actor: { type: "string" },
+    "run-id": { type: "string" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -127,7 +129,7 @@ if (cfg.listen) {
     console.error(`reversi-gateway: ${cfg.mode} mode, agent endpoint http://${cfg.listen?.host}:${typeof a === "object" && a ? a.port : cfg.listen?.port}/mcp, ${engine.data.kind} store`);
   });
 } else {
-  const { server, run } = gateway.createSession({ principal: { name: cfg.actor, roles: ["agent"], via: "api_key" }, operator: false });
+  const { server, run } = gateway.createSession({ principal: { name: cfg.actor, roles: ["agent"], via: "api_key" }, operator: false, run_id: v["run-id"] });
   await server.connect(new StdioServerTransport());
   console.error(`reversi-gateway: run ${run?.run_id}, ${cfg.mode} mode, ${engine.data.kind} store`);
 }

@@ -216,3 +216,23 @@ describe("config", () => {
     expect(() => expandEnv("${MISSING}", {})).toThrow(/MISSING is not set/);
   });
 });
+
+describe("Reversi-Run-Id header", () => {
+  it("continues the named run over HTTP, and refuses another principal's run", async () => {
+    const { url, reversi } = await serve({ keys: KEYS });
+    const withRun = async (key: string, run: string) => {
+      const client = new Client({ name: "t", version: "1" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${key}`, "Reversi-Run-Id": run } } }));
+      closers.push(() => client.close());
+      return client;
+    };
+    const a = await withRun("k-agent", "shared-run");
+    await a.callTool({ name: "lookup", arguments: {} });
+    const b = await withRun("k-agent", "shared-run");
+    await b.callTool({ name: "lookup", arguments: {} });
+    expect(reversi.runIds()).toEqual(["shared-run"]);
+    expect(reversi.openRun("shared-run").state().steps).toHaveLength(2);
+    await expect(withRun("k-agent2", "shared-run")).rejects.toThrow();
+    expect((await post(`${url}/mcp`, { authorization: "Bearer k-agent", "reversi-run-id": "bad id!" })).status).toBe(400);
+  });
+});

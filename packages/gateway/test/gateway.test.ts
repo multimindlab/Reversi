@@ -297,3 +297,26 @@ describe("allowDenyPolicy", () => {
     expect(allowDenyPolicy({ allow: ["x"], deny: [] })?.default).toBe("deny");
   });
 });
+
+describe("continuing a run across sessions", () => {
+  it("a reconnecting agent that names its run keeps its approvals and plan; others cannot take it", async () => {
+    const up = await orders();
+    const { gateway, reversi } = build({ fakes: [up] });
+    const first = gateway.createSession({ principal: AGENT, operator: false, run_id: "my-run" });
+    expect(first.run?.run_id).toBe("my-run");
+    const again = gateway.createSession({ principal: AGENT, operator: false, run_id: "my-run" });
+    expect(again.run?.run_id).toBe("my-run");
+    expect(reversi.ledger.records().filter((r) => r.event === "run_started")).toHaveLength(1); // continued, not restarted
+    expect(() => gateway.createSession({ principal: { ...AGENT, name: "other" }, operator: false, run_id: "my-run" })).toThrow(/another principal/);
+  });
+});
+
+describe("tools no upstream offers", () => {
+  it("in observe mode the call is journaled as failed (nothing was sent), not uncertain", async () => {
+    const up = await orders();
+    const { gateway, reversi } = build({ fakes: [up], mode: "observe" });
+    const { client } = await connect(gateway, AGENT);
+    await expect(client.callTool({ name: "no_such_tool", arguments: {} })).rejects.toThrow(/unknown tool/);
+    expect(events(reversi).slice(-2)).toEqual(["intended:no_such_tool", "failed:no_such_tool"]);
+  });
+});

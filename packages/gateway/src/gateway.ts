@@ -32,7 +32,7 @@ import {
   type SigningKey,
   toJsonl,
 } from "@multimindlab/reversi";
-import type { UpstreamPool } from "./upstream.js";
+import { UnknownToolError, type UpstreamPool } from "./upstream.js";
 
 export const REASON_META_KEY = "reversi/reason";
 export const IDEMPOTENCY_META_KEY = "reversi/idempotency_key";
@@ -69,6 +69,7 @@ export function resultForHandle(result: object): unknown {
 /** Errors that say the call was refused are failures; anything else may have taken effect. */
 function outcomeForError(e: unknown): Outcome {
   const error = e instanceof Error ? e.message : String(e);
+  if (e instanceof UnknownToolError) return { status: "failed", error }; // never reached any upstream
   const refused = e instanceof McpError && (e.code === ErrorCode.InvalidParams || e.code === ErrorCode.MethodNotFound);
   return refused ? { status: "failed", error } : { status: "uncertain", error };
 }
@@ -108,6 +109,34 @@ export class Gateway {
   private visible(name: string): boolean {
     const { allow = [], deny = [] } = this.o;
     return (allow.length === 0 || globAny(allow, name)) && !(deny.length > 0 && globAny(deny, name));
+  }
+
+  /**
+   * The run for a new agent session. An agent that reconnects (a new process, a dropped connection) can name its
+   * run to continue it, so approvals and the rollback plan stay together. Only the principal that opened a run
+   * may continue it, and it keeps the mode and scope it was opened with.
+   */
+  private runFor(principal: Principal, run_id: string | undefined): Run {
+    const rv = this.o.reversi;
+    if (run_id) {
+      let existing: Run | null = null;
+      try {
+        existing = rv.openRun(run_id);
+      } catch {
+        existing = null;
+      }
+      if (existing) {
+        if (existing.state().actor !== principal.name) throw new Error(`run \`${run_id}\` belongs to another principal`);
+        return existing;
+      }
+    }
+    return rv.startRun({
+      run_id,
+      actor: principal.name,
+      scope: SealedScope.seal(this.scopeFor(principal)),
+      mode: this.o.mode,
+      reason: "MCP gateway session",
+    });
   }
 
   private scopeFor(p: Principal): string[] {
@@ -227,15 +256,7 @@ export class Gateway {
     const server = new Server({ name: "reversi-gateway", version: "0.1.0" }, { capabilities: { tools: {} } });
     const rtools = this.tools().filter((t) => (opts.operator ? can(principal, t.cap) : Gateway.AGENT_TOOLS.has(t.name)));
     const ctx: Ctx = { who: principal, own_only: !opts.operator };
-    const run = opts.operator
-      ? null
-      : this.o.reversi.startRun({
-          run_id: opts.run_id,
-          actor: principal.name,
-          scope: SealedScope.seal(this.scopeFor(principal)),
-          mode: this.o.mode,
-          reason: "MCP gateway session",
-        });
+    const run = opts.operator ? null : this.runFor(principal, opts.run_id);
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [...(opts.operator ? [] : await this.upstreamTools()), ...rtools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))],

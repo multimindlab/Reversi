@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -190,5 +190,41 @@ describe("SealedScope", () => {
     s.permissions().push("b");
     expect(s.has("b")).toBe(false);
     expect(s.verify()).toBe(true);
+  });
+});
+
+describe("JsonlLedgerStore shared by several processes", () => {
+  it("each store sees the others' records and extends the same chain", () => {
+    const f = join(tmp(), "ledger.jsonl");
+    const a = new Ledger(new JsonlLedgerStore(f));
+    const b = new Ledger(new JsonlLedgerStore(f));
+    const add = (l: Ledger, reason: string) => l.append({ ts_ms: 1, run_id: "r", actor: "x", tool: "t", reason, event: "run_started" });
+    add(a, "one");
+    add(b, "two"); // b was opened before "one" existed: it must re-read and continue the chain
+    add(a, "three");
+    expect(parseJsonl(readFileSync(f, "utf8")).map((r) => r.reason)).toEqual(["one", "two", "three"]);
+    expect(verifyRecords(parseJsonl(readFileSync(f, "utf8"))).ok).toBe(true);
+    expect(b.records().map((r) => r.seq)).toEqual([0, 1, 2]);
+  });
+
+  it("breaks a stale lock left by a crashed writer, but not a fresh one", () => {
+    const f = join(tmp(), "ledger.jsonl");
+    const l = new Ledger(new JsonlLedgerStore(f));
+    writeFileSync(`${f}.lock`, "");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${f}.lock`, old, old);
+    l.append({ ts_ms: 1, run_id: "r", actor: "x", tool: "t", reason: "after crash", event: "run_started" });
+    expect(existsSync(`${f}.lock`)).toBe(false);
+    expect(l.verify().ok).toBe(true);
+  });
+
+  it("ignores a half-written last line until it is complete", () => {
+    const f = join(tmp(), "ledger.jsonl");
+    const a = new Ledger(new JsonlLedgerStore(f));
+    a.append({ ts_ms: 1, run_id: "r", actor: "x", tool: "t", reason: "one", event: "run_started" });
+    const line = readFileSync(f, "utf8");
+    const reader = new JsonlLedgerStore(f);
+    writeFileSync(f, line + line.slice(0, 20)); // a partial record from a writer in progress
+    expect(reader.all()).toHaveLength(1);
   });
 });

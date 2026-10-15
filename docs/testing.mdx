@@ -1,0 +1,472 @@
+---
+title: Manual testing guide
+description: Step by step, copy-paste instructions to test every feature of Reversi by hand, with the output to expect.
+---
+
+Every command here was run against this repository. Run them from the **repository root**, in `bash` or `zsh`.
+Scratch files go in `try/` (git-ignored); delete it any time. Use separate terminals where it says so.
+
+<Note>
+This guide covers what is built. Things listed under "Not built" in the [roadmap](/roadmap) have nothing to test yet.
+</Note>
+
+## 0. Prerequisites and build
+
+You need **Node 22.13 or newer** (`node -v`), Python 3.9+ for the SDK, `curl`, and `openssl`. Docker is optional (sections 8 and 12).
+
+```bash
+npm install
+npm run build
+mkdir -p try
+```
+
+If `node -v` shows an older version (nvm: `nvm use 22`), nothing else will work. The one-line helpers used below:
+
+```bash
+mcp() { node examples/gateway/mcp.mjs "$@"; }     # a tiny MCP client
+rv()  { node packages/cli/dist/main.js "$@"; }    # the reversi CLI
+```
+
+## 1. The automated suites
+
+```bash
+npm test                 # builds, then ~330 TypeScript tests (core, CLI, server, gateway, connectors)
+npm run test:py          # the Python SDK, including a live run against the built server
+node scripts/gen-fixtures.mjs --check    # cross-language fixtures are in sync
+```
+
+Expect `Test Files … passed` and `OK`. PostgreSQL tests are skipped unless you point them at a throwaway database
+(section 8): `REVERSI_TEST_PG=postgres://… npm test`.
+
+## 2. The built-in demo and the viewer
+
+```bash
+npm run example
+```
+
+Expect: an order and a charge are created, an email is sent, `delete_customer` is **blocked** ("permission
+`customers:admin` is not in the run's scope"), the plan lists the email as *unrecoverable*, rollback compensates steps 2 and 1,
+and the last line says `chain intact`.
+
+Then open `viewer/index.html` in a browser and choose `examples/order-agent/out/ledger.jsonl`. You should see the timeline and a green
+"chain verified". Open the file in an editor, change one letter inside a record, reload it in the viewer: it must flag the first bad record.
+
+## 3. Manifests
+
+```bash
+rv validate examples/order-agent/manifests          # ok: 7 tool manifests valid
+cat > try/bad.yaml <<'EOF2'
+- tool: x
+  effect: reversible
+  permission: p
+- tool: y
+  effect: nope
+  permission: p
+EOF2
+rv validate try/bad.yaml; echo "exit $?"            # two errors, exit 1
+```
+
+## 4. Policy as code
+
+```bash
+cat > try/policy.yaml <<'EOF2'
+version: 1
+rules:
+  - id: big-charges
+    match: { tool: charge_card }
+    when: [{ path: $args.amount, op: gt, value: 100 }]
+    action: require_approval
+    reason: charges over 100 need a human
+content:
+  secrets: deny
+tests:
+  - { name: small charge ok, input: { tool: charge_card, args: { amount: 25 } }, expect: allow }
+  - { name: big charge needs approval, input: { tool: charge_card, args: { amount: 500 } }, expect: require_approval, rule: big-charges }
+EOF2
+rv policy check try/policy.yaml
+rv policy test try/policy.yaml          # ok  small charge ok / ok  big charge needs approval / 2 passed
+```
+
+Break it: change `expect: require_approval` to `expect: allow` and run `policy test` again. You should see `FAIL … expected allow, got
+require_approval` and exit code 1.
+
+## 5. The server, end to end
+
+### 5.1 Create keys and start it
+
+```bash
+sha() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+AGENT=agent-$(openssl rand -hex 8);   FSAGENT=fsagent-$(openssl rand -hex 8); AUD=aud-$(openssl rand -hex 8)
+APPR=appr-$(openssl rand -hex 8);     OPS=ops-$(openssl rand -hex 8);        ROOT=root-$(openssl rand -hex 8)
+cat > try/keys.json <<EOF2
+[
+  { "name": "order-agent", "role": "agent",    "key_sha256": "$(sha $AGENT)",   "max_permissions": ["customers:read","orders:write","payments:write","mail:send"] },
+  { "name": "fs-agent",    "role": "agent",    "key_sha256": "$(sha $FSAGENT)", "max_permissions": ["fs:read","fs:write"] },
+  { "name": "audrey",      "role": "auditor",  "key_sha256": "$(sha $AUD)" },
+  { "name": "alice",       "role": "approver", "key_sha256": "$(sha $APPR)" },
+  { "name": "dana",        "role": "operator", "key_sha256": "$(sha $OPS)" },
+  { "name": "root",        "role": "admin",    "key_sha256": "$(sha $ROOT)" }
+]
+EOF2
+printf 'AGENT=%s\nFSAGENT=%s\nAUD=%s\nAPPR=%s\nOPS=%s\nROOT=%s\n' $AGENT $FSAGENT $AUD $APPR $OPS $ROOT > try/.env.sh   # new terminals: . try/.env.sh
+rv keygen try/signing                                   # signing.key / signing.pub for signed evidence
+
+```
+
+**Terminal A:**
+
+```bash
+REVERSI_MANIFESTS=examples/order-agent/manifests REVERSI_KEYS=try/keys.json REVERSI_DATA=try/data \
+REVERSI_POLICY=try/policy.yaml REVERSI_SIGNING_KEY=try/signing.key REVERSI_KILL_FILE=try/STOP \
+REVERSI_LOG=json PORT=7421 node packages/server/dist/main.js
+```
+
+Expect `reversi-server listening on http://127.0.0.1:7421 (7 tools, files store)`.
+
+**Terminal B** (all the rest of section 5):
+
+```bash
+. try/.env.sh
+j() { curl -s -H "Authorization: Bearer $1" -H 'content-type: application/json' "${@:2}"; echo; }
+B=localhost:7421
+curl -s $B/readyz; echo                  # {"ok":true,...}
+curl -s -o /dev/null -w "no key: %{http_code}\n" $B/v1/runs     # 401
+```
+
+### 5.2 An agent works; policy, approvals, content checks, scope
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"try-1","permissions":["customers:read","orders:write","payments:write","mail:send"]}'
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"create_order","args":{"sku":"BOOK-1"},"reason":"customer asked"}'      # allow, step 0
+j $AGENT -X POST $B/v1/runs/try-1/steps/0/outcome -d '{"status":"succeeded","result":{"order_id":"ord_1"}}'
+```
+
+**Approval flow** (a charge over 100 needs a human, by the policy above):
+
+```bash
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'
+#  -> {"decision":"block","reasons":["approval required: request apr_… is pending an operator decision; retry after it is approved"]}
+j $APPR "$B/v1/approvals?status=pending"        # shows the request: argument NAMES only, never values
+ID=$(curl -s -H "Authorization: Bearer $APPR" "$B/v1/approvals?status=pending" | python3 -c 'import sys,json;print(json.load(sys.stdin)["approvals"][0]["id"])')
+j $AGENT -X POST $B/v1/approvals/$ID/approve -d '{}'                       # {"error":"approver role required"}
+j $APPR -X POST $B/v1/approvals/$ID/approve -d '{"note":"checked ticket 123"}'     # status approved, decided_by alice
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'    # allow, step 1
+j $AGENT -X POST $B/v1/runs/try-1/steps/1/outcome -d '{"status":"succeeded","result":{"charge_id":"ch_1"}}'
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'    # blocked again: the approval was used once
+```
+
+Also check that **a different amount is not covered**: ask for `"amount":900` after a fresh approval for 500 and see it blocked again.
+
+**Content check and scope:**
+
+```bash
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"lookup_customer","args":{"note":"key AKIAABCDEFGHIJKLMNOP"},"reason":"x"}'
+#  -> block: "content check (secret): aws_access_key"
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"delete_customer","args":{"id":"c1"},"reason":"creative"}'
+#  -> block: "permission `customers:admin` is not in the run's scope"
+```
+
+**An unknown outcome:**
+
+```bash
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"create_order","args":{"sku":"X"},"reason":"second"}'     # step 2
+j $AGENT -X POST $B/v1/runs/try-1/steps/2/outcome -d '{"status":"uncertain","error":"timeout"}'
+j $OPS $B/v1/runs/try-1/plan | python3 -m json.tool | head -30      # step 2 is "unresolved", fully_reversible false
+```
+
+### 5.3 Reconcile, roll back, verify
+
+```bash
+j $OPS -X POST $B/v1/runs/try-1/steps/2/resolve -d '{"status":"failed","note":"checked the shop admin: no second order exists"}'
+rvm() { rv "$@" -m examples/order-agent/manifests -d try/data; }     # the CLI with this guide's manifests and data
+rvm runs
+rvm plan try-1                                                   # steps 1 and 0 compensate; fully reversible
+rvm rollback try-1 --compensator-cmd 'cat; echo' --retries 2     # prints each compensation call as JSON
+rv verify -d try/data                                              # ok: 19 records … (the CLI and the server wrote to the same ledger)
+rv export -d try/data --run try-1 | head -3
+```
+
+Look at the event trail: `blocked`, `approved` (by `alice`, from the approval decision), `approved` (the engine consuming it),
+`intended`, `succeeded`, `uncertain`, `failed` (`resolved by dana: …`), `compensating`/`compensated` (actor `cli`).
+
+### 5.4 Evidence
+
+```bash
+rv bundle -d try/data --key try/signing.key --out try/ledger-bundle.json
+rv verify-bundle try/ledger-bundle.json --pub try/signing.pub        # ok … hash chain verified … (trusted)
+sed 's/charge_card/delete_all/' try/ledger-bundle.json > try/tampered.json
+rv verify-bundle try/tampered.json --pub try/signing.pub; echo "exit $?"   # INVALID: records were modified after signing, exit 1
+rv bundle -d try/data --key try/signing.key --out try/run-bundle.json --run try-1
+rv verify-bundle try/run-bundle.json                                  # record hashes verified (single run) … NOT checked against a trusted key
+rvm report try-1 --out try/report.html && open try/report.html     # (macOS) an HTML report for auditors
+curl -s -H "Authorization: Bearer $OPS" $B/v1/runs/try-1/bundle | head -c 200; echo   # the server serves signed bundles too
+```
+
+### 5.5 Metrics, kill switch, logs
+
+```bash
+curl -s -H "Authorization: Bearer $OPS" $B/metrics | grep -E '^reversi_(ledger_events_total|approvals|halted|runs)'
+j $ROOT -X POST $B/v1/halt -d '{"reason":"drill"}'                                                      # {"halted":"drill (by root)"}
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"lookup_customer","args":{},"reason":"x"}'        # block: kill switch
+j $OPS -X POST $B/v1/halt -d '{"reason":"x"}'                                                           # 403: admin only
+j $ROOT -X POST $B/v1/resume
+rv kill-switch on try/STOP     # the file switch: any process watching REVERSI_KILL_FILE is blocked at once
+j $AGENT -X POST $B/v1/runs/try-1/intents -d '{"tool":"lookup_customer","args":{},"reason":"x"}'        # block
+rv kill-switch off try/STOP
+```
+
+In terminal A you should see one JSON line per request (`method`, `path`, `status`, `ms`, `principal`) and no bodies or keys.
+
+### 5.6 The console (browser)
+
+Open <http://127.0.0.1:7421/console/login>, paste `$APPR` (print it with `echo $APPR`), sign in. Then:
+
+1. **Runs**: `try-1` is listed. Use the filter "needs attention".
+2. **Run detail**: steps with statuses, the rollback plan, the event trail, the report link and signed-bundle link.
+3. **Approvals**: ask for another big charge in a new run from the agent, then approve it with the form (add a note). Try **Deny** on another.
+4. **Tools**: manifests with effect, permission and compensation; "called without a manifest".
+5. Sign out, sign in with `$AUD` (the auditor): the approve buttons are gone, and a forged POST is refused.
+6. Sign in with `$ROOT` and use **Evidence → Block all new calls**, then resume. The red banner shows while halted.
+
+Security spot checks: the cookie is `HttpOnly; SameSite=Strict`; a form POST without the CSRF field returns 403.
+
+Stop the server (Ctrl-C in terminal A) when done.
+
+## 6. The MCP gateway
+
+The gateway fronts an MCP server; here the upstream is the built-in filesystem connector. Create the config and manifests:
+
+```bash
+mkdir -p try/sandbox try/gw-manifests && echo original > try/sandbox/notes.txt
+node packages/connectors/dist/main.js manifests fs --format yaml > try/gw-manifests/fs.yaml
+cat > try/gateway.yaml <<'EOF2'
+mode: enforce
+upstreams:
+  - name: fs
+    command: node
+    args: ["packages/connectors/dist/main.js", "serve", "fs", "--root", "try/sandbox"]
+    namespace: false
+listen: { host: 127.0.0.1, port: 7431 }
+auth: { keys: try/keys.json }
+EOF2
+cat > try/gw-policy.yaml <<'EOF2'
+version: 1
+rules:
+  - id: secrets-need-approval
+    match: { tool: fs.write_file }
+    when: [{ path: $args.path, op: matches, value: "\\.(env|pem)$" }]
+    action: require_approval
+EOF2
+```
+
+**Terminal C:**
+
+```bash
+node packages/gateway/dist/main.js --config try/gateway.yaml --manifests try/gw-manifests \
+  --policy try/gw-policy.yaml --data try/gw-data --signing-key try/signing.key
+```
+
+**Terminal B:**
+
+```bash
+. try/.env.sh; U=http://127.0.0.1:7431
+curl -s localhost:7431/readyz; echo                     # {"ok":true,"upstreams":[{"name":"fs","ok":true}],...}
+mcp $U/mcp list                                         # "could not connect: ... missing or invalid credentials"
+mcp $U/mcp list --token $FSAGENT                        # 9 fs.* tools and the read-only reversi.* tools
+```
+
+**Agent calls** (`--run gw-run-1` makes every one-shot invocation continue the same run, as a real agent's session would):
+
+```bash
+mcp $U/mcp call fs.write_file '{"path":"notes.txt","content":"changed by agent"}' --token $FSAGENT --run gw-run-1 --reason "update notes"
+mcp $U/mcp call fs.make_dir '{"path":"out"}' --token $FSAGENT --run gw-run-1
+cat try/sandbox/notes.txt                               # changed by agent
+mcp $U/mcp call nope '{}' --token $FSAGENT --run gw-run-1     # ERROR RESULT: Blocked by Reversi: no manifest registered for tool `nope`
+mcp $U/mcp call fs.write_file '{"path":"prod.env","content":"X=1"}' --token $FSAGENT --run gw-run-1
+#  -> Blocked ... approval required: request apr_… is pending ...
+```
+
+**Approve from the CLI** (it shares the data directory with the gateway):
+
+```bash
+rv approvals list -d try/gw-data
+ID=$(rv approvals list -d try/gw-data | awk '{print $1}' | head -1)
+rv approvals approve $ID -d try/gw-data --as alice --note ok
+mcp $U/mcp call fs.write_file '{"path":"prod.env","content":"X=1"}' --token $FSAGENT --run gw-run-1     # now succeeds
+```
+
+**Operator endpoint and rollback:**
+
+```bash
+mcp $U/operator/mcp list --token $FSAGENT               # could not connect: auditor role or higher required
+mcp $U/operator/mcp list --token $OPS                   # reversi.approve_action, execute_rollback, export_evidence ...
+mcp $U/operator/mcp call reversi.execute_rollback '{"run_id":"gw-run-1"}' --token $OPS                  # a DRY RUN: shows the plan
+mcp $U/operator/mcp call reversi.execute_rollback '{"run_id":"gw-run-1","confirm":true}' --token $OPS  # really undoes it
+cat try/sandbox/notes.txt; ls -A try/sandbox            # original ; out/ and prod.env are gone
+rv verify -d try/gw-data                                # ok: N records
+```
+
+Also try: `reversi.halt` (admin token: `$ROOT`) then an agent call; `reversi.export_evidence`; and `deny_action` instead of approve.
+
+**Observe mode:** stop the gateway, change `mode: observe` in `try/gateway.yaml`, start it again, and call `nope`: it is no longer
+blocked, so the call goes on to the upstream (which has no such tool, so it fails), and the ledger shows `would_block` then `intended` then `failed`:
+`rv export -d try/gw-data | grep -E 'would_block|failed'`. With a tool the upstream *does* have but that has no manifest, the call runs.
+
+**stdio mode** (no `listen:`, no `auth:`: one unauthenticated session, as an MCP client like Claude Code would launch it):
+
+```bash
+cat > try/gw-stdio.yaml <<'EOF2'
+mode: enforce
+actor: stdio-agent
+upstreams:
+  - { name: fs, command: node, args: ["packages/connectors/dist/main.js", "serve", "fs", "--root", "try/sandbox"], namespace: false }
+EOF2
+mcp stdio call fs.list_dir '{}' -- node packages/gateway/dist/main.js --config try/gw-stdio.yaml --manifests try/gw-manifests --data try/stdio-data --run-id stdio-1
+```
+
+Stop the gateway with Ctrl-C.
+
+## 7. Connectors
+
+The filesystem connector is covered above. For the others you need **sandbox credentials**; use throwaway accounts, never production.
+
+**List and compensate by hand:**
+
+```bash
+node packages/connectors/dist/main.js manifests github --format yaml | head -20
+mkdir -p try/sandbox/demo
+echo '{"run_id":"r","step":0,"tool":"fs.remove_dir","original_tool":"fs.make_dir","args":{"path":"demo"},"idempotency_key":"k"}' \
+  | node packages/connectors/dist/main.js compensate --root try/sandbox        # {"ok":true}
+ls try/sandbox                                                                   # demo is gone
+```
+
+**GitHub** (a throwaway repository, token with Issues write): add an upstream to the gateway config and call it:
+
+```yaml
+upstreams:
+  - { name: gh, command: node, args: ["packages/connectors/dist/main.js", "serve", "github"], env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" }, namespace: false }
+```
+
+```bash
+export GITHUB_TOKEN=…   # before starting the gateway; manifests: reversi-connectors manifests github
+mcp $U/mcp call github.create_issue '{"owner":"YOU","repo":"sandbox","title":"reversi test"}' --token $FSAGENT --run gh-1
+mcp $U/operator/mcp call reversi.execute_rollback '{"run_id":"gh-1","confirm":true}' --token $OPS      # the issue is closed
+```
+
+(Give the agent key `github:*` permissions in `max_permissions`; see each tool's `permission` in the manifests.) **Slack**:
+`slack.post_message {"channel":"C…","text":"hi"}` then rollback deletes the message (`SLACK_BOT_TOKEN`). **Stripe**:
+`stripe.create_customer {"email":"t@example.com"}` then rollback deletes it (`STRIPE_SECRET_KEY` = a `sk_test_…` key);
+`stripe.create_refund` needs approval and cannot be undone: check that the plan says so.
+
+The connectors are tested against fakes of these APIs; this is the first time they meet the real ones.
+
+## 8. SQLite and PostgreSQL
+
+**SQLite** (a single file, Node 22.13+): restart the server from 5.1 with `REVERSI_STORE=sqlite REVERSI_DATA=try/sqldata`, repeat a few calls,
+then:
+
+```bash
+rv runs -m examples/order-agent/manifests -d try/sqldata --store sqlite
+rv verify -d try/sqldata --store sqlite
+node -e 'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync("try/sqldata/reversi.db");try{d.exec("DELETE FROM ledger")}catch(e){console.log("rejected:",e.message)}'
+```
+
+Expect `rejected: ledger is append-only`.
+
+**PostgreSQL** with Docker:
+
+```bash
+docker run --rm -d --name reversi-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:5432:5432 postgres:16
+export REVERSI_DATABASE_URL=postgres://postgres:pw@127.0.0.1:5432/postgres
+REVERSI_STORE=postgres REVERSI_MANIFESTS=examples/order-agent/manifests REVERSI_KEYS=try/keys.json PORT=7423 node packages/server/dist/main.js
+```
+
+In another terminal create a run through `localhost:7423` as in 5.2, then:
+
+```bash
+rv runs -m examples/order-agent/manifests --store postgres
+rv verify --store postgres
+docker exec reversi-pg psql -U postgres -c "select seq, record->>'event' from ledger order by seq"
+docker exec reversi-pg psql -U postgres -c "delete from ledger"      # ERROR: ledger is append-only
+REVERSI_TEST_PG=$REVERSI_DATABASE_URL npm test                        # the PostgreSQL suite
+docker stop reversi-pg
+```
+
+**Two writers, one ledger:** start a second server on port 7424 against the same database, make calls through both, and run `rv verify --store postgres`:
+the chain stays intact.
+
+## 9. Authentication
+
+**Roles.** With the keys from 5.1, repeat these and check the status codes: an agent key on `/v1/approvals` (403), an approver key on
+`/v1/runs/try-1/plan` (200) but on `/v1/runs/try-1/steps/0/compensation` (403), an operator key on `/v1/halt` (403), the admin key on it (200).
+
+**Key rotation.** Add `"expires_at": "2000-01-01T00:00:00Z"` to one key in `try/keys.json` and wait two seconds (or `kill -HUP` the server): that key now
+returns 401, others keep working. Set `"disabled": true` for the same effect. Break the JSON on purpose: the server logs
+`key reload failed, keeping the old keys` and nothing changes.
+
+**OIDC** with the bundled mock provider. Terminal D: `node examples/oidc/mock-idp.mjs`. Then:
+
+```bash
+REVERSI_MANIFESTS=examples/order-agent/manifests REVERSI_DATA=try/oidc-data PORT=7422 \
+REVERSI_OIDC_ISSUER=http://127.0.0.1:9000 REVERSI_OIDC_AUDIENCE=reversi \
+REVERSI_OIDC_ROLE_MAP='{"reversi-ops":"operator","reversi-agents":"agent"}' node packages/server/dist/main.js
+```
+
+```bash
+OPSTOK=$(curl -s "http://127.0.0.1:9000/token?sub=dana&roles=reversi-ops")
+AGTOK=$(curl -s "http://127.0.0.1:9000/token?sub=bot-1&roles=reversi-agents")
+curl -s -H "Authorization: Bearer $OPSTOK" localhost:7422/v1/status        # 200 JSON
+curl -s -H "Authorization: Bearer $AGTOK"  localhost:7422/v1/status        # {"error":"auditor role required"}
+curl -s -H "Authorization: Bearer $(curl -s 'http://127.0.0.1:9000/token?sub=x&roles=reversi-ops&aud=other')" localhost:7422/v1/status   # 401: wrong audience
+curl -s -H "Authorization: Bearer $(curl -s 'http://127.0.0.1:9000/token?sub=x&roles=reversi-ops&ttl=-100')" localhost:7422/v1/status    # 401: expired
+```
+
+The ledger actor for the bot's runs is its `sub` (`bot-1`). You can also paste a token into the console login.
+
+## 10. Approval notifications
+
+Terminal D: `node examples/webhook-sink.mjs`. Start any server or gateway with
+`REVERSI_APPROVAL_WEBHOOK=http://127.0.0.1:9100/hook REVERSI_CONSOLE_URL=http://127.0.0.1:7421`, trigger an approval (5.2 or 6) and watch the sink print a
+Slack-style `text` plus the structured request. It never contains argument values. Stop the sink and trigger another: the call is still blocked
+normally and the server logs `approval webhook failed`.
+
+## 11. The Python SDK
+
+```bash
+python3 -m unittest discover -s packages/sdk-py/tests -t packages/sdk-py -v      # includes the live server test
+python3 -m reversi_sdk verify examples/order-agent/out/ledger.jsonl
+REVERSI_MANIFESTS=examples/order-agent/manifests REVERSI_KEYS=examples/python-agent/keys.json node packages/server/dist/main.js &
+python3 examples/python-agent/agent.py
+kill %1
+```
+
+Expect `created …`, a charge, and `blocked: …` for the out-of-scope email. See the [SDK page](/sdks/python) for approvals and rollback calls
+(`Blocked.approval_id`, `run.rollback(...)`).
+
+## 12. Docker
+
+```bash
+docker build -t reversi .
+docker run --rm -p 127.0.0.1:7421:7421 -v $PWD/try:/config:ro -e REVERSI_MANIFESTS=/config/gw-manifests -e REVERSI_KEYS=/config/keys.json reversi
+curl -s localhost:7421/readyz
+```
+
+(The first line of output should be the listening message; `docker ps` shows `healthy` after ~10 s.) The Compose stack on PostgreSQL:
+follow the comments at the top of `deploy/docker-compose.yml`.
+
+## 13. Docs and CI
+
+```bash
+cd docs && npx mint dev          # preview at http://localhost:3000 (downloads the Mintlify CLI)
+npx mint broken-links
+```
+
+Every page in the left navigation should open and render, including this one. CI (`.github/workflows/ci.yml`) runs the test suites with a PostgreSQL
+service, the fixture check, `npm audit`, an SBOM and a secret scan, and builds the Docker image.
+
+## Cleanup
+
+```bash
+pkill -f packages/server/dist/main.js; pkill -f packages/gateway/dist/main.js; pkill -f mock-idp.mjs; pkill -f webhook-sink.mjs
+rm -rf try examples/order-agent/out
+```

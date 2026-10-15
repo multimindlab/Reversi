@@ -8,7 +8,7 @@
  * This detects tampering; it does not prevent a writer who controls the whole file from forging a
  * consistent chain. Anchor `head()` somewhere the writer cannot reach for stronger guarantees.
  */
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
 import { redactSecrets } from "./redact.js";
 
@@ -147,25 +147,82 @@ export function toJsonl(records: readonly LedgerRecord[]): string {
 
 /**
  * JSONL file store. Every append is fsynced so a journaled intent survives a crash.
- * Single writer: two processes appending to one file will fork the chain.
+ *
+ * Several processes on one host may share the file (a server, a gateway and the CLI): each call to
+ * `all()` picks up lines other processes appended, and `append` takes a lock file and refuses to
+ * write if the file grew since this process last read it, so the chain cannot fork. A stale lock
+ * (a crashed holder) is broken after 30 seconds. Not safe over network filesystems; use SQLite or
+ * PostgreSQL to share across hosts.
  */
 export class JsonlLedgerStore implements LedgerStore {
-  private readonly items: LedgerRecord[];
+  private readonly items: LedgerRecord[] = [];
+  private offset = 0;
   constructor(private readonly path: string) {
-    this.items = existsSync(path) ? parseJsonl(readFileSync(path, "utf8")) : [];
+    this.sync();
   }
-  all(): readonly LedgerRecord[] {
-    return this.items;
-  }
-  append(record: LedgerRecord): void {
-    const fd = openSync(this.path, "a");
+
+  /** Read whole lines appended since the last read. A half-written last line is left for next time. */
+  private sync(): void {
+    if (!existsSync(this.path)) return;
+    const size = statSync(this.path).size;
+    if (size <= this.offset) return;
+    const fd = openSync(this.path, "r");
     try {
-      writeSync(fd, JSON.stringify(record) + "\n");
-      fsyncSync(fd);
+      const buf = Buffer.alloc(size - this.offset);
+      readSync(fd, buf, 0, buf.length, this.offset);
+      const text = buf.toString("utf8");
+      const end = text.lastIndexOf("\n");
+      if (end === -1) return;
+      this.items.push(...parseJsonl(text.slice(0, end + 1)));
+      this.offset += Buffer.byteLength(text.slice(0, end + 1));
     } finally {
       closeSync(fd);
     }
-    this.items.push(record);
+  }
+
+  all(): readonly LedgerRecord[] {
+    this.sync();
+    return this.items;
+  }
+
+  append(record: LedgerRecord): void {
+    const lock = `${this.path}.lock`;
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        closeSync(openSync(lock, "wx"));
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        try {
+          if (Date.now() - statSync(lock).mtimeMs > 30_000) unlinkSync(lock); // holder crashed
+        } catch {
+          /* it was released meanwhile */
+        }
+        if (Date.now() > deadline) throw new LedgerError("could not lock the ledger file; another process is holding it");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    }
+    try {
+      const size = existsSync(this.path) ? statSync(this.path).size : 0;
+      if (size !== this.offset) throw new LedgerConflictError(); // someone appended since we last read
+      const line = JSON.stringify(record) + "\n";
+      const fd = openSync(this.path, "a");
+      try {
+        writeSync(fd, line);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      this.items.push(record);
+      this.offset += Buffer.byteLength(line);
+    } finally {
+      try {
+        unlinkSync(lock);
+      } catch {
+        /* already gone */
+      }
+    }
   }
 }
 

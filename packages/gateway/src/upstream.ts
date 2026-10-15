@@ -11,6 +11,14 @@ export interface UpstreamEntry {
   namespace: boolean;
 }
 
+/** The gateway has no upstream for this tool name, so nothing was sent anywhere. */
+export class UnknownToolError extends Error {
+  constructor(readonly tool: string) {
+    super(`unknown tool \`${tool}\``);
+    this.name = "UnknownToolError";
+  }
+}
+
 export class UpstreamPool {
   private routes = new Map<string, { entry: UpstreamEntry; original: string }>();
   constructor(readonly entries: UpstreamEntry[]) {
@@ -72,7 +80,7 @@ export class UpstreamPool {
 
   async call(exposed: string, args: Record<string, unknown> | undefined, meta?: Record<string, unknown>): Promise<CallToolResult> {
     const r = await this.resolve(exposed);
-    if (!r) throw new Error(`unknown tool \`${exposed}\``);
+    if (!r) throw new UnknownToolError(exposed);
     const res = await r.entry.client.callTool({ name: r.original, arguments: args, ...(meta ? { _meta: meta } : {}) });
     return res as CallToolResult;
   }
