@@ -19,8 +19,10 @@ const HELP = `reversi-server. Configuration is by environment variable:
   REVERSI_SIGNING_KEY      PEM file with an Ed25519 private key, for signed evidence bundles
   REVERSI_OIDC_ISSUER, REVERSI_OIDC_AUDIENCE, REVERSI_OIDC_ROLE_MAP   OIDC bearer tokens; role map is JSON like {"reversi-ops":"operator"}
   REVERSI_OIDC_ROLE_CLAIM  claim holding roles (default "roles"; dots allowed: realm_access.roles)
+  REVERSI_OIDC_ACTOR_CLAIM claim used as the principal name (default "sub")
   REVERSI_SESSION_SECRET   signs console cookies (default: random per start)
   REVERSI_SECURE_COOKIES   1 behind HTTPS
+  REVERSI_METRICS_PUBLIC   1 to serve /metrics without credentials (keep it on a private network)
   REVERSI_LOG              json to log one JSON line per request to stdout
   PORT (7421), HOST (127.0.0.1)
 `;
@@ -66,7 +68,7 @@ if (env.REVERSI_OIDC_ISSUER) {
     console.error(`error: REVERSI_OIDC_ROLE_MAP values must be among ${ROLES.join(", ")}`);
     process.exit(64);
   }
-  oidc = new OidcVerifier({ issuer: env.REVERSI_OIDC_ISSUER, audience: env.REVERSI_OIDC_AUDIENCE, role_map, role_claim: env.REVERSI_OIDC_ROLE_CLAIM });
+  oidc = new OidcVerifier({ issuer: env.REVERSI_OIDC_ISSUER, audience: env.REVERSI_OIDC_AUDIENCE, role_map, role_claim: env.REVERSI_OIDC_ROLE_CLAIM, actor_claim: env.REVERSI_OIDC_ACTOR_CLAIM });
 }
 if (ring.size === 0 && !oidc) {
   console.error("error: no credentials configured: set REVERSI_KEYS and/or REVERSI_OIDC_ISSUER");
@@ -86,6 +88,7 @@ const app = createApp({
   keys: ring,
   oidc,
   signing_key,
+  metrics_public: env.REVERSI_METRICS_PUBLIC === "1",
   session_secret: env.REVERSI_SESSION_SECRET,
   secure_cookies: env.REVERSI_SECURE_COOKIES === "1",
   logger: env.REVERSI_LOG === "json" ? (e) => console.log(JSON.stringify(e)) : undefined,

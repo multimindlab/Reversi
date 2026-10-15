@@ -1,36 +1,50 @@
 ---
 title: Security model
-description: Who can do what, and what Reversi assumes.
+description: Roles, approvals, scopes and what Reversi assumes.
 ---
 
-## Two planes
+## Roles
 
-| Plane | Who | Can |
-|---|---|---|
-| **Agent** | agent keys | open runs, request tool calls (`intents`), report outcomes, read own runs |
-| **Operator** | operator keys | plan, roll back, grant approvals, export, verify |
+| Role | Can |
+|---|---|
+| `agent` | open runs, request tool calls, report outcomes, read **its own** runs |
+| `auditor` | read everything: runs, plans, ledger, evidence, metrics. Changes nothing |
+| `approver` | auditor, plus decide approvals |
+| `operator` | approver, plus roll back, resolve unknown outcomes |
+| `admin` | operator, plus the kill switch |
 
-An agent cannot approve its own irreversible call or trigger a rollback. The server enforces this by key role, and
-the agent key's name becomes the ledger `actor`; a request body cannot choose another actor. Agents only see runs they opened.
+An agent cannot approve its own call or trigger a rollback. The server enforces this by role, and the agent key's name
+becomes the ledger `actor`: a request body cannot choose another actor. API keys and OIDC tokens map to roles; see
+[authentication](/operations/authentication). On the [gateway](/gateway), operator tools live on a separate endpoint with
+separate credentials, so they do not exist from the agent's point of view.
 
 ## Approvals
 
-Calls to tools with `approval: always` (all irreversible tools) are blocked until an operator posts a **single-use
-grant** for that run and tool. Grants live in server memory: a restart revokes them, which fails safe.
+Required by manifest, [policy](/concepts/policy) or [content check](/concepts/content-checks). Bound to the arguments,
+single use, expiring, persisted. See [approvals](/concepts/approvals).
 
 ## Scopes
 
-A run is opened with a set of permissions, sealed with a SHA-256 digest. Each call checks the tool's `permission`
-against the scope. A key may carry `max_permissions`, capping what runs it opens can request. Narrowing a scope is
-allowed; the child seal records its parent. If stored run state is edited, the seal no longer matches and calls block.
+A run is opened with a set of permissions, sealed with a SHA-256 digest. Each call checks the tool's `permission` against
+the scope. A key may carry `max_permissions`, capping what runs it opens can request. If stored run state is edited, the
+seal no longer matches and calls block.
+
+## Kill switch
+
+An admin can block every new call at once (`POST /v1/halt`, the console, or a file named by `REVERSI_KILL_FILE`, which
+`reversi kill-switch on <file>` creates and any number of processes watch). Rollbacks keep working: halting must never
+stop you from cleaning up.
 
 ## Observe mode
 
-`mode: observe` journals policy violations as `would_block` and lets the call run. Use it to learn what an agent does
-before you enforce anything.
+`mode: observe` journals violations as `would_block` and lets the call run. Use it to learn what an agent does before
+you enforce anything.
 
 ## Assumptions you must own
 
-- The server's data directory and key file are protected from the agent.
-- Manifests are written by someone who understands the tool; MCP-style self-declared hints are not trusted.
-- API keys are sent over TLS (the server speaks HTTP; terminate TLS in front of it).
+- The data directory or database, the key file and the signing key are protected from the agent.
+- Reversi is in the **only** path from the agent to its tools. An agent that can call a tool directly is not governed.
+- Manifests are written by someone who understands the tool. MCP-style self-declared hints are not trusted.
+- TLS terminates in front of the server and gateway.
+
+See the full [threat model](/threat-model).

@@ -2,12 +2,21 @@
 
 ```sh
 npm install
-npm test          # builds, runs the TypeScript tests (core, CLI, server)
+npm test          # builds, runs the TypeScript tests (core, CLI, server, gateway, connectors)
 npm run test:py   # Python SDK tests, including a live run against the built server
 npm run example   # end-to-end demo
 ```
 
-Both test commands must pass. CI runs them on Node 22 and Python 3.9 and 3.12.
+Both test commands must pass. Node 22.13+ is required (`node:sqlite`). The PostgreSQL tests run when `REVERSI_TEST_PG`
+points at a **throwaway** database (each run creates its own schema in it):
+
+```sh
+REVERSI_TEST_PG=postgres://user:pass@localhost:5432/reversi_test npm test
+```
+
+CI runs everything on Node 22 with a PostgreSQL service, and the Python tests on 3.12.
+
+Docs live in `docs/` (Mintlify: `docs/docs.json` is the navigation). Update the page for any behaviour you change.
 
 ## Ground rules
 

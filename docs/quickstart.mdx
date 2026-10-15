@@ -85,3 +85,14 @@ reversi rollback <run_id> -m tools.yaml -d ./reversi-data --compensator-cmd "./u
 ```
 
 `undo.sh` receives the compensation call as JSON on stdin; exit code 0 means it was undone.
+
+## 6. Or put the gateway in front of an MCP server
+
+No code changes in the agent: point its MCP client at `reversi-gateway`, and it journals, enforces policy,
+asks for approval and can roll the run back. See the [gateway guide](/gateway).
+
+```bash
+reversi-gateway --manifests tools.yaml --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+```
+
+Run it in `--mode observe` first to see what would have been blocked before you enforce anything.

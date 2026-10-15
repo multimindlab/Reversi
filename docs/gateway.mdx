@@ -1,42 +1,108 @@
 ---
 title: MCP gateway
-description: Journal an MCP server's tool calls without changing the agent or the server. Observe mode only.
+description: Journal, police, approve and roll back any MCP server's tool calls, without changing the agent or the server.
 ---
 
-`reversi-gateway` is an MCP server that forwards to one upstream MCP server and journals every `tools/call`.
-Point your MCP client at the gateway instead of the upstream.
+`reversi-gateway` is an MCP server that fronts one or more upstream MCP servers. Point your MCP client (Claude Code,
+Cursor, VS Code, your own agent) at the gateway instead of the upstream. Every `tools/call` goes through the Reversi
+engine before it is forwarded.
 
-```sh
-reversi-gateway --manifests ./manifests --data ./reversi-data \
-  --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
-# or: --upstream-url https://example.com/mcp   (Streamable HTTP)
+```bash
+reversi-gateway --manifests ./manifests --policy ./policy.yaml \
+  --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server        # stdio, enforcing
+reversi-gateway --config gateway.yaml --manifests ./manifests              # anything more
 ```
 
-The gateway speaks MCP on stdio, so logs go to stderr.
+## What happens to a call
 
-## What it does
+1. **Manifest and scope.** A tool with no manifest, or whose permission is outside the session's scope, is blocked.
+2. **Policy, content checks, kill switch** apply ([policy](/concepts/policy), [content checks](/concepts/content-checks)).
+3. **Approval** if required: the call is blocked with the approval id, and the agent retries after an approver decides
+   ([approvals](/concepts/approvals)).
+4. **Journal the intent** (write-ahead), **forward** to the upstream, **journal the outcome**. The upstream result is returned
+   unchanged. An `isError` result is journaled as `failed`; a transport error or timeout as `uncertain`.
 
-- `tools/list` is forwarded unchanged.
-- `tools/call`: the intent is journaled **before** the call is forwarded, the outcome after. The upstream result is
-  returned unchanged, including `isError` results (journaled as `failed`).
-- If the upstream call errors in transit, the step is `uncertain`, so rollback reports it as unresolved.
-- One gateway process is one run. Its data is the same `ledger.jsonl` and `runs/` the CLI reads, so
-  `reversi plan <run>` and `reversi rollback` work on it.
-- Compensation arguments (`$result.*`) resolve from `structuredContent`, or from a single text content block that
-  holds a JSON object.
+A blocked call returns an MCP result with `isError: true` and the reason in the text, so the model can read it. Compensation
+arguments (`$result.*`) resolve from `structuredContent`, or from a single text block holding JSON.
 
-## Why a call was made
+MCP has no field for "why", and every ledger record needs one. Clients may send it in `_meta["reversi/reason"]`; otherwise the
+record says `MCP tools/call <tool>`.
 
-MCP has no field for a reason, and every ledger record needs one. A client may send it in the call's
-`_meta["reversi/reason"]`. Otherwise the record says `MCP tools/call <tool>`.
+**One session is one run**, with the actor taken from the credential (or `actor` in the config when unauthenticated).
 
-## Observe mode
+## Config
 
-Nothing is blocked. A tool with no manifest, or a call outside the run's scope, is journaled as `would_block` and
-still runs. By default the scope is every permission named in your manifests. Enforcement and approvals are not
-built yet.
+```yaml gateway.yaml
+mode: enforce                 # observe: journal and never block (violations become would_block)
+actor: dev-laptop             # for unauthenticated sessions
+permissions: [fs:read, fs:write]   # scope of each session; default: every permission in the manifests
+upstreams:
+  - name: github
+    url: https://mcp.example.com/mcp          # Streamable HTTP
+    headers: { Authorization: "Bearer ${GITHUB_MCP_TOKEN}" }
+  - name: fs
+    command: reversi-connectors
+    args: [serve, fs, --root, ./sandbox]       # stdio
+allow: ["fs.*", "github.get_*"]               # if set, only these may be called (and listed)
+deny:  ["fs.remove_dir"]
+listen: { host: 127.0.0.1, port: 7431 }       # omit to speak MCP on stdio
+resource_url: https://gateway.example.com     # public URL, for OAuth protected-resource metadata
+auth:
+  keys: ./keys.json
+  oidc: { issuer: https://id.example.com/realm, audience: https://gateway.example.com, role_map: { bot: agent, ops: operator } }
+allowed_hosts: [gateway.example.com]
+allowed_origins: []
+```
+
+- **Several upstreams** are namespaced `<name>.<tool>` by default (`namespace: false` per upstream to keep names). Manifests use the
+  exposed names. Two upstreams exposing the same name without namespacing is an error.
+- `${NAME}` in `args`, `env` and `headers` expands from the environment, so secrets stay out of the file. A stdio upstream does **not**
+  inherit the gateway's environment, only what you list.
+- `allow`/`deny` globs are compiled into policy rules, so they also show up as `blocked` records.
+
+## Endpoints (HTTP mode)
+
+| Path | Who | What |
+|---|---|---|
+| `/mcp` | `agent` role | The agent endpoint: upstream tools plus read-only `reversi.*` tools |
+| `/operator/mcp` | `auditor` and up | The operator endpoint: only `reversi.*` tools, limited by role |
+| `/healthz`, `/readyz` | anyone | Liveness; readiness pings every upstream |
+| `/.well-known/oauth-protected-resource` | anyone | Points clients at the OIDC issuer |
+
+A 401 carries `WWW-Authenticate: Bearer resource_metadata="…"`. Tokens must have the configured `audience`. Sessions belong to
+one principal: using another's session id is a 403. `Host` is validated against `allowed_hosts` (default: loopback only when bound to
+loopback) and any `Origin` header is rejected unless allowed, which stops a web page driving a local gateway (DNS rebinding).
+The gateway **refuses to listen beyond loopback without authentication**, and never serves the operator endpoint without it.
+
+## `reversi.*` tools
+
+On the **agent** endpoint (your own runs only):
+
+`reversi.list_runs`, `reversi.get_run`, `reversi.get_action_trace`, `reversi.plan_rollback`, `reversi.dry_run_rollback`,
+`reversi.validate_manifest`.
+
+On the **operator** endpoint, by role:
+
+| Tool | Role | Does |
+|---|---|---|
+| `reversi.list_approvals`, `reversi.export_evidence`, and the read tools above (any run) | auditor | Read |
+| `reversi.approve_action`, `reversi.deny_action` | approver | Decide a request |
+| `reversi.execute_rollback` | operator | Dry run unless `confirm: true`; with `approve_compensations: true` also approves compensations that need it. Calls each compensation **on the upstream**, newest first, with retries and the idempotency key in `_meta["reversi/idempotency_key"]` |
+| `reversi.halt`, `reversi.resume` | admin | Kill switch |
+
+The agent cannot reach any of these: they are not on its endpoint, and calling one by name fails with "unknown tool".
+Compensations bypass `allow`/`deny` and scope, since an operator is deliberately undoing something: keep permissions for
+destructive compensation tools out of agents' scopes.
+
+Over **stdio** the gateway is a single unauthenticated agent session. Operate it with the CLI against the same data store
+(`reversi approvals`, `reversi rollback`), or run it in HTTP mode.
+
+## Storage and notifications
+
+The gateway uses the same stores as the server (`--store files|sqlite|postgres`), so the console, CLI and gateway can all look
+at one ledger and one approval queue. `REVERSI_APPROVAL_WEBHOOK` notifies approvers. See [storage](/operations/storage).
 
 ## Limits
 
-One upstream per gateway, no tool namespacing, no approvals, no HTTP listener (stdio only), and no rollback tools
-exposed over MCP.
+The gateway journals and forwards `tools/call`. It does not proxy resources, prompts or sampling. `tools/list` results are cached
+for five seconds. Rollback executes against the upstream the compensation tool is exposed by.

@@ -1,0 +1,76 @@
+---
+title: Deployment
+description: Run the server and gateway in Docker or directly, configure them, and put TLS in front.
+---
+
+## Docker
+
+The repository's `Dockerfile` builds one image with the server (default command), the gateway and the CLI.
+
+```bash
+docker build -t reversi .
+docker run --rm -p 127.0.0.1:7421:7421 -v reversi-data:/data \
+  -v $PWD/manifests:/config/manifests:ro -v $PWD/keys.json:/config/keys.json:ro \
+  -e REVERSI_MANIFESTS=/config/manifests -e REVERSI_KEYS=/config/keys.json reversi
+
+# the gateway from the same image
+docker run --rm reversi node packages/gateway/dist/main.js --config /config/gateway.yaml --manifests /config/manifests
+```
+
+It runs as the unprivileged `node` user, keeps data in the `/data` volume, and has a health check on `/readyz`.
+
+`deploy/docker-compose.yml` runs the server on PostgreSQL with a Postgres health check; follow the comments at its top
+(generate the example manifests, copy and fill `deploy/keys.json`, set `POSTGRES_PASSWORD`).
+
+<Note>
+The Docker files and compose stack are provided but were not built or run in the project's own test pass. Build and run them
+in your environment before relying on them.
+</Note>
+
+## Server environment
+
+| Variable | Meaning |
+|---|---|
+| `REVERSI_MANIFESTS` | Manifest file or directory (required) |
+| `REVERSI_KEYS` | API key file; reloaded on `SIGHUP` or change |
+| `REVERSI_OIDC_*` | OIDC: `ISSUER`, `AUDIENCE`, `ROLE_MAP`, `ROLE_CLAIM`, `ACTOR_CLAIM` ([authentication](/operations/authentication)) |
+| `REVERSI_DATA`, `REVERSI_STORE`, `REVERSI_DATABASE_URL` | [Storage](/operations/storage) |
+| `REVERSI_POLICY`, `REVERSI_ENV` | [Policy](/concepts/policy) file and environment name |
+| `REVERSI_KILL_FILE` | While this file exists, new calls are blocked |
+| `REVERSI_SIGNING_KEY` | Ed25519 private key (PEM) for [signed bundles](/concepts/evidence) |
+| `REVERSI_APPROVAL_WEBHOOK`, `REVERSI_CONSOLE_URL` | [Approval notifications](/concepts/approvals) |
+| `REVERSI_SESSION_SECRET`, `REVERSI_SECURE_COOKIES` | [Console](/console) sessions |
+| `REVERSI_METRICS_PUBLIC=1` | Serve `/metrics` without credentials (private networks only) |
+| `REVERSI_LOG=json` | One JSON line per request on stdout |
+| `PORT`, `HOST` | Listen address (default `127.0.0.1:7421`) |
+
+At least one credential source (keys or OIDC) is required: the server will not start unauthenticated.
+
+## TLS and networking
+
+Both programs speak plain HTTP. Terminate TLS in a reverse proxy (nginx, Caddy, a cloud load balancer) and set
+`REVERSI_SECURE_COOKIES=1`. Keep the server and gateway on a private network; the agent only needs to reach the gateway or the
+agent endpoints. Set `allowed_hosts` on the gateway to your public hostname.
+
+## High availability
+
+One engine process per run is the supported model. With PostgreSQL you can run several server or gateway instances, each owning
+its own sessions and runs, behind a load balancer with session affinity for MCP sessions (the `Mcp-Session-Id` header). Ledger
+appends from all of them stay on one chain. Active/active drivers of the *same* run are not supported.
+
+## Upgrades
+
+Deploy the new version: PostgreSQL migrations run at start. Back up first ([storage](/operations/storage)). Manifests and
+policy files are read at start; restart to load changes. Key files reload live.
+
+## Incident runbook
+
+| Situation | Do |
+|---|---|
+| Agent is misbehaving | Kill switch: console, `POST /v1/halt`, `reversi.halt`, or `reversi kill-switch on <file>`. Rollbacks still work |
+| Need to know what it did | Console run page, `reversi export --run`, or a signed bundle |
+| Undo it | `reversi plan`, then `reversi rollback` / `reversi.execute_rollback`. Review `cannot be undone` and `unresolved` items by hand |
+| A step has an unknown outcome | Check the downstream system, then `reversi resolve` with a note |
+| Compensation keeps failing | Read the error in the ledger (`compensation_failed`), fix the cause, re-run the rollback: it retries with the same idempotency key |
+| Suspect ledger tampering | `reversi verify`, compare the head with your anchored copy |
+| Key leaked | Set `disabled: true` (reloads within seconds) or remove it; review that principal's runs in the ledger |

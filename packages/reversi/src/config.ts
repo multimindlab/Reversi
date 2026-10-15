@@ -59,7 +59,7 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
     runs: data.runs,
     approver: approvals.asApprover(),
     policy: pol?.policy,
-    content: pol?.content ?? (pol ? new ContentChecker() : undefined),
+    content: pol?.content,
     environment: cfg.environment,
     kill_switch_file: cfg.kill_switch_file,
   });

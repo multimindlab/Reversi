@@ -23,6 +23,7 @@ export interface OidcConfig {
   audience: string;
   role_map: Record<string, Role>;
   role_claim?: string;
+  actor_claim?: string;
   jwks_uri?: string;
 }
 

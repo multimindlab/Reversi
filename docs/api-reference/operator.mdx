@@ -1,27 +1,39 @@
 ---
 title: Operator endpoints
-description: Plan, approve, compensate, export, verify. Operator keys only.
+description: Plan, compensate, resolve, export, verify, report. Auditor reads; operator acts.
 ---
 
-## `GET /v1/runs/{id}/plan`
+## `GET /v1/runs/{id}/plan` (auditor+)
 Simulated rollback: `{"run_id","actions":[{"step","tool","kind","compensation_tool?","args?","idempotency_key?","blocked_by?","note?"}],"fully_reversible"}`.
 `kind`: `compensate`, `skip`, `defer`, `unrecoverable`, `unresolved`, `unmanifested`.
 
-## `POST /v1/runs/{id}/approvals`
+## `POST /v1/runs/{id}/approvals` (approver+)
 ```json
 { "tool": "send_email", "kind": "call", "count": 1 }
 ```
-Single-use grant. For compensations use `"kind": "compensation"` and the **compensation** tool's name.
+Standing pre-approval for a tool in this run, any arguments, `count` uses. For compensations use `"kind": "compensation"`
+and the **compensation** tool's name. To decide a queued request instead, see [admin](/api-reference/admin).
 
-## `POST /v1/runs/{id}/steps/{n}/compensation`
+## `POST /v1/runs/{id}/steps/{n}/compensation` (operator+)
 Journals `compensating` first, then returns what to run:
 `{"decision":"go","call":{"tool","args","idempotency_key",…}}`, or `defer`, `awaiting_approval`, `not_actionable`, `nothing_to_do`.
 
-## `POST /v1/runs/{id}/steps/{n}/compensation/outcome`
+## `POST /v1/runs/{id}/steps/{n}/compensation/outcome` (operator+)
 `{"status":"compensated"}` or `{"status":"failed","error":"…"}`.
 
-## `GET /v1/runs/{id}/export`
+## `POST /v1/runs/{id}/steps/{n}/resolve` (operator+)
+Settle a step whose outcome was unknown, after checking downstream:
+```json
+{ "status": "succeeded", "result": { "id": 7 }, "note": "found order 7 in the admin UI" }
+```
+`note` is required and is stored in the ledger with the caller's name. `status` is `succeeded` or `failed` (with optional `error`).
+Returns `{"step","status"}`.
+
+## `GET /v1/runs/{id}/export` (auditor+)
 The run's ledger records as `application/x-ndjson`.
 
-## `GET /v1/ledger/verify`
+## `GET /v1/runs/{id}/report` (auditor+)
+A self-contained HTML auditor report.
+
+## `GET /v1/ledger/verify` (auditor+)
 `{"ok":true,"records":42,"head":"…"}` or `{"ok":false,"seq":7,"error":"…"}`.

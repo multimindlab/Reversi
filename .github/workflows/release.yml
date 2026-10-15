@@ -1,0 +1,40 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # npm provenance and build attestations
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - name: SBOM
+        run: npm sbom --sbom-format cyclonedx --omit dev > sbom.cdx.json
+      - name: Pack
+        run: |
+          mkdir dist-packages
+          for p in reversi cli server gateway connectors; do npm pack -w packages/$p --pack-destination dist-packages; done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist-packages/*.tgz"
+      - name: Publish with provenance
+        run: for t in dist-packages/*.tgz; do npm publish "$t" --provenance --access public; done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sbom.cdx.json
+            dist-packages/*.tgz

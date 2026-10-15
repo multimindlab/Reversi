@@ -8,27 +8,47 @@ npm install @multimindlab/reversi
 ```
 
 ```ts
-import { Ledger, JsonlLedgerStore, FileRunStore, Registry, Reversi, SealedScope } from "@multimindlab/reversi";
+import { Approvals, Policy, ContentChecker, Reversi, SealedScope, loadRegistry, openData, Ledger } from "@multimindlab/reversi";
 
+const data = await openData({ dir: "./reversi-data", store: "sqlite" });      // files | sqlite | postgres
+const approvals = new Approvals(data.approvals);
 const reversi = new Reversi({
-  registry: Registry.from([/* manifests */]),
-  ledger: new Ledger(new JsonlLedgerStore("./ledger.jsonl")),
-  runs: new FileRunStore("./runs"),
-  approver: async (req) => askAHuman(req),   // called for approval: always tools and compensations
+  registry: loadRegistry("./tools.yaml"),
+  ledger: new Ledger(data.ledger),
+  runs: data.runs,
+  approver: approvals.asApprover(),                    // queue, decide, consume (see Approvals)
+  policy: Policy.from(yamlDoc),                        // optional rules and limits
+  content: new ContentChecker({ secrets: "deny" }),    // optional content checks
+  environment: "prod",
+  kill_switch_file: "/run/reversi/STOP",
 });
+
 const run = reversi.startRun({ actor: "agent", scope: SealedScope.seal(["orders:write"]) });
+const createOrder = run.wrap("create_order", (args: { sku: string }) => shop.createOrder(args), (a) => `order ${a.sku}`);
+await createOrder({ sku: "BOOK-1" });                  // throws BlockedError if blocked
 ```
+
+`openEngine({ manifests, data, policy, environment })` does all of the above from files and returns `{ reversi, approvals, registry, data }`,
+which is what the server, gateway and CLI use.
 
 | API | Purpose |
 |---|---|
-| `run.call({tool, args, reason, execute})` | Authorize, journal, execute, journal. Rethrows executor errors |
+| `run.call({tool, args, reason, execute})` | Authorize, journal, execute, journal. Returns `{status: "executed" \| "blocked"}`; rethrows executor errors |
+| `run.wrap(tool, fn, reason)` | A function that goes through the run; throws `BlockedError` when blocked |
 | `run.begin` / `run.complete` | The same in two steps, when execution happens elsewhere |
-| `run.plan()` | Simulate rollback |
-| `run.rollback({compensate})` | Undo; returns a report |
-| `run.unresolved()` | Steps with unknown outcome |
+| `run.plan()` | Dry-run rollback |
+| `run.rollback({compensate, retry, verify})` | Undo with backoff and verification; returns a report |
+| `run.unresolved()`, `run.resolve(step, outcome, {actor, note})`, `run.reconcile(probe)` | Unknown outcomes |
+| `reversi.halt(reason)`, `reversi.resume()` | Kill switch (in process; the file switch works across processes) |
 | `EffectUncertainError` | Throw from `execute` when you do not know whether the effect happened |
+| `Approvals` | `list`, `approve`, `deny`, `add` (pre-approval), `asApprover()`. Notify with `on_request` and `webhookNotifier` |
+| `Policy`, `parsePolicy`, `runPolicyTests` | [Policy as code](/concepts/policy) |
+| `ContentChecker` | [Content checks](/concepts/content-checks) |
+| `createBundle`, `verifyBundle`, `renderReport`, `generateSigningKey` | [Evidence](/concepts/evidence) |
+| `KeyRing`, `OidcVerifier`, `can` | [Authentication](/operations/authentication) |
 
-`loadRegistry(path)` and `openLocal(dir, registry)` load YAML/JSON manifests and open a file-backed engine.
+Stores are interfaces (`LedgerStore`, `RunStore`, `ApprovalStore`). SQLite (`@multimindlab/reversi/sqlite`, Node 22.13+) and
+PostgreSQL (`@multimindlab/reversi/postgres`) implementations are included; `openData` selects one. The files layout
+(`openLocal`) is still available for the simplest embedding.
 
-For SQLite (Node 22.13+), import from `@multimindlab/reversi/sqlite`: `openSqliteStores(path)` returns `{ db, ledger, runs }` to pass to `new Ledger(ledger)` and `new Reversi({ runs })`. The ledger table rejects UPDATE and DELETE. The server uses it with `REVERSI_STORE=sqlite` (database at `$REVERSI_DATA/reversi.db`); the CLI still reads the file layout.
-Stores are interfaces (`LedgerStore`, `RunStore`); SQLite and Postgres implementations are on the roadmap.
+The approver may return `true`, `false`, or `{ approved, message }`; the message is shown to the caller when not approved.

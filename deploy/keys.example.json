@@ -1,0 +1,6 @@
+[
+  { "name": "order-agent", "role": "agent", "key_sha256": "REPLACE: output of  printf '%s' \"$AGENT_KEY\" | shasum -a 256", "max_permissions": ["fs:read", "fs:write"] },
+  { "name": "alice", "role": "approver", "key_sha256": "REPLACE" },
+  { "name": "ops", "role": "operator", "key_sha256": "REPLACE", "expires_at": "2027-01-01T00:00:00Z" },
+  { "name": "root", "role": "admin", "key_sha256": "REPLACE" }
+]

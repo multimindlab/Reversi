@@ -1,0 +1,28 @@
+---
+title: Operator console
+description: See what an agent changed, decide approvals, plan rollbacks and download evidence in a browser.
+---
+
+The server serves a console at `/console`: server-rendered pages, no client-side JavaScript. Sign in with an API key or OIDC
+access token that has a console role (`auditor`, `approver`, `operator` or `admin`). Agent credentials are refused.
+
+| Page | For |
+|---|---|
+| **Runs** | Filter by actor; "needs attention" shows runs with unresolved, failed-compensation or unrecoverable steps |
+| **Run detail** | Steps and statuses, the rollback plan as a dry run, the full event trail, pending approvals, the auditor report, a signed bundle, and a **Resolve** form for unknown outcomes (operator) |
+| **Approvals** | Pending queue with approve and deny forms, and recent decisions. Shows why approval is needed and the argument names, never values |
+| **Tools** | Every manifest with effect, permission, approval and compensation, plus tools called without a manifest |
+| **Evidence** | Ledger verification, signed whole-ledger bundle, and the kill switch (admin) |
+
+The console shows the rollback plan but never **executes** compensations: it has no connection to the systems they act on. Run
+`reversi rollback`, the operator API, or `reversi.execute_rollback` on the gateway.
+
+## Security
+
+- The session cookie is signed (HMAC-SHA-256), `HttpOnly`, `SameSite=Strict`, scoped to `/console`, and `Secure` with
+  `REVERSI_SECURE_COOKIES=1`. It lasts 8 hours and ends on restart unless you set `REVERSI_SESSION_SECRET`.
+- Every action is a POST with a per-session CSRF token.
+- All values are HTML-escaped and responses carry a strict `Content-Security-Policy` (`default-src 'none'`).
+- Roles are checked on every page; an auditor sees no approve buttons and the POST is refused anyway.
+
+Terminate TLS in front of the server. Do not expose the console to the internet without a reverse proxy and network controls.

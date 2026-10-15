@@ -1,0 +1,62 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: reversi
+          POSTGRES_PASSWORD: reversi
+          POSTGRES_DB: reversi_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U reversi" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      REVERSI_TEST_PG: postgres://reversi:reversi@localhost:5432/reversi_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:py
+      - name: Fixtures are in sync
+        run: node scripts/gen-fixtures.mjs --check
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: SBOM
+        run: npm sbom --sbom-format cyclonedx --omit dev > sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t reversi:ci .

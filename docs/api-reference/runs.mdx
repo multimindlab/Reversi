@@ -1,7 +1,9 @@
 ---
 title: Agent endpoints
-description: Open runs, request calls, report outcomes.
+description: Open runs, request calls, report outcomes. Agent role.
 ---
+
+Agents see only runs they opened (another agent's run is a 404). Auditors and above can read any run.
 
 ## `POST /v1/runs`
 
@@ -18,6 +20,11 @@ Authorize a call and journal its intent. Execute the tool only on `allow` or `wo
 { "tool": "create_order", "args": {"sku": "BOOK-1"}, "reason": "customer asked", "depends_on": [0] }
 ```
 → `{"decision":"allow","step":3}` · `{"decision":"would_block","step":3,"reasons":[…]}` · `{"decision":"block","reasons":[…]}`
+
+A call waiting for approval is a `block` whose reason names the request:
+`approval required: request apr_… is pending an operator decision; retry after it is approved`. After an approver decides it,
+send the same intent again ([approvals](/concepts/approvals)). Violations also come from [policy](/concepts/policy),
+[content checks](/concepts/content-checks) and the kill switch.
 
 ## `POST /v1/runs/{id}/steps/{n}/outcome`
 
