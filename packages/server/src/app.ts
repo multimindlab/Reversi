@@ -2,6 +2,13 @@ import { randomBytes } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import {
+  KeyRing,
+  OidcVerifier,
+  can,
+  isAgent,
+  type ApiKey,
+  type Capability,
+  type Principal,
   ApprovalError,
   LedgerError,
   RUN_ID_PATTERN,
@@ -17,7 +24,6 @@ import {
   type Outcome,
   type SigningKey,
 } from "@multimindlab/reversi";
-import { KeyRing, OidcVerifier, can, isAgent, type ApiKey, type Capability, type Principal } from "./auth.js";
 import { mountConsole } from "./console.js";
 import { Metrics } from "./metrics.js";
 

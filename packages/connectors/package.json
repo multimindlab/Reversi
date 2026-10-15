@@ -3,18 +3,36 @@
   "version": "0.1.0",
   "description": "Real tool connectors with Reversi manifests and working compensations: filesystem, GitHub, Slack, Stripe",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/multimindlab/reversi.git", "directory": "packages/connectors" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/multimindlab/reversi.git",
+    "directory": "packages/connectors"
+  },
   "homepage": "https://reversi.multimind.dev",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "bin": { "reversi-connectors": "dist/main.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "reversi-connectors": "dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@multimindlab/reversi": "0.1.0",
     "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@multimindlab/reversi-gateway": "0.1.0"
   }
 }

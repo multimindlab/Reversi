@@ -330,3 +330,21 @@ export function runPolicyTests(policy: PolicyDoc, extra: PolicyTestCase[] = []):
     };
   });
 }
+
+/** Combine policy documents: rules and limits concatenated (ids must stay unique), default deny wins. */
+export function mergePolicyDocs(...docs: Array<PolicyDoc | undefined>): PolicyDoc | undefined {
+  const present = docs.filter((d): d is PolicyDoc => d !== undefined);
+  if (present.length === 0) return undefined;
+  const merged: PolicyDoc = {
+    version: 1,
+    default: present.some((d) => d.default === "deny") ? "deny" : "allow",
+    rules: present.flatMap((d) => d.rules),
+    limits: present.flatMap((d) => d.limits),
+    tests: present.flatMap((d) => d.tests),
+    content: present.find((d) => d.content)?.content,
+  };
+  const ids = merged.rules.map((r) => r.id);
+  const dup = ids.find((id, i) => ids.indexOf(id) !== i);
+  if (dup) throw new PolicyError([`duplicate rule id \`${dup}\` when combining policies`]);
+  return merged;
+}

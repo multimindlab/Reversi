@@ -69,6 +69,7 @@ export { SECRET_PATTERNS, findSecrets, redactSecrets } from "./redact.js";
 export {
   Policy,
   PolicyError,
+  mergePolicyDocs,
   parsePolicy,
   runPolicyTests,
   type Condition,
@@ -105,3 +106,15 @@ export {
 } from "./evidence.js";
 export { dataOptionsFromEnv, openData, storeKindFrom, type Data, type DataOptions, type StoreKind } from "./data.js";
 export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle } from "./config.js";
+export {
+  KeyRing,
+  OidcVerifier,
+  ROLES,
+  can,
+  isAgent,
+  type ApiKey,
+  type Capability,
+  type OidcOptions,
+  type Principal,
+  type Role,
+} from "./auth.js";

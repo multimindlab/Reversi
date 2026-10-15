@@ -165,6 +165,10 @@ export class OidcVerifier {
     this.jwksUri = o.jwks_uri;
   }
 
+  get issuer(): string {
+    return this.o.issuer;
+  }
+
   private async refresh(): Promise<void> {
     if (this.now() - this.lastFetch < 10_000) return; // at most once per 10s, so unknown kids cannot flood the issuer
     this.lastFetch = this.now();

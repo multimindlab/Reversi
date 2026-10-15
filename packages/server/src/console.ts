@@ -5,8 +5,7 @@
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Context, Hono } from "hono";
-import type { Approvals, ApprovalRecord, LedgerRecord, Reversi, RunState } from "@multimindlab/reversi";
-import { can, type Principal, type Role } from "./auth.js";
+import { can, type Approvals, type ApprovalRecord, type LedgerRecord, type Principal, type Reversi, type Role, type RunState } from "@multimindlab/reversi";
 
 const esc = (v: unknown) =>
   String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);

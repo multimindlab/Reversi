@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { readFileSync, watchFile } from "node:fs";
 import { serve } from "@hono/node-server";
-import { dataOptionsFromEnv, engineConfigFromEnv, openEngine, type SigningKey } from "@multimindlab/reversi";
+import { KeyRing, OidcVerifier, ROLES, dataOptionsFromEnv, engineConfigFromEnv, openEngine, type ApiKey, type Role, type SigningKey } from "@multimindlab/reversi";
 import { createApp } from "./app.js";
-import { KeyRing, OidcVerifier, ROLES, type ApiKey, type Role } from "./auth.js";
 
 const HELP = `reversi-server. Configuration is by environment variable:
 

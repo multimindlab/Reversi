@@ -9,7 +9,7 @@ import { Ledger } from "./ledger.js";
 import { loadRegistry } from "./local.js";
 import { Reversi } from "./engine.js";
 import type { Registry } from "./manifest.js";
-import { Policy, parsePolicy } from "./policy.js";
+import { Policy, mergePolicyDocs, parsePolicy, type PolicyDoc } from "./policy.js";
 
 export interface EngineConfig {
   /** Manifest file or directory. */
@@ -19,6 +19,8 @@ export interface EngineConfig {
   policy?: string;
   environment?: string;
   kill_switch_file?: string;
+  /** Extra policy rules merged with the policy file (the gateway compiles its allow/deny lists into this). */
+  extra_policy?: PolicyDoc;
   /** How long approval requests stay valid. Default one hour. */
   approval_ttl_ms?: number;
 }
@@ -40,7 +42,9 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
   const registry = loadRegistry(cfg.manifests);
   const data = await openData(cfg.data);
   const approvals = new Approvals(data.approvals, { ttl_ms: cfg.approval_ttl_ms });
-  const pol = cfg.policy ? loadPolicyFile(cfg.policy) : undefined;
+  const file = cfg.policy ? loadPolicyFile(cfg.policy) : undefined;
+  const merged = mergePolicyDocs(file?.doc, cfg.extra_policy);
+  const pol = merged ? { policy: new Policy(merged), content: merged.content ? new ContentChecker(merged.content) : undefined } : undefined;
   const reversi = new Reversi({
     registry,
     ledger: new Ledger(data.ledger),
