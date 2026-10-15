@@ -18,7 +18,7 @@ forking the chain impossible; a writer that loses a race re-reads the tail and r
 if it cannot append. Run state is last-write-wins per run, so drive a given run from one process: the gateway session or the
 agent's server connection, with operators acting through steps, approvals and rollback.
 
-With `files`, run **one** process per data directory.
+With `files`, several processes on **one host** may share the directory (server, gateway and CLI): the ledger takes a lock file for each append and re-reads lines others wrote, so the chain cannot fork. Do not share it over a network filesystem.
 
 ## PostgreSQL
 

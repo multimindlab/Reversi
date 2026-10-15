@@ -15,7 +15,7 @@ description: What Reversi does not do. Read this before relying on it.
   adversary can phrase around them. They are one layer, not a firewall.
 - **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path.
 - **One driver per run.** Several processes can share a SQLite or PostgreSQL store and append to one ledger safely, but run state is
-  last-write-wins: do not drive the same run from two processes. With the `files` store, run one process per data directory.
+  last-write-wins: do not drive the same run from two processes. With the `files` store, share the directory only between processes on one host, never over a network filesystem.
 - **Gateway scope.** It proxies `tools/call` and `tools/list`, not resources, prompts or sampling, and one session is one run.
 - **HTTP only.** Terminate TLS in front of the server and gateway.
 - **Console cannot run compensations.** It shows the plan; execution happens through the CLI, API or gateway.
