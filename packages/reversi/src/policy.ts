@@ -213,8 +213,24 @@ function matches(m: Match, i: PolicyInput): boolean {
   );
 }
 
-function holds(c: Condition, args: unknown): boolean {
+/** Numbers, and numeric strings: an upstream that coerces "5000" must not slip under `gt 1000`. */
+function numeric(v: unknown): number | undefined {
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  return undefined;
+}
+
+/**
+ * Does the condition hold? For `deny` and `require_approval` rules (`failClosed`), a value that is present but
+ * of the wrong type for the operator counts as matching: a restriction must not be dodged by sending the wrong type.
+ */
+function holds(c: Condition, args: unknown, failClosed = false): boolean {
   const v = resolveRef(c.path, "args", args);
+  if (failClosed && v !== undefined && v !== null) {
+    if (["gt", "gte", "lt", "lte"].includes(c.op) && numeric(v) === undefined) return true;
+    if (c.op === "matches" && typeof v !== "string") return true;
+  }
+  const n = numeric(v);
   switch (c.op) {
     case "exists":
       return v !== undefined;
@@ -223,13 +239,13 @@ function holds(c: Condition, args: unknown): boolean {
     case "ne":
       return JSON.stringify(v) !== JSON.stringify(c.value);
     case "gt":
-      return typeof v === "number" && v > (c.value as number);
+      return n !== undefined && n > (c.value as number);
     case "gte":
-      return typeof v === "number" && v >= (c.value as number);
+      return n !== undefined && n >= (c.value as number);
     case "lt":
-      return typeof v === "number" && v < (c.value as number);
+      return n !== undefined && n < (c.value as number);
     case "lte":
-      return typeof v === "number" && v <= (c.value as number);
+      return n !== undefined && n <= (c.value as number);
     case "in":
       return (c.value as unknown[]).some((x) => JSON.stringify(x) === JSON.stringify(v));
     case "not_in":
@@ -259,7 +275,7 @@ export class Policy {
     const fired: string[] = [];
     let allowed = false;
     for (const r of this.doc.rules) {
-      if (!matches(r.match, input) || !(r.when ?? []).every((c) => holds(c, input.args))) continue;
+      if (!matches(r.match, input) || !(r.when ?? []).every((c) => holds(c, input.args, r.action !== "allow"))) continue;
       fired.push(r.id);
       const why = `policy \`${r.id}\`${r.reason ? `: ${r.reason}` : ""}`;
       if (r.action === "deny") deny.push(why);

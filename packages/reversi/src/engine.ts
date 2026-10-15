@@ -16,6 +16,7 @@ import { existsSync } from "node:fs";
 import { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
 import type { ContentChecker } from "./content.js";
 import { Ledger, type LedgerEvent } from "./ledger.js";
+import { redactSecrets } from "./redact.js";
 import { Registry, resolveRef } from "./manifest.js";
 import type { Policy, PolicyInput } from "./policy.js";
 import { SealedScope } from "./scope.js";
@@ -185,7 +186,7 @@ function isArgObject(v: unknown): v is Record<string, unknown> {
 const MANIFEST_TRIGGER = "manifest requires approval";
 const ERROR_LIMIT = 300;
 function messageOf(e: unknown): string {
-  const m = e instanceof Error ? e.message : String(e);
+  const m = redactSecrets(e instanceof Error ? e.message : String(e)); // error text is stored in run state and shown in the console
   return m.length > ERROR_LIMIT ? m.slice(0, ERROR_LIMIT) + "…" : m;
 }
 
@@ -410,6 +411,15 @@ export class Run {
       else violations.push(`depends_on step ${d} does not exist`);
     }
 
+    // Arguments with no canonical form (Infinity, NaN, BigInt...) would all share one hash, which would let an
+    // approval granted for one call cover another. Treat them as a violation and never match an approval.
+    let argsHash: string;
+    try {
+      argsHash = sha256Hex(canonicalize(call.args === undefined ? null : call.args));
+    } catch (e) {
+      argsHash = `unhashable-${randomUUID()}`;
+      violations.push(`arguments cannot be canonicalized: ${e instanceof Error ? e.message : "unsupported value"}`);
+    }
     const triggers: string[] = [];
     const notes: string[] = [];
     const halted = this.rv.halted();
@@ -456,7 +466,7 @@ export class Run {
             tool: call.tool,
             reason: call.reason,
             kind: "call",
-            args_hash: hashPayload(call.args),
+            args_hash: argsHash,
             triggers,
             arg_keys: isArgObject(call.args) ? Object.keys(call.args).slice(0, 50) : [],
           })

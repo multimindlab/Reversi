@@ -11,7 +11,7 @@
  */
 import { createRequire } from "node:module";
 import { MessageChannel, Worker, receiveMessageOnPort, type MessagePort } from "node:worker_threads";
-import type { ApprovalRecord, ApprovalStore } from "./approvals.js";
+import type { ApprovalRecord, ApprovalStatus, ApprovalStore } from "./approvals.js";
 import { LedgerConflictError, type LedgerRecord, type LedgerStore } from "./ledger.js";
 import { RUN_ID_PATTERN, type RunState, type RunStore } from "./store.js";
 
@@ -26,9 +26,9 @@ parentPort.on("message", async (m) => {
   let reply;
   try {
     const r = await pool.query(m.sql, m.params);
-    reply = { ok: true, rows: r.rows };
+    reply = { id: m.id, ok: true, rows: r.rows };
   } catch (e) {
-    reply = { ok: false, code: e.code, message: String(e.message) };
+    reply = { id: m.id, ok: false, code: e.code, message: String(e.message) };
   }
   port.postMessage(reply);
   Atomics.store(flag, 0, 1);
@@ -54,6 +54,7 @@ export class SyncPg {
   private readonly flag: Int32Array;
   private readonly port: MessagePort;
   private closed = false;
+  private seq = 0;
 
   constructor(url: string, private readonly timeoutMs = 30_000) {
     const sab = new SharedArrayBuffer(4);
@@ -72,12 +73,21 @@ export class SyncPg {
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
     if (this.closed) throw new PgError("connection closed");
+    const id = ++this.seq;
     Atomics.store(this.flag, 0, 0);
-    this.worker.postMessage({ sql, params });
+    this.worker.postMessage({ id, sql, params });
     const res = Atomics.wait(this.flag, 0, 0, this.timeoutMs);
-    if (res === "timed-out") throw new PgError(`query timed out after ${this.timeoutMs}ms`);
-    const m = receiveMessageOnPort(this.port)?.message as { ok: boolean; rows?: T[]; code?: string; message?: string } | undefined;
-    if (!m) throw new PgError("no reply from the database worker");
+    if (res === "timed-out") {
+      // The worker may still finish this statement and answer later. Never reuse the connection: a stale reply
+      // could be mistaken for the next query's, and a journaled intent must not be believed durable when it is not.
+      this.close();
+      throw new PgError(`query timed out after ${this.timeoutMs}ms; the connection was closed`);
+    }
+    const m = receiveMessageOnPort(this.port)?.message as { id: number; ok: boolean; rows?: T[]; code?: string; message?: string } | undefined;
+    if (!m || m.id !== id) {
+      this.close();
+      throw new PgError("unexpected reply from the database worker; the connection was closed");
+    }
     if (!m.ok) throw new PgError(m.message ?? "query failed", m.code);
     return m.rows ?? [];
   }
@@ -180,6 +190,12 @@ export class PgApprovalStore implements ApprovalStore {
   }
   list(): ApprovalRecord[] {
     return this.pg.query<{ record: ApprovalRecord }>("SELECT record FROM approvals").map((r) => r.record);
+  }
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean {
+    return (
+      this.pg.query("UPDATE approvals SET record = record || $1::jsonb WHERE id = $2 AND record->>'status' = $3 RETURNING id", [JSON.stringify(patch), id, from])
+        .length === 1
+    );
   }
 }
 

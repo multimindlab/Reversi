@@ -96,6 +96,16 @@ describe("HTTP gateway with API keys", () => {
     expect(noInit.status).toBe(400);
   });
 
+  it("ties a session to the roles it was opened with", async () => {
+    const keys = new KeyRing([{ name: "svc", role: "agent", key: "k-svc" }]);
+    const { url, http } = await serve({ keys });
+    await mcp(url, "/mcp", "k-svc");
+    const [id] = [...http.sessions.keys()];
+    keys.replace([{ name: "svc", roles: ["agent", "admin"], key: "k-svc" }]); // same name, different roles
+    const r = await post(`${url}/mcp`, { authorization: "Bearer k-svc", "mcp-session-id": id as string }, { jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(r.status).toBe(403);
+  });
+
   it("validates Host and Origin, and serves health and readiness", async () => {
     const { url } = await serve({ keys: KEYS });
     // fetch() will not let a caller set Host, so send this one with node:http.
@@ -142,6 +152,9 @@ describe("HTTP gateway without auth", () => {
     expect(() => createHttpGateway({ gateway, pool, host: "0.0.0.0", port: 0, anonymous_actor: "x" })).toThrow(/without authentication/);
     expect(isLoopback("127.0.0.1")).toBe(true);
     expect(isLoopback("10.0.0.5")).toBe(false);
+    expect(isLoopback("127.attacker.example.com")).toBe(false);
+    expect(isLoopback("127.0.0.256x")).toBe(false);
+    expect(isLoopback("127.0.0.2")).toBe(true);
   });
 });
 

@@ -31,7 +31,13 @@ export interface Principal {
   name: string;
   roles: Role[];
   max_permissions?: string[];
+  /** May open runs in `observe` mode. Observe mode lets violating calls run, so it is not for agents by default. */
+  allow_observe?: boolean;
   via: "api_key" | "oidc";
+  /** API keys: identifies the key (a prefix of its hash) so a console session can be re-checked against the key ring. */
+  fingerprint?: string;
+  /** OIDC: when the token expires, epoch ms. A console session never outlives it. */
+  exp_ms?: number;
 }
 
 export const can = (p: Principal, cap: Capability): boolean => p.roles.some((r) => CAPS[r].includes(cap));
@@ -49,6 +55,8 @@ export interface ApiKey {
   key_sha256?: string;
   /** Agent keys only: the most permissions a run opened with this key may request. Omit for no cap. */
   max_permissions?: string[];
+  /** Agent keys: allow opening runs in observe mode (default: enforce only). */
+  allow_observe?: boolean;
   /** ISO date or epoch ms. The key is rejected before this time. Use with `expires_at` to rotate without downtime. */
   not_before?: string | number;
   /** ISO date or epoch ms. The key is rejected from this time on. */
@@ -70,6 +78,7 @@ interface Compiled {
   roles: Role[];
   digest: Buffer;
   max_permissions?: string[];
+  allow_observe: boolean;
   not_before?: number;
   expires_at?: number;
   disabled: boolean;
@@ -97,6 +106,7 @@ export class KeyRing {
         roles,
         digest,
         max_permissions: k.max_permissions,
+        allow_observe: k.allow_observe === true,
         not_before: toMs(k.not_before, "not_before", k.name),
         expires_at: toMs(k.expires_at, "expires_at", k.name),
         disabled: k.disabled === true,
@@ -108,17 +118,30 @@ export class KeyRing {
     return this.keys.length;
   }
 
+  private live(k: Compiled): boolean {
+    const now = this.now();
+    return !k.disabled && (k.not_before === undefined || now >= k.not_before) && (k.expires_at === undefined || now < k.expires_at);
+  }
+
+  private principal(k: Compiled): Principal {
+    return { name: k.name, roles: k.roles, max_permissions: k.max_permissions, allow_observe: k.allow_observe, via: "api_key", fingerprint: k.digest.toString("hex").slice(0, 32) };
+  }
+
   authenticate(token: string): Principal | null {
     const d = sha(token);
-    const now = this.now();
     let found: Compiled | null = null;
     // Compare every key so timing does not reveal which one matched.
     for (const k of this.keys) {
       const same = timingSafeEqual(d, k.digest);
-      const live = !k.disabled && (k.not_before === undefined || now >= k.not_before) && (k.expires_at === undefined || now < k.expires_at);
-      if (same && live && !found) found = k;
+      if (same && this.live(k) && !found) found = k;
     }
-    return found ? { name: found.name, roles: found.roles, max_permissions: found.max_permissions, via: "api_key" } : null;
+    return found ? this.principal(found) : null;
+  }
+
+  /** The principal for a key fingerprint, if that key is still live. Lets a long-lived session notice revocation. */
+  byFingerprint(fingerprint: string): Principal | null {
+    const k = this.keys.find((x) => x.digest.toString("hex").slice(0, 32) === fingerprint);
+    return k && this.live(k) ? this.principal(k) : null;
   }
 }
 
@@ -150,12 +173,14 @@ interface Jwk extends JsonWebKey {
   alg?: string;
 }
 
+const KEYS_TTL_MS = 10 * 60_000;
 const b64u = (s: string) => Buffer.from(s, "base64url");
 
 export class OidcVerifier {
   private keys = new Map<string, Jwk>();
   private jwksUri: string | undefined;
   private lastFetch = 0;
+  private refreshing: Promise<void> | null = null;
   private readonly f: typeof fetch;
   private readonly now: () => number;
   constructor(private readonly o: OidcOptions) {
@@ -169,9 +194,18 @@ export class OidcVerifier {
     return this.o.issuer;
   }
 
-  private async refresh(): Promise<void> {
-    if (this.now() - this.lastFetch < 10_000) return; // at most once per 10s, so unknown kids cannot flood the issuer
+  /** Fetch the key set, at most once per 10s (so unknown kids cannot flood the issuer), sharing one fetch between callers. */
+  private refresh(): Promise<void> {
+    if (this.refreshing) return this.refreshing;
+    if (this.now() - this.lastFetch < 10_000) return Promise.resolve();
     this.lastFetch = this.now();
+    this.refreshing = this.fetchKeys().finally(() => {
+      this.refreshing = null;
+    });
+    return this.refreshing;
+  }
+
+  private async fetchKeys(): Promise<void> {
     if (!this.jwksUri) {
       const r = await this.f(`${this.o.issuer.replace(/\/$/, "")}/.well-known/openid-configuration`);
       if (!r.ok) throw new Error(`oidc discovery failed: ${r.status}`);
@@ -194,6 +228,8 @@ export class OidcVerifier {
       const claims = JSON.parse(b64u(parts[1] as string).toString("utf8")) as Record<string, unknown>;
       if (header.alg !== "RS256" && header.alg !== "ES256") return null; // never `none`, never HMAC
       if (!header.kid) return null;
+      // Re-read the key set periodically even for known kids, so a key the issuer withdrew stops verifying.
+      if (this.now() - this.lastFetch > KEYS_TTL_MS) await this.refresh().catch(() => {});
       let jwk = this.keys.get(header.kid);
       if (!jwk) {
         await this.refresh();
@@ -220,11 +256,11 @@ export class OidcVerifier {
 
       const raw = (this.o.role_claim ?? "roles").split(".").reduce<unknown>((o, k) => (typeof o === "object" && o !== null ? (o as Record<string, unknown>)[k] : undefined), claims);
       const values = typeof raw === "string" ? raw.split(/[\s,]+/) : Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : [];
-      const roles = [...new Set(values.map((v) => this.o.role_map[v]).filter((r): r is Role => !!r))];
+      const roles = [...new Set(values.filter((v) => Object.hasOwn(this.o.role_map, v)).map((v) => this.o.role_map[v] as Role))].filter((r) => ROLES.includes(r));
       if (roles.length === 0) return null;
       const name = claims[this.o.actor_claim ?? "sub"];
       if (typeof name !== "string" || !name) return null;
-      return { name, roles, max_permissions: this.o.max_permissions, via: "oidc" };
+      return { name, roles, max_permissions: this.o.max_permissions, via: "oidc", exp_ms: claims.exp * 1000 };
     } catch {
       return null;
     }

@@ -21,7 +21,8 @@ Compensations can also require approval (`compensation.requires_approval`).
   a retry for 500 is a different call and needs its own approval.
 - **One use.** After the call runs the approval is `consumed`.
 - **A time limit.** Pending and approved requests expire (default one hour).
-- **A decision record.** Who decided, when, and the note, in the approval store.
+- **A decision record.** Who decided, when, and the note, in the approval store **and in the ledger** (an `approved` record for approvals, a `blocked` record for denials, with the approver as actor).
+- **Claimed atomically.** Consuming or deciding a request is a compare-and-swap in the store, so two processes sharing a database cannot both use one approval.
 - **A denial sticks** for that call, with the reason shown to the agent.
 
 A request stores the names of the arguments, never their values, so approvals do not become a second copy of

@@ -45,8 +45,11 @@ interface Session {
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 export function isLoopback(host: string): boolean {
-  return LOOPBACK.has(host) || host.startsWith("127.");
+  return LOOPBACK.has(host) || /^127(\.\d{1,3}){3}$/.test(host);
 }
+
+/** Who a session belongs to: the name and the roles it was opened with. Changed roles mean a new login. */
+const ownerKey = (p: Principal) => `${p.name}|${[...p.roles].sort().join(",")}`;
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   res.writeHead(status, { "Content-Type": "application/json", ...headers });
@@ -90,6 +93,7 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
     return o.keys?.authenticate(token) ?? (o.oidc && token.split(".").length === 3 ? await o.oidc.authenticate(token) : null);
   };
 
+  let ready: { at: number; up: Array<{ name: string; ok: boolean }> } | null = null;
   const reap = setInterval(() => {
     const cutoff = Date.now() - ttl;
     for (const [id, s] of sessions) if (s.last < cutoff) void s.transport.close();
@@ -116,7 +120,7 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
     if (sessionId) {
       const s = sessions.get(sessionId);
       if (!s || s.kind !== kind) return json(res, 404, { error: "unknown session" });
-      if (s.owner !== who.name) return json(res, 403, { error: "this session belongs to another principal" });
+      if (s.owner !== ownerKey(who)) return json(res, 403, { error: "this session belongs to another principal, or the credential's roles changed" });
       s.last = Date.now();
       return s.transport.handleRequest(req, res, body);
     }
@@ -126,7 +130,7 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
-        sessions.set(id, { transport, owner: (who as Principal).name, kind, last: Date.now() });
+        sessions.set(id, { transport, owner: ownerKey(who as Principal), kind, last: Date.now() });
       },
     });
     transport.onclose = () => {
@@ -150,9 +154,13 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
         const path = (req.url ?? "/").split("?")[0];
         if (path === "/healthz") return json(res, 200, { ok: true });
         if (path === "/readyz") {
-          const up = await o.pool.status();
-          const ready = up.every((u) => u.ok);
-          return json(res, ready ? 200 : 503, { ok: ready, upstreams: up, sessions: sessions.size });
+          // Unauthenticated, and it pings every upstream: answer from a two-second cache.
+          if (!ready || Date.now() - ready.at > 2000) {
+            const up = await o.pool.status();
+            ready = { at: Date.now(), up };
+          }
+          const ok = ready.up.every((u) => u.ok);
+          return json(res, ok ? 200 : 503, { ok, upstreams: ready.up, sessions: sessions.size });
         }
         if (path === "/.well-known/oauth-protected-resource") {
           return json(res, 200, { resource, authorization_servers: o.oidc ? [o.oidc.issuer] : [], bearer_methods_supported: ["header"] });

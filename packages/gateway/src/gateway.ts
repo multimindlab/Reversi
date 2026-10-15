@@ -100,6 +100,8 @@ interface Ctx {
 }
 
 export class Gateway {
+  /** Runs being rolled back right now by this process: two concurrent rollbacks would run each compensation twice. */
+  private readonly rollingBack = new Set<string>();
   private cache: { at: number; tools: Tool[] } | null = null;
   constructor(readonly o: GatewayOptions) {}
 
@@ -170,6 +172,9 @@ export class Gateway {
           const run = runFor(a, ctx);
           const plan = run.plan();
           if (a.confirm !== true) return ok({ dry_run: true, plan });
+          if (this.rollingBack.has(run.run_id)) return fail(`a rollback of run ${run.run_id} is already in progress`);
+          this.rollingBack.add(run.run_id);
+          try {
           if (a.approve_compensations === true) {
             for (const act of plan.actions) if (act.kind === "compensate" && act.needs_approval && act.compensation_tool) approvals.add(run.run_id, "compensation", act.compensation_tool, 1, ctx.who.name);
           }
@@ -182,6 +187,9 @@ export class Gateway {
             },
           });
           return ok({ dry_run: false, report });
+          } finally {
+            this.rollingBack.delete(run.run_id);
+          }
         },
       },
       {

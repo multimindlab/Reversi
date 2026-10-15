@@ -8,7 +8,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { ApprovalRecord, ApprovalStore } from "./approvals.js";
+import type { ApprovalRecord, ApprovalStatus, ApprovalStore } from "./approvals.js";
 import { LedgerConflictError, type LedgerRecord, type LedgerStore } from "./ledger.js";
 import { RUN_ID_PATTERN, type RunState, type RunStore } from "./store.js";
 
@@ -102,6 +102,12 @@ export class SqliteApprovalStore implements ApprovalStore {
   }
   list(): ApprovalRecord[] {
     return (this.db.prepare("SELECT record FROM approvals").all() as Array<{ record: string }>).map((r) => JSON.parse(r.record) as ApprovalRecord);
+  }
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean {
+    const res = this.db
+      .prepare("UPDATE approvals SET record = json_patch(record, ?) WHERE id = ? AND json_extract(record, '$.status') = ?")
+      .run(JSON.stringify(patch), id, from);
+    return Number(res.changes) === 1;
   }
 }
 

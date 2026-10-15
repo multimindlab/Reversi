@@ -23,6 +23,8 @@ A principal may have several roles. Agents are scoped to their own runs; every o
 ]
 ```
 
+`max_permissions` caps what an agent's runs may request. Agents open runs in `enforce` mode only; set `allow_observe: true` on a key to let it open `observe` runs (which let violating calls proceed, so keep it for lab agents).
+
 Hash keys (`printf '%s' "$KEY" | shasum -a 256`) rather than storing them. Generate keys with at least 128 bits of entropy
 (`openssl rand -hex 24`). Keys are compared in constant time across all entries.
 
@@ -50,4 +52,4 @@ The server also accepts API keys at the same time, which is handy for service ac
 
 ## Console login
 
-Paste a key or token into the [console](/console) login form. Sessions are signed cookies, not tokens you can reuse elsewhere.
+Paste a key or token into the [console](/console) login form. A session is a signed cookie, re-checked against the key ring on every request: disabling, expiring or demoting the key ends or narrows the session at once. An OIDC session never outlives its token. Logging out invalidates the cookie.

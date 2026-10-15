@@ -51,7 +51,8 @@ const INJECTION: RegExp[] = [
 ];
 
 const MAX_DEPTH = 3;
-const MAX_STRINGS = 500;
+const MAX_STRINGS = 5000;
+const MAX_DEPTH_NEST = 16;
 
 function printable(s: string): boolean {
   if (s.length < 8) return false;
@@ -100,16 +101,19 @@ function direct(text: string): Array<{ kind: "secret" | "injection"; what: strin
   return hits;
 }
 
-function collectStrings(v: unknown, out: string[], depth = 0): void {
-  if (out.length >= MAX_STRINGS || depth > 8) return;
+/** Returns true if anything was left unscanned (too many strings, too deep). */
+function collectStrings(v: unknown, out: string[], depth = 0): boolean {
+  if (out.length >= MAX_STRINGS || depth > MAX_DEPTH_NEST) return true;
+  let skipped = false;
   if (typeof v === "string") out.push(v);
-  else if (Array.isArray(v)) for (const x of v) collectStrings(x, out, depth + 1);
+  else if (Array.isArray(v)) for (const x of v) skipped = collectStrings(x, out, depth + 1) || skipped;
   else if (typeof v === "object" && v !== null) {
     for (const [k, x] of Object.entries(v)) {
       out.push(k);
-      collectStrings(x, out, depth + 1);
+      skipped = collectStrings(x, out, depth + 1) || skipped;
     }
   }
+  return skipped;
 }
 
 export class ContentChecker {
@@ -121,12 +125,16 @@ export class ContentChecker {
   /** Check call arguments (or a result) for credentials, encoded payloads and injection phrasing. */
   inspect(value: unknown): Finding[] {
     const strings: string[] = [];
-    collectStrings(value, strings);
+    const incomplete = collectStrings(value, strings);
     const findings = new Map<string, Finding>();
     const add = (f: Finding) => {
       const key = `${f.kind}:${f.detail}`;
       if (!findings.has(key)) findings.set(key, f);
     };
+    // Padding an argument until the scanner gives up must not be a way past it: say so, with the encoded-payload action.
+    if (incomplete || strings.some((s) => s.length > this.config.max_string_bytes)) {
+      add({ kind: "encoded_payload", action: this.config.encoded_payloads, detail: "arguments too large or deeply nested to inspect fully" });
+    }
     for (const raw of strings) {
       const s = raw.length > this.config.max_string_bytes ? raw.slice(0, this.config.max_string_bytes) : raw;
       for (const h of direct(s)) {

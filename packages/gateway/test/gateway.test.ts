@@ -209,6 +209,27 @@ describe("rollback through the upstreams", () => {
     expect(up.calls.filter((c) => c.name === "cancel_order")).toHaveLength(1);
   });
 
+  it("refuses a second concurrent rollback of the same run, so compensations are not run twice", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const up = await fakeUpstream("shop", { create_order: () => json({ id: 1 }), cancel_order: async () => { await gate; return json({ ok: true }); } });
+    const { gateway } = build({ fakes: [up] });
+    const agent = await connect(gateway, AGENT);
+    const ops = await connect(gateway, OPERATOR, true);
+    await agent.client.callTool({ name: "create_order", arguments: {} });
+    const args = { run_id: agent.run?.run_id, confirm: true };
+    const first = ops.client.callTool({ name: "reversi.execute_rollback", arguments: args });
+    await new Promise((r) => setTimeout(r, 50));
+    const second = await ops.client.callTool({ name: "reversi.execute_rollback", arguments: args });
+    expect(second.isError).toBe(true);
+    expect(textOf(second)).toContain("already in progress");
+    release();
+    expect(JSON.parse(textOf(await first)).report.complete).toBe(true);
+    expect(up.calls.filter((c) => c.name === "cancel_order")).toHaveLength(1);
+    // and the lock is released afterwards
+    expect(JSON.parse(textOf(await ops.client.callTool({ name: "reversi.execute_rollback", arguments: args }))).report.compensated).toEqual([]);
+  });
+
   it("reports a failed compensation honestly", async () => {
     const up = await fakeUpstream("shop", { create_order: () => json({ id: 1 }), cancel_order: () => ({ isError: true, content: [{ type: "text", text: "locked" }] }) });
     const { gateway } = build({ fakes: [up] });

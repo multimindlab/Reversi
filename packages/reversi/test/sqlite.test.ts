@@ -97,3 +97,17 @@ describe("SQLite shared by two processes", () => {
     b.db.close();
   });
 });
+
+describe("SQLite approvals", () => {
+  it("transition is atomic and merges the patch", async () => {
+    const { Approvals } = await import("../src/index.js");
+    const s = openSqliteStores(dbPath());
+    const a = new Approvals(s.approvals);
+    a.add("r1", "call", "refund", 1, "alice");
+    const id = a.list()[0]!.id;
+    expect(s.approvals.transition(id, "approved", { status: "consumed", decision_note: "used" })).toBe(true);
+    expect(s.approvals.transition(id, "approved", { status: "consumed" })).toBe(false);
+    expect(a.get(id)).toMatchObject({ status: "consumed", decision_note: "used", decided_by: "alice", tool: "refund" });
+    s.db.close();
+  });
+});

@@ -38,6 +38,13 @@ describe.skipIf(!base)("PostgreSQL stores", () => {
     pg.close();
   });
 
+  it("closes the connection after a timeout, so a late reply can never be mistaken for the next query's", () => {
+    const pg = new SyncPg(freshUrl(), 300);
+    expect(() => pg.query("SELECT pg_sleep(1.5)")).toThrow(/timed out/);
+    expect(() => pg.query("SELECT 1")).toThrow(/closed/);
+    pg.close();
+  });
+
   it("surfaces database errors with their code", () => {
     const pg = new SyncPg(freshUrl());
     expect(() => pg.query("SELECT * FROM nope")).toThrow(PgError);
@@ -62,6 +69,10 @@ describe.skipIf(!base)("PostgreSQL stores", () => {
     const a = new Approvals(s.approvals);
     a.add("r1", "call", "refund", 1, "alice");
     expect(a.list({ status: "approved" })).toHaveLength(1);
+    const id = a.list()[0]!.id;
+    expect(s.approvals.transition(id, "approved", { status: "consumed" })).toBe(true);
+    expect(s.approvals.transition(id, "approved", { status: "consumed" })).toBe(false); // already consumed
+    expect(a.get(id)?.status).toBe("consumed");
 
     new Ledger(s.ledger).append({ ts_ms: 1, run_id: "r", actor: "a", tool: "t", reason: "why", event: "run_started" });
     expect(() => s.pg.query("UPDATE ledger SET record = '{}'")).toThrow(/append-only/);

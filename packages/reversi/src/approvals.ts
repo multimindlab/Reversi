@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ApprovalDecision, ApprovalRequest, Approver } from "./engine.js";
+import { redactSecrets } from "./redact.js";
 
 export type ApprovalStatus = "pending" | "approved" | "denied" | "consumed" | "expired";
 
@@ -37,6 +38,12 @@ export interface ApprovalStore {
   get(id: string): ApprovalRecord | undefined;
   put(rec: ApprovalRecord): void;
   list(): ApprovalRecord[];
+  /**
+   * Atomically change a record that is still in status `from`, merging `patch` into it. Returns false if it was
+   * not in that status (someone else got there first). This is what makes "single use" and "decided once" hold
+   * when several processes share a store.
+   */
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean;
 }
 
 export class MemoryApprovalStore implements ApprovalStore {
@@ -50,6 +57,12 @@ export class MemoryApprovalStore implements ApprovalStore {
   }
   list() {
     return [...this.items.values()].map((r) => structuredClone(r));
+  }
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>) {
+    const r = this.items.get(id);
+    if (!r || r.status !== from) return false;
+    this.items.set(id, { ...r, ...patch });
+    return true;
   }
 }
 
@@ -80,6 +93,13 @@ export class FileApprovalStore implements ApprovalStore {
   list() {
     return Object.values(this.read());
   }
+  /** Read, compare and rename-over: atomic enough for one host; use SQLite or PostgreSQL to share across hosts. */
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>) {
+    const r = this.read()[id];
+    if (!r || r.status !== from) return false;
+    this.put({ ...r, ...patch });
+    return true;
+  }
 }
 
 export class ApprovalError extends Error {
@@ -95,12 +115,15 @@ export interface ApprovalsOptions {
   now?: () => number;
   /** Called when a new request is queued (to notify an approver). Must not throw; failures are the callback's to handle. */
   on_request?: (rec: ApprovalRecord) => void;
+  /** Called after an approver approves or denies, so the decision can be written to the ledger. */
+  on_decision?: (rec: ApprovalRecord, decision: "approved" | "denied") => void;
 }
 
 export class Approvals {
   private readonly ttl: number;
   private readonly now: () => number;
   private readonly onRequest: ((rec: ApprovalRecord) => void) | undefined;
+  private readonly onDecision: ((rec: ApprovalRecord, d: "approved" | "denied") => void) | undefined;
   constructor(
     readonly store: ApprovalStore = new MemoryApprovalStore(),
     opts: ApprovalsOptions = {},
@@ -108,6 +131,7 @@ export class Approvals {
     this.ttl = opts.ttl_ms ?? 3_600_000;
     this.now = opts.now ?? Date.now;
     this.onRequest = opts.on_request;
+    this.onDecision = opts.on_decision;
   }
 
   private sweep(r: ApprovalRecord): ApprovalRecord {
@@ -140,11 +164,9 @@ export class Approvals {
     const mine = this.list({ run_id: req.run_id }).filter(
       (r) => r.kind === req.kind && r.tool === req.tool && (r.args_hash === null || r.args_hash === (req.args_hash ?? null)),
     );
-    const standing = mine.find((r) => r.status === "approved");
-    if (standing) {
-      standing.status = "consumed";
-      this.store.put(standing);
-      return true;
+    for (const standing of mine.filter((r) => r.status === "approved")) {
+      // Claim it atomically: if another process consumed it first, try the next one.
+      if (this.store.transition(standing.id, "approved", { status: "consumed" })) return true;
     }
     const denied = mine.find((r) => r.status === "denied" && r.args_hash === (req.args_hash ?? null) && r.step === req.step);
     if (denied) return { approved: false, message: `approval ${denied.id} was denied${denied.decision_note ? `: ${denied.decision_note}` : ""}` };
@@ -156,7 +178,7 @@ export class Approvals {
       step: req.step,
       kind: req.kind,
       tool: req.tool,
-      reason: req.reason,
+      reason: redactSecrets(req.reason),
       triggers: req.triggers ?? [],
       arg_keys: req.arg_keys ?? [],
       args_hash: req.args_hash ?? null,
@@ -180,12 +202,17 @@ export class Approvals {
     const r = this.get(id);
     if (!r) throw new ApprovalError(`approval \`${id}\` not found`);
     if (r.status !== "pending") throw new ApprovalError(`approval \`${id}\` is ${r.status}, not pending`);
-    r.status = status;
-    r.decided_by = by;
-    r.decided_ms = this.now();
-    r.decision_note = note ?? null;
-    this.store.put(r);
-    return r;
+    const patch = { status, decided_by: by, decided_ms: this.now(), decision_note: note ? redactSecrets(note) : null };
+    if (!this.store.transition(id, "pending", patch)) {
+      throw new ApprovalError(`approval \`${id}\` was decided by someone else first`);
+    }
+    const done = { ...r, ...patch };
+    try {
+      this.onDecision?.(done, status);
+    } catch {
+      /* the decision stands even if recording it elsewhere failed; the approval store is the source of truth */
+    }
+    return done;
   }
 
   approve(id: string, by: string, note?: string): ApprovalRecord {

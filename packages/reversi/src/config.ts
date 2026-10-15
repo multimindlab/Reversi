@@ -46,7 +46,19 @@ export function loadPolicyFile(path: string) {
 export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
   const registry = loadRegistry(cfg.manifests);
   const data = await openData(cfg.data);
+  const ledger = new Ledger(data.ledger);
   const approvals = new Approvals(data.approvals, {
+    on_decision: (rec, decision) =>
+      ledger.append({
+        ts_ms: Date.now(),
+        run_id: rec.run_id,
+        step: rec.step,
+        actor: rec.decided_by ?? "approver",
+        tool: rec.tool,
+        reason: rec.decision_note || `operator ${decision} request ${rec.id}`,
+        event: decision === "approved" ? "approved" : "blocked",
+        detail: `approval ${rec.id} ${decision} by ${rec.decided_by}${decision === "approved" ? "; the call must be retried" : ""}`,
+      }),
     ttl_ms: cfg.approval_ttl_ms,
     on_request: cfg.approval_webhook ? webhookNotifier({ url: cfg.approval_webhook, console_url: cfg.console_url }) : undefined,
   });
@@ -55,7 +67,7 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
   const pol = merged ? { policy: new Policy(merged), content: merged.content ? new ContentChecker(merged.content) : undefined } : undefined;
   const reversi = new Reversi({
     registry,
-    ledger: new Ledger(data.ledger),
+    ledger,
     runs: data.runs,
     approver: approvals.asApprover(),
     policy: pol?.policy,

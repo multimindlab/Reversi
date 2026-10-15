@@ -133,6 +133,8 @@ export function createApp(opts: AppOptions): Hono {
     });
   });
 
+  // The login form is reachable without credentials: keep its body small.
+  app.use("/console/*", bodyLimit({ maxSize: 16_384, onError: (c) => c.text("body too large", 413) }));
   app.use("/v1/*", bodyLimit({ maxSize: opts.maxBodyBytes ?? 1_000_000, onError: (c) => c.json({ error: "body too large" }, 413) }));
   app.use("/v1/*", async (c, next) => {
     const who = await authenticate(c.req.header("authorization"));
@@ -157,8 +159,9 @@ export function createApp(opts: AppOptions): Hono {
       throw new HttpError(404, `run \`${id}\` not found`);
     }
     const who = c.get("who");
-    if (isAgent(who) && run.state().actor !== who.name) throw new HttpError(404, `run \`${id}\` not found`);
-    if (write && !can(who, "runs:own") && !can(who, "rollback")) throw new HttpError(403, "agent or operator role required");
+    // Journaling on a run (intents, outcomes) is only ever the opening principal's: a key that also holds a read role
+    // must not be able to write into someone else's run.
+    if ((write || isAgent(who)) && run.state().actor !== who.name) throw new HttpError(404, `run \`${id}\` not found`);
     return run;
   };
 
@@ -200,6 +203,10 @@ export function createApp(opts: AppOptions): Hono {
     }
     const mode = b.mode ?? "enforce";
     if (mode !== "enforce" && mode !== "observe") throw new HttpError(400, "`mode` must be enforce or observe");
+    // Observe mode lets violating calls run, so an agent must not be able to pick it for itself.
+    if (mode === "observe" && !who.allow_observe) {
+      throw new HttpError(403, "this credential may not open observe-mode runs (key option `allow_observe`)");
+    }
     const run = reversi.startRun({
       run_id,
       actor: who.name,
@@ -225,7 +232,7 @@ export function createApp(opts: AppOptions): Hono {
   // ---- agent plane: journal intent, then outcome ----
   app.post("/v1/runs/:id/intents", async (c) => {
     need(c, "runs:own");
-    const run = openRun(c, c.req.param("id"));
+    const run = openRun(c, c.req.param("id"), true);
     const b = await body(c);
     const deps = b.depends_on;
     if (deps !== undefined && (!Array.isArray(deps) || deps.some((d) => !Number.isInteger(d) || d < 0))) {
@@ -242,7 +249,7 @@ export function createApp(opts: AppOptions): Hono {
 
   app.post("/v1/runs/:id/steps/:n/outcome", async (c) => {
     need(c, "runs:own");
-    const run = openRun(c, c.req.param("id"));
+    const run = openRun(c, c.req.param("id"), true);
     const n = stepParam(c);
     const b = await body(c);
     const status = b.status;
@@ -384,6 +391,7 @@ export function createApp(opts: AppOptions): Hono {
     reversi,
     approvals,
     authenticate: authenticateToken,
+    byFingerprint: (fp) => ring.byFingerprint(fp),
     session_secret: opts.session_secret ?? randomBytes(32).toString("hex"),
     secure_cookies: opts.secure_cookies ?? false,
     session_ttl_ms: 8 * 3600_000,

@@ -415,3 +415,55 @@ describe("console", () => {
     expect(out.headers.get("set-cookie")).toMatch(/Max-Age=0/);
   });
 });
+
+describe("hardening", () => {
+  it("agents cannot choose observe mode unless their key allows it", async () => {
+    const { call } = make({}, [...KEYS, { name: "lab", role: "agent", key: "k-lab", allow_observe: true }]);
+    const open = (key: string, id: string) => call(key, "POST", "/v1/runs", { run_id: id, permissions: ["o:w"], mode: "observe" });
+    expect((await open("k-agent", "o1")).status).toBe(403);
+    expect((await open("k-lab", "o2")).status).toBe(201);
+    expect((await call("k-agent", "POST", "/v1/runs", { run_id: "e1", permissions: ["o:w"] })).status).toBe(201);
+  });
+
+  it("a key with an agent and a read role still cannot journal into another agent's run", async () => {
+    const dual: ApiKey = { name: "dual", roles: ["agent", "auditor"], key: "k-dual" };
+    const { call } = make({}, [...KEYS, dual]);
+    await openRun(call); // owned by "agent"
+    expect((await call("k-dual", "GET", "/v1/runs/r1")).status).toBe(200); // reading is allowed
+    expect((await call("k-dual", "POST", "/v1/runs/r1/intents", { tool: "create_order", reason: "x" })).status).toBe(404);
+    expect((await call("k-dual", "POST", "/v1/runs/r1/steps/0/outcome", { status: "succeeded" })).status).toBe(404);
+  });
+
+  it("console sessions end when the key is disabled or demoted, and on logout", async () => {
+    const ring = new KeyRing([{ name: "ops", role: "operator", key: "k-ops" }, { name: "agent", role: "agent", key: "k-agent" }]);
+    const { app } = make({ keys: ring });
+    const cookieOf = (res: Response) => (res.headers.get("set-cookie") ?? "").split(";")[0] as string;
+    const login = (key: string) => app.request("/console/login", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ key }) });
+    const get = (path: string, cookie: string) => app.request(path, { headers: { cookie } });
+
+    const c = cookieOf(await login("k-ops"));
+    expect((await get("/console/approvals", c)).status).toBe(200);
+    ring.replace([{ name: "ops", role: "auditor", key: "k-ops" }]); // demoted
+    const page = await (await get("/console/approvals", c)).text();
+    expect(page).toContain("(auditor)");
+    expect((await get("/console/evidence", c)).status).toBe(200);
+    const csrf = /name="csrf" value="([^"]+)"/.exec(await (await get("/console/evidence", c)).text())?.[1] as string;
+    const denied = await app.request("/console/halt", { method: "POST", headers: { cookie: c, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ csrf, reason: "x" }) });
+    expect(denied.status).toBe(403);
+
+    ring.replace([{ name: "ops", role: "auditor", key: "k-ops", disabled: true }]);
+    expect((await get("/console/runs", c)).status).toBe(302); // key disabled: session over
+
+    ring.replace([{ name: "ops", role: "operator", key: "k-ops" }]);
+    const c2 = cookieOf(await login("k-ops"));
+    const csrf2 = /name="csrf" value="([^"]+)"/.exec(await (await get("/console/runs", c2)).text())?.[1] as string;
+    await app.request("/console/logout", { method: "POST", headers: { cookie: c2, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ csrf: csrf2 }) });
+    expect((await get("/console/runs", c2)).status).toBe(302); // a copied cookie no longer works after logout
+  });
+
+  it("limits the size of the unauthenticated login form", async () => {
+    const { app } = make();
+    const r = await app.request("/console/login", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ key: "x".repeat(100_000) }) });
+    expect(r.status).toBe(413);
+  });
+});

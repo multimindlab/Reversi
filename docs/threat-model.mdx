@@ -22,8 +22,10 @@ the tools act on.
 | Threat | Mitigation | Residual risk |
 |---|---|---|
 | Agent calls a tool it should not | Manifest required, scope check, policy, allow/deny lists; enforce mode blocks | An unmanifested tool in observe mode runs. A wrong manifest grants too much |
+| Agent reports false outcomes over the HTTP API (a made-up `result` becomes a compensation argument; a false `failed` hides a step from rollback) | Use the [gateway](/gateway): there the results come from the upstream, not the agent. Over HTTP, operators should review the plan before rolling back | **Accepted risk on the HTTP plane**: it trusts the agent's own reports |
+| Agent chooses `observe` mode to dodge enforcement | Agent keys open `enforce` runs only unless `allow_observe` is set | A lab key with `allow_observe` |
 | Agent approves its own call or triggers a rollback | Role separation; operator tools on a separate endpoint with separate credentials | Compromised operator credentials |
-| Approved call swapped for another | Approvals bound to the argument hash, single use, expiring | Approvers who approve without reading |
+| Approved call swapped for another | Approvals bound to the argument hash (calls whose arguments cannot be canonicalized are blocked), single use, claimed atomically in the store, expiring; every decision is written to the ledger with the approver's name | Approvers who approve without reading |
 | Privilege escalation through scope | Scope sealed with a digest; key `max_permissions` caps | Over-broad caps |
 | Prompt injection or exfiltration through arguments | Content checks (secrets, encoded payloads, injection, cumulative intent) with flag, approval or deny | Heuristics can be bypassed by creative encoding or paraphrase |
 | Credentials leak into the audit trail | Arguments and results are hashed, not stored; free text redacted | Unusual credential formats not matched by the patterns |
@@ -33,7 +35,7 @@ the tools act on.
 | Stolen API key | Hashed at rest, rotation windows, expiry, disable, constant-time compare | A key is a bearer credential: use TLS and short lives |
 | Forged or confused OIDC token | Signature against JWKS, RS256/ES256 only, `iss`, `aud`, `exp`, `nbf`; unmapped roles rejected | Trust in the identity provider |
 | Web page driving a local gateway or console | Host and Origin validation; SameSite=Strict cookies; CSRF tokens; strict CSP | Misconfigured `allowed_hosts`/`allowed_origins` |
-| Console session theft or forgery | Signed HttpOnly cookies, 8 h lifetime, per-session CSRF | XSS in a future page: output is escaped everywhere today |
+| Console session theft or forgery | Signed HttpOnly cookies, 8 h lifetime, re-validated against the key ring every request, revoked on logout, per-session CSRF | XSS in a future page: output is escaped everywhere today |
 | Runaway agent | Kill switch (API, console, file), rate and budget limits | Latency until an operator notices |
 | Two writers fork the ledger | `seq` primary key; losers retry or fail closed | None known |
 | Upstream MCP server compromised | Nothing: it is a trusted tool provider. Its results are content-checked for injection | A malicious upstream can lie about results |

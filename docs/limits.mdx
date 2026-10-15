@@ -9,6 +9,8 @@ description: What Reversi does not do. Read this before relying on it.
   read. Irreversible stays irreversible, and compensation can fail: the report says so.
 - **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not
   detectable from the data alone ([evidence](/concepts/evidence)).
+- **Policy regular expressions** are run against agent-supplied values. A pathological pattern written by a policy author can stall the process; keep patterns simple (policy files are trusted input).
+- **The HTTP API trusts the agent's reported outcomes** (results feed compensation arguments). Use the gateway when results must come from the system, not the agent.
 - **Content checks are heuristics.** They catch obvious credentials, hidden payloads and injection phrasing. A determined
   adversary can phrase around them. They are one layer, not a firewall.
 - **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path.

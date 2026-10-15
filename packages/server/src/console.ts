@@ -16,6 +16,8 @@ export interface ConsoleDeps {
   reversi: Reversi;
   approvals: Approvals;
   authenticate: (token: string) => Promise<Principal | null>;
+  /** Re-check an API-key session against the live key ring, so disabling, expiring or demoting a key takes effect now. */
+  byFingerprint: (fingerprint: string) => Principal | null;
   session_secret: string;
   secure_cookies: boolean;
   session_ttl_ms: number;
@@ -30,6 +32,8 @@ interface Session {
   roles: Role[];
   exp: number;
   sid: string;
+  /** API-key sessions: which key, re-validated on every request. */
+  fp?: string;
 }
 
 const CSS = `body{font:14px/1.5 system-ui,sans-serif;margin:0;color:#1b1b1f;background:#fafafa}header{background:#1F5FD6;color:#fff;padding:.6rem 1.2rem;display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap}header a{color:#fff;text-decoration:none}header .sp{flex:1}main{max-width:1150px;margin:1.2rem auto;padding:0 1rem}table{border-collapse:collapse;width:100%;background:#fff;margin:.6rem 0 1.4rem}th,td{border:1px solid #ddd;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f0f2f6}code{background:#eef;padding:0 3px;border-radius:3px}.badge{display:inline-block;padding:0 7px;border-radius:9px;background:#ddd;font-size:12px}.bad{background:#fbb}.ok{background:#bfb}.warn{background:#fe9}form.inline{display:inline}button{cursor:pointer;padding:3px 10px}.card{background:#fff;border:1px solid #ddd;padding:.8rem 1rem;margin:.6rem 0 1.2rem}input[type=text],input[type=password],select{padding:3px 6px}.muted{color:#666}`;
@@ -57,6 +61,9 @@ export function mountConsole(app: Hono, deps: ConsoleDeps): void {
     c.header("Referrer-Policy", "no-referrer");
   };
 
+  /** Sessions ended by logout. The cookie is stateless, so remember them until they would have expired anyway. */
+  const revoked = new Map<string, number>();
+
   const readSession = (c: Context): Session | null => {
     const raw = /(?:^|;\s*)rv_session=([^;]+)/.exec(c.req.header("cookie") ?? "")?.[1];
     if (!raw) return null;
@@ -67,7 +74,13 @@ export function mountConsole(app: Hono, deps: ConsoleDeps): void {
     if (want.length !== got.length || !timingSafeEqual(want, got)) return null;
     try {
       const s = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Session;
-      return s.exp > deps.now() ? s : null;
+      if (s.exp <= deps.now() || revoked.has(s.sid)) return null;
+      if (s.fp) {
+        const live = deps.byFingerprint(s.fp);
+        if (!live) return null; // the key was disabled, expired or removed
+        return { ...s, name: live.name, roles: live.roles }; // and roles follow the key's current roles
+      }
+      return s;
     } catch {
       return null;
     }
@@ -116,17 +129,21 @@ export function mountConsole(app: Hono, deps: ConsoleDeps): void {
     if (!p || (p.roles.length === 1 && p.roles[0] === "agent")) {
       return html(c, 401, page("Sign in", null, `<p><strong>That credential was not accepted, or it has no console role.</strong></p><p><a href="/console/login">Try again</a></p>`));
     }
-    const s: Session = { name: p.name, roles: p.roles, exp: deps.now() + deps.session_ttl_ms, sid: randomBytes(12).toString("hex") };
+    // An OIDC session never outlives the token it came from.
+    const exp = Math.min(deps.now() + deps.session_ttl_ms, p.exp_ms ?? Infinity);
+    const s: Session = { name: p.name, roles: p.roles, exp, sid: randomBytes(12).toString("hex"), ...(p.fingerprint ? { fp: p.fingerprint } : {}) };
     const payload = Buffer.from(JSON.stringify(s)).toString("base64url");
     c.header(
       "Set-Cookie",
-      `rv_session=${payload}.${sign(payload)}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(deps.session_ttl_ms / 1000)}${deps.secure_cookies ? "; Secure" : ""}`,
+      `rv_session=${payload}.${sign(payload)}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=${Math.max(0, Math.floor((exp - deps.now()) / 1000))}${deps.secure_cookies ? "; Secure" : ""}`,
     );
     return c.redirect("/console/runs", 303);
   });
   app.post(
     "/console/logout",
-    guarded({ post: true }, (c) => {
+    guarded({ post: true }, (c, s) => {
+      revoked.set(s.sid, s.exp);
+      for (const [sid, exp] of revoked) if (exp <= deps.now()) revoked.delete(sid);
       c.header("Set-Cookie", "rv_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0");
       return c.redirect("/console/login", 303);
     }),
