@@ -4,11 +4,11 @@ description: What is built and what is next.
 ---
 
 **Built:** manifests, write-ahead ledger, dependency-aware rollback, scopes, approvals, observe mode, CLI, HTTP API,
-Python SDK, trace viewer, conformance fixtures, SQLite store (`REVERSI_STORE=sqlite`).
+Python SDK, trace viewer, conformance fixtures, SQLite store (`REVERSI_STORE=sqlite`), MCP gateway in observe mode.
 
 **Next (in this order):**
 1. Validate with real MCP tool authors (manifest ergonomics, missing fields).
-2. MCP gateway: proxy that journals and enforces over Streamable HTTP and stdio, observe mode first.
+2. MCP gateway enforcement: block, approval pause/resume, rollback tools, multiple upstreams.
 3. Connector manifests and compensators for GitHub, Stripe, Slack, filesystem.
 4. Postgres store; API key rotation, OIDC.
 5. Approval UI, dashboard, richer policy language.

@@ -8,7 +8,7 @@ description: What Reversi does not do. Read this before relying on it.
 - **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not detectable from the file alone.
 - **Single writer.** The file-backed and SQLite ledgers and run stores assume one server process. Do not point two at the same directory or database.
 - **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path to the tools.
-- **No automatic discovery of side effects**, no semantic firewall (intent graphs, encoding detection) and no MCP gateway yet.
+- **No automatic discovery of side effects**, no semantic firewall (intent graphs, encoding detection). The [MCP gateway](/gateway) only observes: it does not enforce or ask for approval yet.
 - **Approvals are in memory** in the server and expire on restart.
 - **HTTP only.** Terminate TLS in front of the server.
 - **Python SDK** reads JSON manifests only and rejects some floats when hashing payloads (see its page).

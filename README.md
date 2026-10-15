@@ -29,6 +29,7 @@ open viewer/index.html   # load examples/order-agent/out/ledger.jsonl; the chain
 |---|---|
 | `packages/reversi` | TypeScript core: manifests, ledger, scopes, engine (`@multimindlab/reversi`) |
 | `packages/cli` | `reversi validate / verify / runs / plan / rollback / export` |
+| `packages/gateway` | MCP gateway, observe mode (`reversi-gateway`) |
 | `packages/server` | HTTP API (Hono) with agent and operator API keys |
 | `packages/sdk-py` | Python client and offline verifier, stdlib only (`reversi-sdk`) |
 | `viewer/` | Single-file trace viewer |
@@ -38,7 +39,7 @@ open viewer/index.html   # load examples/order-agent/out/ledger.jsonl; the chain
 
 ## Honest status
 
-Built and tested: everything in the table above. **Not built:** an MCP gateway, SQLite/Postgres stores,
+Built and tested: everything in the table above. **Not built:** MCP gateway enforcement (it only observes), Postgres store,
 a hosted dashboard, content checks for prompt injection. Reversi enforces what manifests declare;
 it cannot discover what a tool really does, and the ledger is tamper-*evident*, not tamper-proof.
 Read [docs/limits.mdx](docs/limits.mdx) before relying on it.

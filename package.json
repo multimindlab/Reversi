@@ -5,7 +5,7 @@
   "description": "Reversibility, approval and audit evidence for every tool an agent can touch",
   "license": "Apache-2.0",
   "type": "module",
-  "workspaces": ["packages/reversi", "packages/server", "packages/cli"],
+  "workspaces": ["packages/reversi", "packages/server", "packages/cli", "packages/gateway"],
   "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -b",
