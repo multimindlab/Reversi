@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { Approvals } from "./approvals.js";
+import { webhookNotifier } from "./notify.js";
 import { ContentChecker } from "./content.js";
 import { openData, type Data, type DataOptions } from "./data.js";
 import { Ledger } from "./ledger.js";
@@ -23,6 +24,10 @@ export interface EngineConfig {
   extra_policy?: PolicyDoc;
   /** How long approval requests stay valid. Default one hour. */
   approval_ttl_ms?: number;
+  /** Webhook (Slack/Teams incoming-webhook compatible) told about each new approval request. */
+  approval_webhook?: string;
+  /** Public URL of the console, linked from the notification. */
+  console_url?: string;
 }
 
 export interface EngineHandle {
@@ -41,7 +46,10 @@ export function loadPolicyFile(path: string) {
 export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
   const registry = loadRegistry(cfg.manifests);
   const data = await openData(cfg.data);
-  const approvals = new Approvals(data.approvals, { ttl_ms: cfg.approval_ttl_ms });
+  const approvals = new Approvals(data.approvals, {
+    ttl_ms: cfg.approval_ttl_ms,
+    on_request: cfg.approval_webhook ? webhookNotifier({ url: cfg.approval_webhook, console_url: cfg.console_url }) : undefined,
+  });
   const file = cfg.policy ? loadPolicyFile(cfg.policy) : undefined;
   const merged = mergePolicyDocs(file?.doc, cfg.extra_policy);
   const pol = merged ? { policy: new Policy(merged), content: merged.content ? new ContentChecker(merged.content) : undefined } : undefined;
@@ -62,5 +70,5 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
 export function engineConfigFromEnv(env: Record<string, string | undefined>, dataOpts: DataOptions): EngineConfig {
   const manifests = env.REVERSI_MANIFESTS;
   if (!manifests) throw new Error("REVERSI_MANIFESTS is required (a manifest file or directory)");
-  return { manifests, data: dataOpts, policy: env.REVERSI_POLICY, environment: env.REVERSI_ENV, kill_switch_file: env.REVERSI_KILL_FILE };
+  return { manifests, data: dataOpts, policy: env.REVERSI_POLICY, environment: env.REVERSI_ENV, kill_switch_file: env.REVERSI_KILL_FILE, approval_webhook: env.REVERSI_APPROVAL_WEBHOOK, console_url: env.REVERSI_CONSOLE_URL };
 }

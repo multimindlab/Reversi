@@ -84,6 +84,8 @@ const engine = await openEngine({
   policy: v.policy ?? process.env.REVERSI_POLICY,
   environment: v.environment ?? process.env.REVERSI_ENV,
   kill_switch_file: process.env.REVERSI_KILL_FILE,
+  approval_webhook: process.env.REVERSI_APPROVAL_WEBHOOK,
+  console_url: process.env.REVERSI_CONSOLE_URL,
   extra_policy: allowDenyPolicy(cfg),
 });
 

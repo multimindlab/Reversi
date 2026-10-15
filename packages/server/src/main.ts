@@ -14,6 +14,8 @@ const HELP = `reversi-server. Configuration is by environment variable:
   REVERSI_POLICY           policy file (rules, limits, content checks)
   REVERSI_ENV              environment name matched by policy rules (default "default")
   REVERSI_KILL_FILE        while this file exists, new calls are blocked
+  REVERSI_APPROVAL_WEBHOOK URL told about each new approval request (Slack/Teams incoming-webhook compatible)
+  REVERSI_CONSOLE_URL      public URL of this server, linked from notifications
   REVERSI_SIGNING_KEY      PEM file with an Ed25519 private key, for signed evidence bundles
   REVERSI_OIDC_ISSUER, REVERSI_OIDC_AUDIENCE, REVERSI_OIDC_ROLE_MAP   OIDC bearer tokens; role map is JSON like {"reversi-ops":"operator"}
   REVERSI_OIDC_ROLE_CLAIM  claim holding roles (default "roles"; dots allowed: realm_access.roles)

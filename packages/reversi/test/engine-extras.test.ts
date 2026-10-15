@@ -288,3 +288,38 @@ describe("evidence", () => {
     expect(renderReport({ run: evil.run.state(), records: evil.rv.ledger.records() })).not.toContain("<script>alert");
   });
 });
+
+describe("approval notifications", () => {
+  it("posts a Slack-compatible message once per new request, and never breaks the decision", async () => {
+    const { webhookNotifier } = await import("../src/index.js");
+    const posts: Array<{ url: string; body: any }> = [];
+    const notify = webhookNotifier({
+      url: "https://hooks.example.com/T1/B1",
+      console_url: "https://reversi.example.com/",
+      fetch: (async (url: string, init: RequestInit) => {
+        posts.push({ url, body: JSON.parse(String(init.body)) });
+        return new Response("ok");
+      }) as typeof fetch,
+    });
+    const approvals = new Approvals(undefined, { on_request: notify });
+    const policy = Policy.from({ rules: [{ id: "all", match: { tool: "refund" }, action: "require_approval" }] });
+    const { run } = make({ policy, approver: approvals.asApprover() });
+    await run.call({ tool: "refund", args: { amount: 9, secret: "AKIAABCDEFGHIJKLMNOP" }, reason: "x", execute: ok });
+    await run.call({ tool: "refund", args: { amount: 9, secret: "AKIAABCDEFGHIJKLMNOP" }, reason: "x", execute: ok }); // pending already: no second message
+    await new Promise((r) => setTimeout(r, 10));
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.url).toBe("https://hooks.example.com/T1/B1");
+    expect(posts[0]?.body.text).toContain("refund");
+    expect(posts[0]?.body.text).toContain("https://reversi.example.com/console/approvals");
+    expect(JSON.stringify(posts[0]?.body)).not.toContain("AKIA"); // only argument names are ever sent
+
+    const failing = new Approvals(undefined, { on_request: () => { throw new Error("boom"); } });
+    const r2 = make({ policy, approver: failing.asApprover() });
+    expect((await r2.run.call({ tool: "refund", reason: "x", execute: ok })).status).toBe("blocked");
+    expect(() => webhookNotifier({ url: "ftp://x" })).toThrow(/http/);
+    const errors: string[] = [];
+    webhookNotifier({ url: "https://h.example.com", fetch: (async () => new Response("no", { status: 500 })) as typeof fetch, on_error: (e) => errors.push(e.message) })({ id: "a", run_id: "r", step: null, kind: "call", tool: "t", reason: "x", triggers: [], arg_keys: [], args_hash: null, status: "pending", requested_ms: 0, expires_ms: 1, decided_by: null, decided_ms: null, decision_note: null });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(errors).toEqual(["webhook answered 500"]);
+  });
+});

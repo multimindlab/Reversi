@@ -93,17 +93,21 @@ export interface ApprovalsOptions {
   /** How long a pending or approved request stays valid. Default 1 hour. */
   ttl_ms?: number;
   now?: () => number;
+  /** Called when a new request is queued (to notify an approver). Must not throw; failures are the callback's to handle. */
+  on_request?: (rec: ApprovalRecord) => void;
 }
 
 export class Approvals {
   private readonly ttl: number;
   private readonly now: () => number;
+  private readonly onRequest: ((rec: ApprovalRecord) => void) | undefined;
   constructor(
     readonly store: ApprovalStore = new MemoryApprovalStore(),
     opts: ApprovalsOptions = {},
   ) {
     this.ttl = opts.ttl_ms ?? 3_600_000;
     this.now = opts.now ?? Date.now;
+    this.onRequest = opts.on_request;
   }
 
   private sweep(r: ApprovalRecord): ApprovalRecord {
@@ -164,6 +168,11 @@ export class Approvals {
       decision_note: null,
     };
     this.store.put(rec);
+    try {
+      this.onRequest?.(rec);
+    } catch {
+      /* a broken notifier must never change an approval decision */
+    }
     return { approved: false, message: `approval required: request ${rec.id} is pending an operator decision; retry after it is approved` };
   }
 
