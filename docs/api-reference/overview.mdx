@@ -1,6 +1,6 @@
 ---
 title: API overview
-description: HTTP API conventions, roles and status codes.
+description: HTTP API conventions, roles, status codes and an index of every route.
 ---
 
 Start the server (see [deployment](/operations/deployment) for every option):
@@ -10,24 +10,65 @@ REVERSI_MANIFESTS=./tools.yaml REVERSI_KEYS=./keys.json node packages/server/dis
 ```
 
 All `/v1` routes need `Authorization: Bearer <API key or OIDC token>`. `GET /healthz` and `GET /readyz` are open;
-`GET /metrics` needs an auditor credential. [Roles](/operations/authentication) gate each route:
+`GET /metrics` needs an auditor credential unless `REVERSI_METRICS_PUBLIC=1`. [Roles](/operations/authentication) gate each route.
+Request and response bodies are JSON, except where noted. Bodies are capped at 1 MB.
+
+Examples in these pages use `$KEY`, `$AGENT_KEY`, `$OPS_KEY` and so on for credentials, and `http://127.0.0.1:7421` for the
+server. They were run against a local server.
 
 | Plane | Role needed | Routes |
 |---|---|---|
 | Agent | `agent` | [runs](/api-reference/runs): open a run, `intents`, `outcome` |
-| Read | `auditor`+ | plan, export, report, bundle, ledger verify, status, list approvals |
-| Approve | `approver`+ | approve, deny, pre-approve |
-| Operate | `operator`+ | compensation, resolve ([operator](/api-reference/operator)) |
-| Admin | `admin` | halt, resume ([admin](/api-reference/admin)) |
+| Read | `auditor`+ | run state, plan, export, reports, search, impact, alerts, status, approvals, ledger verify, bundles |
+| Approve | `approver`+ | approve, deny, pre-approve, delegations |
+| Operate | `operator`+ | compensation, resolve, rollback, simulate, replay, registry read ([operator](/api-reference/operator)) |
+| Admin | `admin` | halt, resume, break-glass, publish or approve manifests and policy, keys, holds, retention, anchor, reload ([admin](/api-reference/admin)) |
+
+Roles are cumulative: each includes the ones before it. Agents see only the runs they opened.
 
 | Status | Meaning |
 |---|---|
-| 400 | Invalid body or id |
+| 400 | Invalid body, id or query |
 | 401 | Missing or invalid credential |
 | 403 | Role or permission cap forbids it |
-| 404 | Unknown run (also for another agent's run), approval, or a feature that is not enabled |
-| 409 | State conflict (duplicate run id, outcome already reported, approval already decided) |
+| 404 | Unknown run (also for another agent's run), approval, or a feature that is not enabled on this server |
+| 409 | State conflict (duplicate run id, outcome already reported, approval already decided, a saved configuration that did not load) |
 | 413 | Body over 1 MB |
+| 502 | Anchor delivery failed |
 | 503 | Ledger unavailable; the request was refused (fail closed) |
 
-Policy refusals are **not** errors: `POST …/intents` returns 200 with `"decision": "block"` and `reasons`.
+Errors are `{"error": "message"}`. Policy refusals are **not** errors: `POST …/intents` returns 200 with `"decision": "block"` and `reasons`.
+
+**Features that are not enabled** answer 404 with a message saying why, for example `no retention settings`, `capture is off`,
+`no manifest registry folder is configured on this server`, `signed bundles are not enabled on this server`.
+On the standalone `reversi-server`, `/v1/connectors` returns an empty list (the gateway console fills it in), and
+`/integrations/slack/actions` answers 404 unless `REVERSI_SLACK_SIGNING_SECRET` and `REVERSI_SLACK_USERS` are set.
+
+## Index
+
+| Route | Role | Page |
+|---|---|---|
+| `POST /v1/runs` | agent | [runs](/api-reference/runs) |
+| `GET /v1/runs`, `GET /v1/runs/{id}` | agent (own), auditor+ (all) | [runs](/api-reference/runs) |
+| `POST /v1/runs/{id}/intents`, `POST /v1/runs/{id}/steps/{n}/outcome` | agent (own run) | [runs](/api-reference/runs) |
+| `GET /v1/runs/{id}/plan` | auditor | [operator](/api-reference/operator) |
+| `POST /v1/runs/{id}/rollback`, `GET /v1/runs/{id}/rollback` | operator, auditor | [operator](/api-reference/operator) |
+| `POST /v1/runs/{id}/steps/{n}/compensation`, `…/compensation/outcome`, `…/resolve` | operator | [operator](/api-reference/operator) |
+| `POST /v1/runs/{id}/approvals` | approver | [operator](/api-reference/operator) |
+| `GET /v1/runs/{id}/export`, `…/report`, `…/report.pdf` | auditor | [operator](/api-reference/operator) |
+| `GET /v1/search/runs`, `GET /v1/search/records` | auditor | [operator](/api-reference/operator) |
+| `GET /v1/impact`, `POST /v1/speculate` | auditor | [operator](/api-reference/operator) |
+| `POST /v1/simulate`, `POST /v1/runs/{id}/replay` | operator | [operator](/api-reference/operator) |
+| `GET /v1/report`, `GET /v1/alerts`, `GET /v1/connectors` | auditor | [operator](/api-reference/operator) |
+| `GET /v1/approvals`, `POST /v1/approvals/{id}/approve`, `…/deny` | auditor, approver | [admin](/api-reference/admin) |
+| `POST /v1/approvals/{id}/break-glass` | admin | [admin](/api-reference/admin) |
+| `GET/POST /v1/delegations`, `DELETE /v1/delegations/{id}` | auditor, approver | [admin](/api-reference/admin) |
+| `GET /v1/runs/{id}/bundle`, `GET /v1/ledger/bundle`, `GET /v1/evidence/key`, `GET /v1/ledger/verify` | auditor | [admin](/api-reference/admin) |
+| `GET /v1/status`, `GET /v1/halts` | auditor | [admin](/api-reference/admin) |
+| `POST /v1/halt`, `POST /v1/resume`, `POST /v1/reload` | admin | [admin](/api-reference/admin) |
+| `GET/POST /v1/holds`, `DELETE /v1/holds/{id}`, `GET /v1/retention/plan`, `POST /v1/retention/apply`, `POST /v1/anchor` | auditor read, admin write | [admin](/api-reference/admin) |
+| `GET /v1/registry` | operator | [admin](/api-reference/admin) |
+| `POST /v1/registry/manifests`, `…/{tool}/approve`, `…/{tool}/deprecate`, `POST /v1/registry/policy`, `…/policy/{version}/activate` | operator (drafts), admin | [admin](/api-reference/admin) |
+| `GET/POST /v1/keys`, `PATCH/DELETE /v1/keys/{index}` | admin | [admin](/api-reference/admin) |
+| `POST /integrations/slack/actions` | Slack signature | [admin](/api-reference/admin) |
+| `GET /healthz`, `/readyz`, `/metrics` | open, open, auditor | [monitoring](/operations/monitoring) |

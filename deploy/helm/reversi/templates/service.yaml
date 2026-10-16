@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "reversi.name" . }}
+  labels: {{- include "reversi.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: reversi
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - { name: http, port: {{ .Values.server.port }}, targetPort: http }
+    {{- if .Values.gateway.enabled }}
+    - { name: mcp, port: {{ .Values.gateway.port }}, targetPort: mcp }
+    {{- end }}

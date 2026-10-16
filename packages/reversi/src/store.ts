@@ -14,6 +14,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -50,9 +51,24 @@ export interface StepState {
   handle_missing: string[];
   error: string | null;
   ts_ms: number;
+  /** Manifest version at call time. */
+  manifest_version?: number;
+  /** `inverse` restores exact state; `compensation` may leave `residue`. Snapshotted with the compensation. */
+  compensation_kind?: "inverse" | "compensation";
+  residue?: string[];
+  /** Read-back to run after the compensation: arguments resolved from this call's args and result. */
+  verification?: { tool: string; refs: Record<string, string>; args: Record<string, unknown>; expect: Record<string, unknown>; retries: number; backoff_ms: number; missing: string[] };
+  compensation_timeout_ms?: number;
+  /** Rendered idempotency key, for duplicate detection. */
+  idem_key?: string;
+  /** Hash of the result: a reference to it that is safe to keep. */
+  result_hash?: string;
+  /** Risk score 0..100 computed when the call began, if risk scoring is configured. */
+  risk_score?: number;
 }
 
-export type Mode = "enforce" | "observe";
+/** `advise` behaves like `observe` (nothing is blocked) and tells the caller what would have been. */
+export type Mode = "enforce" | "observe" | "advise";
 
 export interface RunState {
   run_id: string;
@@ -60,6 +76,8 @@ export interface RunState {
   mode: Mode;
   scope: { permissions: string[]; seal: string; parent_seal: string | null };
   created_ms: number;
+  /** Customer or team the run belongs to, for tenant-scoped policy and queries. */
+  tenant?: string;
   steps: StepState[];
 }
 
@@ -67,6 +85,8 @@ export interface RunStore {
   get(run_id: string): RunState | undefined;
   put(state: RunState): void;
   list(): string[];
+  /** Remove a run's state (retention). The ledger records about it stay: the ledger is append-only. */
+  delete(run_id: string): boolean;
 }
 
 export const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -82,6 +102,9 @@ export class MemoryRunStore implements RunStore {
   }
   list(): string[] {
     return [...this.runs.keys()];
+  }
+  delete(run_id: string): boolean {
+    return this.runs.delete(run_id);
   }
 }
 
@@ -114,6 +137,13 @@ export class FileRunStore implements RunStore {
       closeSync(fd);
     }
     renameSync(tmp, f);
+  }
+
+  delete(run_id: string): boolean {
+    const f = this.file(run_id);
+    if (!existsSync(f)) return false;
+    unlinkSync(f);
+    return true;
   }
 
   list(): string[] {

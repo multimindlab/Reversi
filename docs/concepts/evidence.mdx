@@ -1,6 +1,6 @@
 ---
 title: Evidence
-description: Signed bundles, auditor reports and independent verification.
+description: Signed bundles, anchored ledger heads, run and period reports, and independent verification.
 ---
 
 ## Signed bundles
@@ -13,6 +13,7 @@ reversi keygen ./signing                      # writes signing.key (private) and
 reversi bundle -d ./reversi-data --key signing.key --out ledger.json
 reversi bundle -d ./reversi-data --key signing.key --out run.json --run run_123
 reversi verify-bundle ledger.json --pub signing.pub
+# ok: 9 records, hash chain verified, key 855d22c17ca4a717 (trusted)
 ```
 
 `verify-bundle` recomputes every record hash, checks the chain where it applies and checks the signature.
@@ -23,23 +24,101 @@ reversi verify-bundle ledger.json --pub signing.pub
 - **`--pub`** checks the signature against a key you already trust. Without it, a valid signature only proves the bundle
   is self-consistent: anyone could re-sign an edited bundle with their own key.
 
-The server serves bundles (`GET /v1/runs/{id}/bundle`, `/v1/ledger/bundle`) when started with `REVERSI_SIGNING_KEY`, and
-publishes the public key at `/v1/evidence/key`. Give auditors the public key out of band.
+The server serves bundles (`GET /v1/runs/{id}/bundle`, `/v1/ledger/bundle`) when started with `REVERSI_SIGNING_KEY`
+(or `signing_key:` in the project file), and publishes the public key at `/v1/evidence/key`. Give auditors the public key
+out of band. The same key signs anchors and retention archives.
 
 ## Anchoring
 
 A hash chain detects edits, deletions and reordering. It cannot detect truncation of the tail or a rewrite of the whole
-file by someone who controls it. Publish the ledger head (`reversi verify` prints it; every bundle contains it) somewhere
-the operator cannot rewrite: a ticket, a signed commit, an external timestamp service.
+file by someone who controls it. **Anchoring** publishes the ledger head somewhere the operator cannot quietly rewrite, so
+that later you can prove the history is unchanged.
 
-## Auditor report
+### What is anchored
+
+One JSON line per anchor: the hash of the last record (`head`), how many records the ledger had (`records`), a timestamp,
+the data `region` if set under [`egress`](/operations/retention), and, when a signing key is configured, the `key_id` and
+an Ed25519 `signature`.
+
+```json
+{"format":"reversi-anchor","version":1,"ts_ms":1792171387301,"head":"cdb044b2…","records":9,"key_id":"855d22c17ca4a717","signature":"LLHxL16j…"}
+```
+
+### Sinks and schedule
+
+```yaml reversi.config.yaml
+signing_key: ./signing.key
+anchor:
+  sinks:
+    - { type: file, path: /mnt/worm/anchors.jsonl }        # append-only file on other storage
+    - { type: webhook, url: "https://audit.example.com/anchors", secret: "${ANCHOR_SECRET}" }
+  interval: 1h
+```
+
+- **File** sinks append one line per anchor. **Webhook** sinks POST the JSON; with `secret` the body is signed in the
+  `x-reversi-signature: sha256=<hmac>` header, which you check like a [notification webhook](/operations/notifications).
+  Webhooks go through the [egress guard](/operations/retention) and time out after 10 s.
+- The server and gateway anchor **once at start and then every `interval`** (default one hour). A failing sink is logged
+  and does not lose the anchor for the other sinks.
+- On demand: `reversi anchor publish [--file <path>] [--webhook <url>] [--secret <s>] [--key <file>]` (it uses the sinks
+  in the config when none are given, and exits 1 if any sink failed), or `POST /v1/anchor` (admin).
+
+There is no scheduler for reports or bundles. Anchors are the scheduled evidence; run `reversi report` and
+`reversi bundle` from cron if you want files on a timetable.
+
+### Verifying
+
+```bash
+reversi anchor verify anchors.jsonl --pub signing.pub -d ./reversi-data
+# 2026-10-16T17:23:07Z  9 records  ok (signature trusted)
+```
+
+Every anchor in the file is checked against the ledger: the ledger itself must verify, the signature must match the key you
+trust (with `--pub`; an unsigned anchor is then rejected), the ledger must still have at least that many records, and the
+record at that position must still have the anchored hash. A shortened ledger fails with
+`the ledger has 5 records but was anchored at 9: it has been truncated`; a rewritten one with
+`history was rewritten`. Exit code 1 if any anchor fails. Keep the anchor file where the ledger's operator cannot edit it,
+otherwise it proves nothing.
+
+## Run report
 
 ```bash
 reversi report run_123 -m tools.yaml -d ./reversi-data --out run_123.html
+reversi report run_123 -m tools.yaml -d ./reversi-data --out run_123.pdf
 ```
 
-A self-contained HTML page: who ran what, step statuses, the rollback outlook (what stands, what cannot be undone and
-why) and the full event trail. The server and [console](/console) serve the same report.
+The extension picks the format. Both hold who ran what, step statuses, the rollback outlook (what stands, what cannot be
+undone and why) and the full event trail with record hashes. The PDF also states the data region and the ledger head at
+generation. The PDF is a plain, dependency-free A4 document (monospaced text) that any viewer opens and text tools can read.
+Over HTTP: `GET /v1/runs/{id}/report` (HTML) and `GET /v1/runs/{id}/report.pdf`; the [console](/console) links both.
+
+## Period report
+
+What the agents did over a window, for a weekly review or an auditor.
+
+```bash
+reversi report --since 7d --out week.md           # md (default), html or json by extension or --format
+reversi report --since 2026-10-01 --format json
+```
+
+It covers calls, runs, outcomes, calls by tool, actor and reversibility class, what was **blocked** and what **would have
+been** blocked in observe and advise modes, tools called without a manifest, approvals (requested, approved, denied,
+expired, escalated, median time to decision), rollback results and verification rate, irreversible actions that ran, runs
+needing attention, budgets near their limit, and calls per day. The server serves it at
+`GET /v1/report?since=7d&format=md|html|json` (auditor and up).
+
+## Retention archives
+
+When [retention](/operations/retention) deletes a run's working data, it can first write a signed bundle of that run's
+ledger records to an archive folder (`reversi retention apply --archive-dir ./arch --key signing.key`). A manifest with
+`audit.evidence_export: required` makes that mandatory. The archive is an ordinary single-run bundle:
+
+```bash
+reversi verify-bundle arch/r1.json --pub signing.pub
+# ok: 9 records, record hashes verified (single run), key 855d22c17ca4a717 (trusted)
+```
+
+The ledger itself is never purged; the deletion is recorded in it as a `purged` event.
 
 ## Offline verification without Node
 

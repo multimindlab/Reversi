@@ -1,19 +1,87 @@
 ---
 title: Tool manifests
-description: How a tool declares its reversibility, its undo, and the permission it needs.
+description: How a tool declares its reversibility, its undo, who owns it and who must approve it, plus the registry, lint and contract tests that keep manifests honest.
 ---
 
 A manifest is one JSON or YAML object per tool (or an array of them). The machine-readable schema is
 [`schemas/manifest.schema.json`](https://github.com/multimindlab/reversi/blob/main/schemas/manifest.schema.json).
+Unknown fields are rejected at every level, so a typo is an error, not a silently ignored setting.
+
+```yaml manifests/payments.yaml
+- tool: stripe.get_charge
+  description: Read one charge.
+  effect: read_only
+  permission: payments:read
+
+- tool: stripe.create_charge
+  description: Charge a card.
+  effect: compensable
+  permission: payments:write
+  owner: payments-team@example.com
+  oncall: payments-oncall
+  risk: { data_class: financial, blast_radius: high, environment: prod }
+  timeout_ms: 30s
+  idempotency: { key: "charge-{{args.order_id}}", scope: global }
+  audit:
+    retention_days: 2555
+    evidence_export: required
+    redaction: [$args.card_token]
+  approval:
+    roles: [finance]
+    quorum: 2
+    timeout: 15m
+    on_timeout: escalate
+    escalate_to: [cfo]
+  compensation:
+    tool: stripe.refund
+    kind: compensation
+    residue: [the charge still appears on the customer's statement]
+    requires_approval: false
+    timeout_ms: 20s
+    argument_map:
+      charge_id: $result.id
+      amount: $args.amount
+    verification:
+      tool: stripe.get_charge
+      arguments: { charge_id: $result.id }
+      expect: { refunded: true }
+      retries: 3
+      backoff_ms: 2s
+
+- tool: stripe.refund
+  description: Refund a charge.
+  effect: idempotent
+  permission: payments:write
+  retry: { attempts: 3, base_ms: 200ms, max_ms: 5s }
+```
+
+`reversi validate manifests` accepts this file (`ok: 3 tool manifests valid`).
+
+## Fields
 
 | Field | Meaning |
 |---|---|
-| `tool` | Tool name |
-| `effect` | `read_only`, `idempotent`, `reversible`, `compensable`, `irreversible` |
-| `permission` | Permission the run's scope must contain |
-| `approval` | `never` (default) or `always`. Forced to `always` for irreversible tools |
+| `tool` | Tool name: letters, digits and `_ . : / -`, up to 128 characters. Required |
+| `effect` | `read_only`, `idempotent`, `reversible`, `compensable`, `irreversible`. Required |
+| `permission` | Permission the run's scope must contain. No whitespace. Required |
+| `description` | Free text. Reviewers read it; lint warns when a mutating tool has none |
+| `approval` | `never` (default), `always`, or an object (see [Approval](#approval)). Forced to `always` for irreversible tools |
 | `compensation` | Required for `reversible` and `compensable`; forbidden otherwise |
-| `requires` | Tools that must have succeeded earlier in the run. Also creates rollback ordering |
+| `requires` | Tools that must have succeeded earlier in the run. Also creates rollback ordering. Entries may be a name or `{ tool, status: succeeded }` |
+| `version` | Positive integer, default 1. A registry increments it on every publish |
+| `status` | `draft`, `approved` (default) or `deprecated` |
+| `replaced_by` | For a deprecated tool, the tool to use instead. Must be registered |
+| `owner`, `oncall` | Who to ask when it misbehaves. Free text |
+| `risk` | `data_class` (free text such as `pii`, `financial`), `blast_radius` (`low`, `medium`, `high`, `critical`), `environment` (recorded only) |
+| `timeout_ms` | Longest the gateway waits for the upstream. A number of milliseconds or a duration |
+| `retry` | `attempts` (1 to 10, default 3), `base_ms` (default 200), `max_ms` (default 5000). Only for `read_only` and `idempotent` tools |
+| `idempotency` | `key` template and `scope` (see [Duplicate calls](#duplicate-calls)) |
+| `audit` | `retention_days`, `evidence_export` (`required` or `optional`), `redaction` (paths) |
+| `schema_hash` | Hash of the upstream tool's input schema when the manifest was written (see [Schema drift](#schema-drift)) |
+
+Durations are a number of milliseconds or a string with a unit: `500ms`, `30s`, `15m`, `2h`, `1d`. That applies to
+`timeout_ms`, `retry.base_ms`, `retry.max_ms`, `approval.timeout`, `compensation.timeout_ms` and
+`verification.backoff_ms`.
 
 ## Effects
 
@@ -23,31 +91,249 @@ A manifest is one JSON or YAML object per tool (or an array of them). The machin
 - **compensable**: a counteraction exists but leaves residue (a refund still appears on a statement).
 - **irreversible**: no safe undo (an email). Always needs approval; rollback reports it as not undone.
 
-## Compensation arguments
+## Compensation
 
-`argument_map` builds the undo call's arguments from references:
+| Field | Meaning |
+|---|---|
+| `tool` | The tool that undoes this one. Not the tool itself |
+| `argument_map` | Builds the undo call's arguments from references (below) |
+| `kind` | `compensation` (default): makes amends, may leave residue. `inverse`: restores the exact prior state |
+| `residue` | What the undo cannot take back, in plain words. An `inverse` cannot declare residue |
+| `requires_approval` | A human must approve running this compensation. Default false |
+| `timeout_ms` | Recorded on the step for the party that runs the undo |
+| `verification` | Read back the result of the undo before it counts as done (below) |
+
+`argument_map` values are references:
 
 - `$args.path`: from the original call's arguments
 - `$result.path`: from what the tool returned
 
 Arguments are **not stored in the ledger**. Reversi keeps only the values named by `argument_map`, in run state, so
 it can build the undo later. If a referenced value is missing when the tool returns, the step is marked
-*unrecoverable* rather than guessed.
+*unrecoverable* rather than guessed. The plan reports `kind` and `residue` per step, so a reviewer sees what a rollback
+will leave behind before running it.
+
+### Verification
+
+An API can answer "ok" and do nothing. `verification` calls a read-only tool after the undo and compares the answer:
+
+- `tool`: must be registered with effect `read_only`
+- `arguments`: references, resolved from the original call and result
+- `expect`: dotted path to expected value, deep equal. At least one entry. A path into an array uses the index (`items.0.id`)
+- `retries` (1 to 10, default 3) and `backoff_ms` (default 1000, doubled between attempts), because undo is often eventually consistent
+
+If every attempt mismatches, the compensation fails with the first mismatch in the ledger. See
+[Rollback](/concepts/rollback#verification) for what happens when nothing can run the read-back.
+
+## Approval
+
+`approval: always` makes a human approve each call. The object form says who and how many:
 
 ```yaml
-- tool: charge_card
-  effect: compensable
-  permission: payments:write
-  requires: [create_order]
-  compensation:
-    tool: refund
-    requires_approval: false
-    argument_map:
-      charge_id: $result.charge_id
-      amount: $args.amount
+approval:
+  roles: [finance]        # an approver must hold one of these roles or groups
+  quorum: 2               # 1 to 10; a quorum above 1 needs roles
+  timeout: 15m
+  on_timeout: escalate    # deny (default) or escalate
+  escalate_to: [cfo]
 ```
+
+`required: false` in the object form means `never`. Internally the manifest keeps `approval: always` plus the rules.
+Rules from the manifest and from [policy](/concepts/policy#approvers-and-quorum) are merged for one call: any listed role
+may approve, the largest quorum wins, the shortest timeout wins. See [approvals](/concepts/approvals).
 
 <Note>
 `approval` is deliberately separate from `effect`. A reversible tool can still need a human (large amounts), and
 irreversible tools always do.
 </Note>
+
+## Duplicate calls
+
+```yaml
+idempotency: { key: "charge-{{args.order_id}}", scope: global }
+```
+
+The key is a template over call arguments and needs at least one `{{args.field}}`. Two calls of the same tool with the
+same rendered key are duplicates: the second is refused while the first still stands (in flight, succeeded, uncertain or
+being compensated). `scope` is `run` (default), `actor` or `global`. If an argument is missing or not a plain value the
+call is refused rather than guessed. Once the first call is undone or failed, the key is free again.
+
+This is separate from the idempotency key Reversi gives each compensation, which stays the same across retries so the
+downstream API can deduplicate.
+
+## Lifecycle
+
+| Status | Behavior |
+|---|---|
+| `draft` | Not enforceable: calls are blocked (`the manifest ... is a draft`). A registry skips drafts when it loads |
+| `approved` | Enforced. The default when `status` is omitted |
+| `deprecated` | Still runs and still rolls back. Each call is noted `manifest deprecated; use <replaced_by>` |
+
+## What the validator enforces
+
+- `reversible` and `compensable` tools declare a compensation; the other effects must not.
+- `irreversible` tools cannot set `approval: never`.
+- A tool cannot require itself or compensate itself. `requires` has no duplicates.
+- Every `argument_map`, `verification.arguments` and `audit.redaction` entry is a reference such as `$args.id` or `$result.charge_id`.
+- `kind: inverse` cannot list residue.
+- `retry` is only allowed on `read_only` and `idempotent` tools: retrying anything else could repeat its effect.
+- `verification.expect` is not empty. `approval.quorum` is 1 to 10.
+- Once all manifests are loaded: the compensation tool, every required tool, the verification tool and `replaced_by` must exist, and the verification tool must be `read_only`. A duplicate tool name is an error.
+
+## Schema drift
+
+`schema_hash` is a short hash of the upstream tool's input schema. When the gateway sees a different hash it adds a
+violation (`the tool's input schema changed since its manifest was approved: review the manifest again`), so in enforce
+mode the call is blocked until someone reviews and re-approves the manifest. `reversi suggest-manifest` fills it in.
+
+## Registry: versions, signing, trust
+
+A registry is a folder of immutable versions. Every publish makes a new version; a draft becomes enforceable only when
+someone approves it, and the approval is itself a new version.
+
+```bash
+reversi keygen keys/mf                                  # keys/mf.key (private) and keys/mf.pub
+reversi manifests publish manifests --registry reg --by alice --key keys/mf.key --note "first draft"
+#   stripe.create_charge  v1  draft  40301964dd00
+reversi manifests approve stripe.create_charge --registry reg --by bob --key keys/mf.key --four-eyes
+#   stripe.create_charge  v2  approved by bob
+reversi manifests history stripe.create_charge --registry reg
+#   v1  draft     ...  by alice  40301964dd00  signed  - first draft
+#   v2  approved  ...  by alice, approved by bob  5804deda419f  signed  - approved from v1
+```
+
+| Command | Does |
+|---|---|
+| `reversi manifests publish <path>` | Add a file or folder as new versions. `--status draft` (default) or `approved` |
+| `reversi manifests approve <tool>` | Promote a draft. `--version <n>`, `--four-eyes` (the author may not approve their own draft) |
+| `reversi manifests deprecate <tool>` | Needs an approved version. `--replaced-by <tool>` |
+| `reversi manifests rollback <tool> <n>` | Publish an old version again as the newest, history intact |
+| `reversi manifests history <tool>`, `diff <tool> <a> <b>`, `list` | Inspect |
+| `reversi manifests verify [--trust <pem>]` | Check every checksum, and every signature against a public key. Exit 1 on a problem |
+| `reversi manifests check <path>` | Validate plain manifest files (same as `reversi validate`) |
+
+All writing commands take `--registry <dir>` (default: `manifests:` in `reversi.config.yaml`), `--by`, `--key` and `--note`.
+
+- **Checksums.** Each version's checksum is in `index.json` and is checked on load. A file edited outside the workflow is refused.
+- **Signing.** With `--key`, each version carries an Ed25519 signature over `reversi-manifest:<tool>@<version>:<checksum>` and the key id.
+- **Trusted key.** Set `manifest_public_key` in the project config (or `REVERSI_MANIFEST_PUBLIC_KEY`) to a PEM public key. Every version must then be signed by it, or the registry does not load. Setting it for manifests that are not in a registry is an error.
+- **Remote registry.** `manifests:` may be an `https://` URL serving `index.json` and `tools/<tool>/v<N>.json` as static files. The newest non-draft version of each tool is fetched, its checksum (and signature, with a trusted key) is checked, and the project's `egress:` rules apply (see the [gateway](/gateway) page). Tested against a local static server; not run against a hosted one.
+- **HTTP.** A server with a registry folder exposes `GET /v1/registry` and `POST /v1/registry/manifests`, `.../{tool}/approve`, `.../{tool}/deprecate`. Drafts need the operator role; approving or publishing as approved needs admin. A change reloads the engine.
+
+`approve`, `deprecate` and `rollback` keep a manifest's `approval:` object (roles, quorum, timeout, `escalate_to`) as you wrote it, and so do
+`reversi apply` and the console editor; a registry holding such a manifest loads everywhere. Two things to know:
+
+- `manifests publish --status` overrides a `status:` in the file: the flag (default `draft`) decides.
+- A draft is not enforced and is simply absent from the loaded registry, so a call to a tool that has only a draft reports
+  "no manifest", not "is a draft".
+
+## Lint
+
+```bash
+reversi lint manifests
+#   warning L011  stripe.refund: mutating tool has no owner: nobody is named to ask when it misbehaves
+#   warning L012  stripe.refund: no risk.data_class: policy and retention cannot treat sensitive data differently
+#   info    L022  stripe.refund: no timeout_ms: a hung call is only bounded by the gateway default
+#   0 errors, 2 warnings, 1 notes
+```
+
+Lint finds manifests that are valid but unsafe, incomplete or contradictory. It exits 1 on errors, and on warnings
+with `--strict`. `--json` prints the findings. With `--upstream-cmd`, `--upstream-url` or `--gateway-config` it also checks the
+manifests against the real tools' input schemas.
+
+| Code | Level | Finding |
+|---|---|---|
+| L010 | warning | Mutating tool has no description |
+| L011 | warning | Mutating tool has no owner |
+| L012 | warning | No `risk.data_class` |
+| L013 | warning | Compensable but no `residue` declared |
+| L014 | warning | The compensation tool is not idempotent, but rollback retries it |
+| L015 | warning | Irreversible with no `blast_radius` and no approvers |
+| L016 | info | The undo is not verified |
+| L017 | error | `argument_map` or verification reads an argument the input schema lacks (with an upstream) |
+| L019 | warning | A read-only tool shares a permission with tools that change things |
+| L020 | error | The idempotency key uses an argument the input schema lacks (with an upstream) |
+| L021 | info | Irreversible without `audit.evidence_export: required` |
+| L022 | info | Mutating tool with no `timeout_ms` |
+| L023 | error | `requires` forms a cycle |
+| L024 | warning | Draft manifest |
+| L027 | info | No `schema_hash` (with an upstream) |
+| L030 | warning | Declared reversible but the compensation lists residue |
+| L031 | warning | Declared compensable but the compensation is an exact `inverse` |
+| L032 | info | Compensation takes no arguments from the call |
+| L033 | warning | A redaction path names an argument the input schema lacks (with an upstream) |
+| L034 | warning | No upstream tool has this name (with an upstream) |
+| L035 | warning | The upstream offers a tool with no manifest |
+
+## Contract tests
+
+`reversi test` runs manifest contract tests without touching any system: for a fake call and a fake result, does the
+manifest produce the undo arguments, verification and plan you expect? It reads every `*.yaml`, `*.test.yaml` or `*.json`
+under `tests/` next to the config, or the files you pass, and also runs the policy's own tests.
+
+```yaml tests/payments.test.yaml
+- name: a charge is refunded with the right arguments, and the read-back is checked
+  tool: stripe.create_charge
+  args: { order_id: o1, amount: 2500 }
+  result: { id: ch_1 }
+  expect_plan: compensate
+  expect_handle: { charge_id: ch_1, amount: 2500 }
+  expect_verification: { charge_id: ch_1 }
+  verify_with: { refunded: true }
+  expect_verified: true
+- name: a failed charge leaves nothing to undo
+  tool: stripe.create_charge
+  args: { order_id: o1, amount: 2500 }
+  fail: card declined
+- name: the same order twice is refused
+  tool: stripe.create_charge
+  args: { order_id: o1, amount: 2500 }
+  result: { id: ch_1 }
+  expect_duplicate: true
+```
+
+```bash
+reversi test tests/payments.test.yaml -m manifests
+#   ok   a charge is refunded with the right arguments, and the read-back is checked
+#   ok   a failed charge leaves nothing to undo
+#   ok   the same order twice is refused
+#   not covered by any test: stripe.refund
+#   3 passed
+```
+
+Case fields: `tool`, `args`, `result` (the fake success), `fail` (a message: the call fails), `after` (tools to run first;
+default is the manifest's `requires`), `expect_plan` (`compensate`, `skip` or `unrecoverable`), `expect_handle`
+(undo arguments), `expect_verification` (verification arguments), `verify_with` plus `expect_verified` (would this read-back
+be accepted), `expect_duplicate`, and `expect_blocked` (a substring of the reason the call must be refused for). Exit 1 on any
+failure. Tools without a test are listed as not covered.
+
+## Draft manifests from a running server
+
+```bash
+reversi suggest-manifest --upstream-cmd node --upstream-arg connectors/dist/main.js \
+  --upstream-arg serve --upstream-arg fs --upstream-arg --root --upstream-arg ./sandbox -o drafts
+#   drafts/fs.write_file.yaml  medium
+#   ...
+#   9 drafted, 0 skipped (already have manifests)
+```
+
+It connects to an MCP server and drafts a manifest for each tool that has none, from names, descriptions, input schemas and the
+server's annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) and the `mcp-compensate` convention.
+Every draft has `status: draft`, a confidence (`low` or `medium` in the run above), comments saying what was guessed, a `schema_hash`, and a
+`TODO` residue where the undo needs describing. Annotations are the server's own claims, so a draft grants nothing until a
+person reviews and approves it. Over the gateway the same thing is `reversi.suggest_manifest`.
+
+## Python and JSON Schema
+
+The JSON Schema and the Python SDK mirror the TypeScript validator. `reversi_sdk.validate_manifest` returns the normalized
+manifest and a list of errors, and is tested against the TypeScript implementation on shared fixtures:
+
+```python
+from reversi_sdk import validate_manifest
+manifest, errors = validate_manifest({"tool": "stripe.refund", "effect": "idempotent",
+                                      "permission": "payments:write", "timeout_ms": "30s"})
+# manifest["timeout_ms"] == 30000, errors == []
+```
+
+Optional pydantic v2 models (`reversi_sdk.pydantic_models.ToolManifest`) run the same validator first, so they cannot disagree
+with it. Manifests are read from JSON in Python; convert YAML first.

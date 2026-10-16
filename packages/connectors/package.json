@@ -1,7 +1,7 @@
 {
   "name": "@multimindlab/reversi-connectors",
   "version": "0.1.0",
-  "description": "Real tool connectors with Reversi manifests and working compensations: filesystem, GitHub, Slack, Stripe",
+  "description": "Real tool connectors with Reversi manifests and working compensations: filesystem, GitHub, GitLab, Slack, Teams, Linear, Jira, Stripe, Google Calendar, Postgres, S3, Cloud Storage, Blob Storage, Kubernetes",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -30,6 +30,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@multimindlab/reversi": "0.1.0",
+    "pg": "^8.23.1",
     "yaml": "^2.8.0"
   },
   "devDependencies": {

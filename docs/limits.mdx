@@ -1,27 +1,49 @@
 ---
 title: Limits
-description: What Reversi does not do. Read this before relying on it.
+description: What Reversi does not do, and what is built but not yet checked against real services. Read this before relying on it.
 ---
 
+## What Reversi cannot do
+
 - **Manifests are trusted.** Reversi cannot inspect what a tool really does. Wrong manifest, wrong guarantees. It also cannot
-  discover side effects nobody declared.
+  discover side effects nobody declared. MCP annotations (`readOnlyHint` and friends) are the server's own claims: they seed
+  draft manifests and the startup banner, and nothing more ([gateway](/gateway)).
 - **Compensation is not time travel.** Refunds leave statements, deletions can lose data, a Slack message may already have been
   read. Irreversible stays irreversible, and compensation can fail: the report says so.
-- **Tamper-evident, not tamper-proof.** Anchor the ledger head externally. Whole-file rewrites and tail truncation are not
-  detectable from the data alone ([evidence](/concepts/evidence)).
+- **Tamper-evident, not tamper-proof.** Anchor the ledger head externally (`reversi anchor publish`, or `anchor:` sinks in the project file). Whole-file rewrites and tail truncation are not
+  detectable from the data alone ([evidence](/concepts/evidence)). Retention deletes run state, approvals and captures, never ledger records.
 - **Policy regular expressions** are run against agent-supplied values. A pathological pattern written by a policy author can stall the process; keep patterns simple (policy files are trusted input).
 - **The HTTP API trusts the agent's reported outcomes** (results feed compensation arguments). Use the gateway when results must come from the system, not the agent.
 - **Content checks are heuristics.** They catch obvious credentials, hidden payloads and injection phrasing. A determined
   adversary can phrase around them. They are one layer, not a firewall.
+- **Schema checks are a subset.** The gateway checks arguments and structured results against the upstream's published JSON Schema
+  with a small checker (types, enums, required, bounds, patterns, composition). It does not follow `$ref` or `if/then/else`, and it can only check what the upstream declares.
 - **Not an agent sandbox.** An agent that can call a tool directly, bypassing Reversi, is not governed. Put Reversi in the only path.
 - **One driver per run.** Several processes can share a SQLite or PostgreSQL store and append to one ledger safely, but run state is
-  last-write-wins: do not drive the same run from two processes. With the `files` store, share the directory only between processes on one host, never over a network filesystem.
-- **Gateway scope.** It proxies `tools/call` and `tools/list`, not resources, prompts or sampling, and one session is one run.
+  last-write-wins: do not drive the same run from two processes. With the `files` store, share the directory only between processes on one host, never over a network filesystem. There is no clustering with run hand-off.
+- **Gateway scope.** It proxies `tools/call` and `tools/list`, not MCP resources, prompts or sampling, and one session is one run.
 - **HTTP only.** Terminate TLS in front of the server and gateway.
-- **Console cannot run compensations.** It shows the plan; execution happens through the CLI, API or gateway.
-- **No OpenTelemetry export, no retention or purge policy, no hosted multi-tenant service.** Metrics, JSON logs and the ledger are
-  the operational record. Retention is yours to define with the store's own tools, and the ledger is append-only by design.
-- **Connectors cover four systems** (filesystem, GitHub, Slack, Stripe) and were tested against fakes of those APIs, not live
-  services. Verify each against a sandbox account before trusting it ([connectors](/connectors)).
-- **Python SDK** reads JSON manifests only, rejects some floats when hashing payloads, and cannot verify Ed25519 bundles.
-- **Docker and CI files** were written but not executed in the project's own test pass.
+- **Console sign-in is a pasted credential.** Login mode takes an API key or an OIDC access token. There is no browser redirect login to an identity provider. The open console has no login at all and is limited to loopback and a non-admin role.
+- **Rollbacks from the console depend on a compensator.** The server console can execute a rollback only when `REVERSI_COMPENSATOR_CMD` is set. Declared read-backs run only if `REVERSI_READER_CMD` is set too; without it those steps stay `unverified`. The gateway console runs compensations and read-backs on the upstream. `reversi console` only shows the plan.
+- **No hosted service.** Nothing here runs as a managed, multi-tenant control plane.
+- **No Terraform provider and no Kubernetes operator.** Use `reversi apply` from CI and the Helm chart ([GitOps](/operations/gitops)).
+- **SDKs.** TypeScript and Python only; no Go or Java. The Python SDK reads JSON manifests only, rejects non-whole floats outside 1e-4 to 1e16 when hashing payloads, and cannot verify Ed25519 bundles (use `reversi verify-bundle`).
+- **Standalone server routes.** `/v1/connectors` is empty (the gateway console fills it in).
+- **`manifests publish --status` overrides a `status:` in the file.** The flag (default `draft`) decides, so a file that says `status: approved` still lands as a draft unless you pass `--status approved`.
+- **A draft in a registry is absent, not blocked.** Enforcement loads only the newest non-draft version of each tool, so a call to a tool that has only a draft reports "no manifest", not "is a draft".
+- **`--detailed-exitcode`** exits 2 only together with `--dry-run`.
+- **`reversi.classification` and `reversi.suggest_manifest`** are tools of the gateway's operator endpoint (`/operator/mcp`) only.
+
+## Built, but not verified against the real thing
+
+These are implemented and covered by tests that use fakes or local stand-ins, but have not been run against real services,
+clusters or accounts. Do a first run in a throwaway environment.
+
+- **Fourteen connectors** (filesystem, GitHub, GitLab, Slack, Teams, Linear, Jira, Stripe, Google Calendar, Postgres, S3, Cloud Storage, Blob Storage, Kubernetes) and their certification suite run against fakes written from each vendor's documentation, not live services ([connectors](/connectors)). The filesystem connector is the exception: it is real and local.
+- **Notification channels** (Slack, Teams, email over SMTP, PagerDuty, Opsgenie, signed webhook) and **OpenTelemetry export** were tested against local fake receivers, not the real products ([notifications](/operations/notifications)).
+- **Framework integrations** (LangGraph, CrewAI, OpenAI Agents SDK, FastMCP, Claude Code hook) are tested against small fakes of each framework's interface, not installed copies ([integrations](/integrations)).
+- **Dockerfile, Docker Compose stack and Helm chart** were written but not built or installed. `helm` was not available to lint the chart, and it has never been installed on a real cluster ([deployment](/operations/deployment)).
+- **GitHub workflows** (`.github/workflows`) and the example workflow in [GitOps](/operations/gitops) have not been run on GitHub.
+- **PostgreSQL** was exercised against a local instance; managed cloud PostgreSQL services were not.
+- **Third-party MCP servers.** The gateway was run against stdio test servers and the bundled filesystem connector, not a range of hosted MCP servers.
+- **An external security review** has not happened. See the [threat model](/threat-model) and `SECURITY.md`.

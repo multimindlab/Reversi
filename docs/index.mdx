@@ -10,22 +10,28 @@ Reversi sits between an agent and its tools and gives you:
 
 <CardGroup cols={2}>
   <Card title="Tool manifests" icon="file-code" href="/concepts/manifests">
-    Declare per tool: how reversible it is, what undoes it, which permission it needs.
+    Declare per tool: how reversible it is, what undoes it, which permission it needs. Versioned, reviewable, signable.
   </Card>
   <Card title="Saga rollback" icon="rotate-left" href="/concepts/rollback">
-    Undo a run newest-first, idempotently, with retries, and never claim an irreversible step was undone.
+    Undo a run newest-first, idempotently, with retries and read-backs, and never claim an irreversible step was undone.
   </Card>
   <Card title="Hash-chained ledger" icon="link" href="/concepts/ledger">
     Who did what and why. Edits, deletions and reordering are detectable. Credentials never reach it.
   </Card>
   <Card title="Policy and approvals" icon="shield-check" href="/concepts/policy">
-    Rules as code, rate limits, content checks, and human approval bound to the exact call.
+    Rules as code, rate limits, content checks, and human approval bound to the exact call, with quorum, delegation and break-glass.
   </Card>
   <Card title="MCP gateway" icon="route" href="/gateway">
-    Put it in front of any MCP server. Journal, enforce, approve and roll back without changing the agent.
+    Put it in front of any MCP server. Starts in observe mode with no setup; journal, enforce, approve and roll back without changing the agent.
+  </Card>
+  <Card title="Console" icon="browser" href="/console">
+    See runs, decide approvals, run rollbacks, edit manifests and policy. Off by default.
+  </Card>
+  <Card title="Simulate before you ship" icon="flask" href="/concepts/simulation">
+    Replay captured calls through a candidate policy and see what would change.
   </Card>
   <Card title="Signed evidence" icon="file-signature" href="/concepts/evidence">
-    Ed25519-signed bundles and auditor-readable reports.
+    Ed25519-signed bundles, auditor reports and externally anchored ledger heads.
   </Card>
 </CardGroup>
 
@@ -33,17 +39,21 @@ Reversi sits between an agent and its tools and gives you:
 
 | Piece | Package |
 |---|---|
-| Engine, stores (files, SQLite, PostgreSQL), policy, content checks, evidence | `@multimindlab/reversi` |
-| `reversi` CLI | `@multimindlab/reversi-cli` |
+| Engine, stores (files, SQLite, PostgreSQL), policy, content checks, evidence, registry, simulation | `@multimindlab/reversi` |
+| `reversi` CLI: init, doctor, lint, test, apply, inspect, rollback, approvals | `@multimindlab/reversi-cli` |
 | HTTP API, operator console, metrics | `@multimindlab/reversi-server` |
 | MCP gateway (stdio and Streamable HTTP) | `@multimindlab/reversi-gateway` |
-| Filesystem, GitHub, Slack and Stripe connectors with working compensations | `@multimindlab/reversi-connectors` |
-| Python client and offline verifier (standard library only) | `reversi-sdk` |
+| Fourteen connectors with working compensations and a certification suite | `@multimindlab/reversi-connectors` |
+| Python client, offline verifier, Pydantic bindings, framework adapters | `reversi-sdk` |
 | Browser trace viewer that verifies the ledger locally | `viewer/` |
+| Dockerfile, Compose stack, Helm chart | `deploy/`, `Dockerfile` |
 
 Start with the [quickstart](/quickstart), or go straight to the [gateway](/gateway) if you already run MCP servers.
+To run it for a team, see [GitOps](/operations/gitops) and [deployment](/operations/deployment).
 
 <Warning>
 Reversi records and enforces what manifests declare. It cannot discover what a tool really does. A manifest that
-lies makes Reversi lie. Read [limits](/limits) and the [threat model](/threat-model).
+lies makes Reversi lie. Many parts (the connectors, notification channels, framework adapters, Docker and Helm files) are
+built and tested against fakes but not against real services or clusters. Read [limits](/limits), the
+[roadmap](/roadmap) and the [threat model](/threat-model).
 </Warning>

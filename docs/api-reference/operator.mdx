@@ -1,39 +1,222 @@
 ---
 title: Operator endpoints
-description: Plan, compensate, resolve, export, verify, report. Auditor reads; operator acts.
+description: Plan, roll back, resolve, export, report, search, preview and simulate. Auditor reads; operator acts.
 ---
 
-## `GET /v1/runs/{id}/plan` (auditor+)
-Simulated rollback: `{"run_id","actions":[{"step","tool","kind","compensation_tool?","args?","idempotency_key?","blocked_by?","note?"}],"fully_reversible"}`.
-`kind`: `compensate`, `skip`, `defer`, `unrecoverable`, `unresolved`, `unmanifested`.
+Examples use `$AUDIT_KEY` (auditor), `$APPROVER_KEY` and `$OPS_KEY` (operator).
 
-## `POST /v1/runs/{id}/approvals` (approver+)
+## Rollback
+
+### `GET /v1/runs/{id}/plan` (auditor+)
+
+Simulated rollback. Executes nothing.
+
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" http://127.0.0.1:7421/v1/runs/demo-1/plan
+```
+```json
+{"run_id":"demo-1","actions":[{"step":0,"tool":"notes.write","kind":"compensate","compensation_tool":"notes.restore",
+ "args":{"name":"a","backup":"b1"},"idempotency_key":"1631984a…","needs_approval":false,"compensation_kind":"inverse","verified":true}],
+ "fully_reversible":true}
+```
+
+`kind`: `compensate`, `skip`, `defer` (waits for `blocked_by` steps), `unrecoverable`, `unresolved`, `unmanifested`. Other fields:
+`compensation_tool`, `args`, `idempotency_key`, `needs_approval`, `compensation_kind` (`inverse` or `compensation`), `residue`,
+`verified` (the undo is read back), `note`.
+
+### `POST /v1/runs/{id}/rollback` (operator+)
+
+Without `"confirm": true` this is a dry run:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $OPS_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/runs/demo-1/rollback -d '{}'
+```
+```json
+{"dry_run":true,"plan":{…},"executable":true}
+```
+
+With `{"confirm": true}` (and optionally `"approve_compensations": true`, which also approves compensations that need approval)
+the server runs the rollback in the background and answers **202**:
+
+```json
+{"run_id":"demo-1","running":true,"started_ms":1792171502758,"by":"ops"}
+```
+
+It needs a compensator: start the server with `REVERSI_COMPENSATOR_CMD` (404 `this server has no compensator configured` otherwise).
+To run manifests' declared read-backs, also set `REVERSI_READER_CMD`: a command that receives `{"tool","arguments"}` as JSON
+on stdin and prints the tool's JSON result.
+Compensations are attempted 3 times with backoff and the same idempotency key. A second start while one runs is a 409.
+
+### `GET /v1/runs/{id}/rollback` (auditor+)
+
+Progress and result of the last rollback this server started for the run (404 if none):
+
+```json
+{"run_id":"demo-1","running":false,"started_ms":1792171502758,"by":"ops","finished_ms":1792171502791,
+ "report":{"run_id":"demo-1","compensated":[0],"skipped":[],"failed":[],"unrecoverable":[],"unresolved":[],
+           "unmanifested":[],"deferred":[],"awaiting_approval":[],"unverified":[0],"complete":false}}
+```
+
+`complete` is false in this example because the manifest declares a read-back and the server was started without
+`REVERSI_READER_CMD`, so it could not call the tool to verify it and step 0 is `unverified`. With `REVERSI_READER_CMD` set and
+the read-back matching, `unverified` is empty and `complete` is true. A failure to run at all appears as `error`. The
+[gateway](/gateway) does the read-back through the upstream.
+
+### Step by step: `…/steps/{n}/compensation` (operator+)
+
+For callers that run the undo themselves. `POST /v1/runs/{id}/steps/{n}/compensation` journals `compensating` first, then says what to run:
+
+```json
+{"decision":"go","step":0,"call":{"run_id":"demo-3","step":0,"tool":"notes.restore","original_tool":"notes.write",
+ "args":{"name":"b","backup":"b9"},"idempotency_key":"18784249…"}}
+```
+
+Other decisions: `defer`, `awaiting_approval`, `not_actionable` (with `kind` and `note`, e.g. `irreversible: cannot be undone, needs human follow-up`), `nothing_to_do`.
+
+Report what happened with `POST /v1/runs/{id}/steps/{n}/compensation/outcome`:
+
+```json
+{"status":"compensated"}
+{"status":"failed","error":"…"}
+```
+→ `{"ok":true}`
+
+### `POST /v1/runs/{id}/steps/{n}/resolve` (operator+)
+
+Settle a step whose outcome was unknown, after checking downstream:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $OPS_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/runs/demo-2/steps/0/resolve \
+  -d '{"status":"succeeded","note":"found the order in the admin UI"}'
+```
+```json
+{"step":0,"status":"succeeded"}
+```
+
+`note` is required and is stored in the ledger with the caller's name. `status` is `succeeded` (optional `result`, so the step
+can be rolled back) or `failed` (optional `error`).
+
+### `POST /v1/runs/{id}/approvals` (approver+)
+
 ```json
 { "tool": "send_email", "kind": "call", "count": 1 }
 ```
-Standing pre-approval for a tool in this run, any arguments, `count` uses. For compensations use `"kind": "compensation"`
-and the **compensation** tool's name. To decide a queued request instead, see [admin](/api-reference/admin).
 
-## `POST /v1/runs/{id}/steps/{n}/compensation` (operator+)
-Journals `compensating` first, then returns what to run:
-`{"decision":"go","call":{"tool","args","idempotency_key",…}}`, or `defer`, `awaiting_approval`, `not_actionable`, `nothing_to_do`.
+Standing pre-approval for a tool in this run, any arguments, `count` uses (1 to 100). For compensations use `"kind": "compensation"`
+and the **compensation** tool's name. → `201 {"ok":true}`. To decide a queued request instead, see [admin](/api-reference/admin).
 
-## `POST /v1/runs/{id}/steps/{n}/compensation/outcome` (operator+)
-`{"status":"compensated"}` or `{"status":"failed","error":"…"}`.
+## Evidence and search
 
-## `POST /v1/runs/{id}/steps/{n}/resolve` (operator+)
-Settle a step whose outcome was unknown, after checking downstream:
-```json
-{ "status": "succeeded", "result": { "id": 7 }, "note": "found order 7 in the admin UI" }
+### `GET /v1/runs/{id}/export` (auditor+)
+
+The run's ledger records as `application/x-ndjson`, one JSON object per line (`seq`, `ts_ms`, `run_id`, `step`, `actor`,
+`tool`, `payload_hash`, `reason`, `event`, `detail`, `prev_hash`, `hash`).
+
+### `GET /v1/runs/{id}/report`, `GET /v1/runs/{id}/report.pdf` (auditor+)
+
+A self-contained auditor report as HTML, or as `application/pdf`.
+
+### `GET /v1/report` (auditor+)
+
+The period report: what agents did, what was blocked or would have been, approvals, rollbacks.
+
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" 'http://127.0.0.1:7421/v1/report?since=7d&format=md'
 ```
-`note` is required and is stored in the ledger with the caller's name. `status` is `succeeded` or `failed` (with optional `error`).
-Returns `{"step","status"}`.
 
-## `GET /v1/runs/{id}/export` (auditor+)
-The run's ledger records as `application/x-ndjson`.
+`since` is `7d` (default), `12h`, `30m` or an ISO date. `format` is `json` (default), `md` or `html`. The JSON has `runs`, `calls`,
+`actors`, `tools`, `by_effect`, `outcomes`, `blocked`, `would_block`, `unclassified_tools`, `approvals`, `rollback`,
+`irreversible_executed`, `needs_attention`, `budget_warnings` and `days`.
 
-## `GET /v1/runs/{id}/report` (auditor+)
-A self-contained HTML auditor report.
+### `GET /v1/search/runs` (auditor+)
 
-## `GET /v1/ledger/verify` (auditor+)
-`{"ok":true,"records":42,"head":"…"}` or `{"ok":false,"seq":7,"error":"…"}`.
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" \
+  'http://127.0.0.1:7421/v1/search/runs?actor=agent1&status=rolled_back&since=7d'
+```
+```json
+{"runs":[{"run_id":"demo-1","actor":"agent1","mode":"enforce","started_ms":1792171472466,"steps":1,"tools":["notes.write"],
+ "status":"rolled_back","unresolved":[],"failed_compensations":0}]}
+```
+
+Filters: `actor`, `tenant`, `tool`, `status` (`needs_attention`, `rolled_back`, `complete`, `blocked_only`, `empty`), `mode`, `since`,
+`until`, `text` (part of the run id), `limit`, `after` (a cursor).
+
+### `GET /v1/search/records` (auditor+)
+
+Ledger records. Filters: `run`, `actor`, `tool`, `event` (one or several, comma separated), `text`, `since`, `until`, `limit`, `after_seq`.
+→ `{"records":[…],"next_seq":1}`.
+
+## Preview and simulation
+
+### `GET /v1/impact` (auditor+)
+
+What a call would do, without making it.
+
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" \
+  'http://127.0.0.1:7421/v1/impact?tool=notes.write&args=%7B%22name%22:%22a%22%7D'
+```
+```json
+{"tool":"notes.write","known":true,"status":"approved","effect":"reversible","owner":"you@example.com",
+ "risk":{"data_class":"internal","blast_radius":"low"},"verdict":"allow","reasons":[],
+ "risk_score":{"score":20,"factors":["effect reversible +15","data class internal +5"]},
+ "compensation":{"tool":"notes.restore","kind":"inverse","residue":[],"verified":true,"needs_approval":false},
+ "requires":[],"rollback_outlook":["undo by calling notes.restore","the undo is read back and verified"],"warnings":[]}
+```
+
+`tool` is required; `args` is URL-encoded JSON; `actor` is optional. A tool with no manifest answers `"known": false`,
+`"verdict": "block"`.
+
+### `POST /v1/speculate` (auditor+)
+
+Compare alternative plans without running them.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $AUDIT_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/speculate \
+  -d '{"plans":[{"name":"a","calls":[{"tool":"notes.write","args":{"name":"x"}}]}]}'
+```
+
+Optional `policy` (YAML text) and `actor`. Each plan comes back with per-call verdicts, `approvals_needed`, `max_risk`,
+`total_risk`, `irreversible`, `residue`, `fully_reversible`, its own `rollback` plan and a `rank`. Results the manifests had to
+synthesize are marked in `notes`.
+
+### `POST /v1/simulate` (operator+)
+
+Replay captured calls through a candidate policy. Needs capture on (404 `capture is off` otherwise).
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $OPS_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/simulate -d '{"since":"1d"}'
+```
+```json
+{"calls":1,"runs":1,"unchanged":1,"newly_blocked":[],"newly_needs_approval":[],"newly_allowed":[],"notes":[]}
+```
+
+Body: `policy` (YAML text; default is the running policy), `since` (default `7d`), `run_id`.
+
+### `POST /v1/runs/{id}/replay` (operator+)
+
+Replay one captured run, once as recorded and once with changes. Needs capture on.
+
+```json
+{"changes":[{"path":"name","value":"b"}],"policy":"…optional YAML…"}
+```
+
+A change is `{path, value}` with optional `step` and `tool` to narrow it. → `baseline`, `variant`, `differences`,
+`baseline_plan`, `variant_plan`.
+
+## Status and inventory
+
+### `GET /v1/alerts` (auditor+)
+
+`{"alerts":[…]}`: what needs attention right now, computed from the ledger, approvals and upstream health (severity, title,
+detail, `ts_ms`, `run_id`).
+
+### `GET /v1/connectors` (auditor+)
+
+`{"connectors":[{"name","kind","healthy","tools","classified","unclassified","credential?","detail?"}]}`. Filled by the gateway
+console; the standalone server returns an empty list.

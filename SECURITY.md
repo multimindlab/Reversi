@@ -1,13 +1,16 @@
 # Security policy
 
-Reversi is a security-relevant project. Please report vulnerabilities privately, not in a public
-issue.
+Reversi is a security-relevant project. Please report vulnerabilities privately, not in a public issue.
 
-**Report to:** security contact to be set before the repository is made public (replace this line
-with an address or a GitHub private vulnerability reporting link).
+**Report a vulnerability:** use GitHub's private vulnerability reporting. On the repository page open the
+**Security** tab, then **Report a vulnerability**
+(<https://github.com/multimindlab/Reversi/security/advisories/new>). Only the maintainers can see the report.
 
-Please include affected version, a description, and reproduction steps. We aim to acknowledge
-reports within a few working days.
+For a hardening question or an idea that is not sensitive (a missing check, a documentation gap), a normal public
+issue is fine. If you are not sure which this is, use the private route.
+
+Please include the affected version, a description, and reproduction steps. We aim to acknowledge reports within a few
+working days.
 
 ## Scope notes
 

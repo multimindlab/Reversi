@@ -1,0 +1,132 @@
+---
+title: Notifications
+description: Tell people about approvals, failed rollbacks and alerts through Slack, Teams, email, PagerDuty, Opsgenie or a signed webhook.
+---
+
+Reversi can push events to the places your team already watches. A notification never changes what Reversi decided: a
+channel that is down, slow or misconfigured is logged as a warning and the call, approval or rollback carries on.
+
+## Configure
+
+Channels and routes live under `notifications:` in `reversi.config.yaml`. `${NAME}` is replaced from the environment, so
+secrets stay out of the file (a missing variable is a config error).
+
+```yaml reversi.config.yaml
+approval:
+  console_url: https://reversi.example.com      # linked from messages
+notifications:
+  channels:
+    - { type: slack, name: ops, url: "${SLACK_WEBHOOK_URL}", interactive: true }
+    - { type: pagerduty, name: oncall, routing_key: "${PD_ROUTING_KEY}" }
+    - { type: webhook, name: siem, url: "https://siem.example.com/reversi", secret: "${HOOK_SECRET}" }
+  routes:
+    - { events: [approval_requested, approval_decided, approval_escalated], channels: [ops] }
+    - { events: ["*"], channels: [oncall], min_severity: critical }
+    - { events: ["*"], channels: [siem] }
+```
+
+- **Routes** pick channels by event name (`"*"` for all) and an optional `min_severity` (`info`, `warning` or `critical`;
+  default `info`). A message goes to every channel named by any matching route, once.
+- **No `routes`:** every event goes to every channel.
+- A route naming a channel that does not exist, a duplicate channel `name`, or a missing required field fails when the
+  config loads, with the field named.
+- Notifications are sent by the process that sees the event: the server, gateway, console, or the CLI when it decides an
+  approval (`reversi approvals approve|deny` sends `approval_decided` to the channels in the project file; see
+  [approvals](/concepts/approvals)).
+
+## Channels
+
+| `type` | Required | Optional | Notes |
+|---|---|---|---|
+| `slack` | `url` (incoming webhook) | `interactive` | Header, text and a link to the console. `interactive: true` adds Approve and Deny buttons to approval requests |
+| `teams` | `url` (incoming webhook) | | A `MessageCard` coloured by severity with an "Open in Reversi" action |
+| `email` | `host`, `port`, `from`, `to` (list) | `secure`, `starttls`, `user`, `pass`, `verify_tls` | Plain-text mail, subject `[Reversi warning] <title>` |
+| `pagerduty` | `routing_key` | `url` | Events API v2: `trigger`, then `resolve` with the same dedup key |
+| `opsgenie` | `api_key` | `region` (`us` or `eu`), `url` | Alert with the dedup key as alias; priority P5, P3 or P1 by severity; resolve closes it |
+| `webhook` | `url` | `secret`, `headers` | Signed JSON, below |
+
+**Email** speaks SMTP directly with no dependency: `secure: true` for implicit TLS (port 465), otherwise STARTTLS is used
+when the server offers it (`starttls: false` turns that off), `user` and `pass` authenticate with AUTH PLAIN, and the
+certificate is verified unless `verify_tls: false`. A permanent rejection (a 5xx reply) is not retried.
+
+**Delivery.** Every channel sends through the [egress guard](/operations/retention), with a 10 second timeout and up to
+three attempts (waits of 0.2 s and 0.4 s) on network errors, `429` and `5xx`. A `4xx` fails at once: it means a wrong URL
+or key. Error messages have `key=`, `token=` and `secret=` values blanked.
+
+## Events
+
+| Event | Severity | When |
+|---|---|---|
+| `approval_requested` | warning | A call is waiting for approval. Carries the approval id and argument names |
+| `approval_progress` | info | One approver of a quorum has voted; more are needed |
+| `approval_decided` | info | The request was approved or denied. Resolves the matching incident |
+| `approval_escalated` | warning | Nobody answered in time and the request was widened |
+| `break_glass` | critical | An admin forced an approval through |
+| `rollback_failed` | critical | A compensation failed |
+| `verification_failed` | critical | An undo ran but could not be read back |
+| `rollback_unverified` | warning | An undo ran with nothing to verify it |
+| `irreversible_executed` | warning | An irreversible tool ran |
+| `unclassified_mutation` | warning | A tool with no manifest was called |
+| `retention_purged` | info | Run data was deleted by [retention](/operations/retention) |
+| `alert` | per alert | An [alert](/operations/monitoring), and its `Resolved:` message |
+
+Messages carry names and ids (tool, run, actor, argument names), never argument values.
+
+## The signed webhook
+
+A `webhook` channel POSTs JSON:
+
+```json
+{"event":"approval_requested","ts":"2026-10-16T17:22:36.534Z","severity":"warning","title":"Approval needed: payments.refund",
+ "text":"Reversi approval needed: call `payments.refund` in run run_… (arguments: amount). Why: policy `big-refund`: large refund; manifest requires approval. Decide: https://reversi.example.com/console/approvals",
+ "link":"https://reversi.example.com/console/approvals","dedup_key":"approval:apr_…","resolve":false,
+ "data":{"approval_id":"apr_…","run_id":"run_…","tool":"payments.refund","status":"pending","quorum":2,"arg_keys":["amount"]}}
+```
+
+with headers `x-reversi-event` (the event name) and, when `secret` is set, `x-reversi-signature: sha256=<hex>`, the
+HMAC-SHA-256 of the **raw request body** under the secret. Compute it over the bytes exactly as received, before parsing
+JSON, and compare in constant time.
+
+<CodeGroup>
+```python Python
+from reversi_sdk import verify_webhook_signature
+
+ok = verify_webhook_signature(secret, raw_body, request.headers.get("x-reversi-signature"))
+```
+
+```js Node
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(secret, rawBody, header) {
+  if (!header?.startsWith("sha256=")) return false;
+  const want = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const got = header.slice(7).trim().toLowerCase();
+  return got.length === want.length && timingSafeEqual(Buffer.from(got), Buffer.from(want));
+}
+```
+</CodeGroup>
+
+`verify_webhook_signature` returns `False` for a missing header, a missing `sha256=` prefix or any change to the body. It is
+also `ReversiClient.verify_webhook_signature`. Anchor webhooks use the same header and scheme.
+
+## Test it
+
+```bash
+reversi doctor --send-test
+# ok    egress allows 127.0.0.1:7553
+# ok    test message: sent to ops-hook
+```
+
+`doctor` checks every channel URL against the egress rules and then sends a test message through all channels. Admins can
+also press **Send a test notification** under **Settings** in the console, which lists the channels that were reached and
+the ones that failed.
+
+## The older approval webhook
+
+`REVERSI_APPROVAL_WEBHOOK` (or `approval.webhook`) is a single URL that gets each new approval request with a `text` field.
+It keeps working beside channels. Prefer channels: they add retries, routing, signing, decisions and the egress guard.
+
+## Not verified here
+
+The Slack, Teams, PagerDuty, Opsgenie and SMTP payloads are covered by this repository's tests against local fakes. They
+have not been exercised against the real services.

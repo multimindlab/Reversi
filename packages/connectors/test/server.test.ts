@@ -87,7 +87,7 @@ describe("reversi-connectors binary", () => {
     expect(list.map((m) => m.tool)).toContain("stripe.create_refund");
     Registry.from(list);
     const json = JSON.parse(run(["manifests", "all", "--format", "json"]).stdout) as unknown[];
-    expect(Registry.from(json).size).toBe(29);
+    expect(Registry.from(json).size).toBe(84);
   });
 
   it.skipIf(!existsSync(main))("serve refuses to start without its credential and never takes it from flags", () => {

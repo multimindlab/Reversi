@@ -1,0 +1,1216 @@
+---
+title: Manual testing - adoption
+description: Try by hand, in one terminal, everything that takes a team from "an MCP server we do not trust yet" to enforced, signed manifests kept in git.
+---
+
+Every command here was run, in this order, against this repository, in a fresh scratch directory. The expected output is copied
+from that run and trimmed (`...` marks cut text; ids, times and your scratch path will differ). For the rest of the manual tests
+see the [main testing guide](/testing).
+
+Everything runs from **one terminal**. Servers are started in the background, write to a log file, and are stopped with `kill`.
+Ports used: 7700, 7701, 7702 (all on 127.0.0.1).
+
+<Note>
+This page covers what is built. There is no Terraform provider and no Kubernetes operator: `reversi apply` (scenario 6) and the
+Helm chart are the supported ways to manage Reversi from files.
+</Note>
+
+## 0. Setup
+
+You need Node 22.13 or newer (`node -v`), `curl`, `openssl` and `shasum`, and a repository built with `npm install && npm run build`.
+
+```bash
+cd /path/to/Reversi                 # the repository root
+export REPO=$PWD
+export T=$(mktemp -d)               # everything below is created in here
+export NODE_NO_WARNINGS=1           # hides Node's "SQLite is experimental" notice
+rv()      { node $REPO/packages/cli/dist/main.js "$@"; }        # the reversi CLI
+mcp()     { node $REPO/examples/gateway/mcp.mjs "$@"; }         # a tiny MCP client
+sha()     { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+waitfor() { until curl -sf "http://127.0.0.1:$1/readyz" >/dev/null; do sleep 0.3; done; }
+echo $T
+```
+
+## 1. `reversi init` and `reversi doctor`
+
+`init` creates a project: a config file, example manifests, a starter policy, a contract-test file and a data store.
+
+```bash
+mkdir $T/proj && cd $T/proj
+rv init
+```
+
+```text
+created  reversi.config.yaml
+created  manifests/example.yaml
+created  policy.yaml
+created  tests/manifests.test.yaml
+updated  .gitignore (reversi-data/)
+created  reversi-data/ (sqlite store)
+
+Next:
+  reversi doctor                         check the setup
+  ...
+```
+
+`reversi.config.yaml` is found from the current folder or any parent, by the CLI, the server and the gateway. Relative paths in it
+are relative to the file. See what Reversi resolved:
+
+```bash
+rv show-config
+```
+
+```text
+root: <scratch>/proj
+file: <scratch>/proj/reversi.config.yaml
+manifests: <scratch>/proj/manifests
+policy: <scratch>/proj/policy.yaml
+environment: dev
+data:
+  dir: <scratch>/proj/reversi-data
+  store: sqlite
+```
+
+`doctor` checks the Node version, the config, that the manifests load and lint, that the data store opens and the ledger chain is
+intact, the policy and its own tests, signing key, notification channels, network rules, that the data directory is writable, and
+(with `--upstream-cmd`, `--upstream-url` or `--gateway-config`) that an MCP server answers.
+
+```bash
+rv doctor; echo "exit $?"
+```
+
+```text
+ok    Node 22.14.0
+ok    config <scratch>/proj/reversi.config.yaml
+ok    3 manifests load
+warn  lint: 2 warnings (reversi lint)
+ok    data store (sqlite) opens
+ok    ledger: 0 records, chain intact
+info  no signing key: signed evidence bundles and anchors are off
+ok    policy: 1 rules, 2 tests
+info  no notification channels configured
+ok    data directory <scratch>/proj/reversi-data is writable
+ok, with 1 warning
+exit 0
+```
+
+The example contract tests and the policy's own tests run without touching anything:
+
+```bash
+rv lint
+rv test
+```
+
+```text
+warning L011  notes.restore: mutating tool has no owner: nobody is named to ask when it misbehaves
+warning L012  notes.restore: no risk.data_class: policy and retention cannot treat sensitive data differently
+info    L022  notes.restore: no timeout_ms: a hung call is only bounded by the gateway default
+0 errors, 2 warnings, 1 notes
+ok   writing a note can be undone, and the undo is read back
+ok   a failed write leaves nothing to undo
+ok   policy: ordinary tools are allowed
+ok   policy: drop needs approval
+not covered by any test: notes.restore
+4 passed
+```
+
+**A failing doctor, and the fix.** Break a manifest, run `doctor`, then put it back:
+
+```bash
+sed -i.bak 's/effect: reversible/effect: sort_of/' manifests/example.yaml
+rv doctor > doctor.out; echo "exit $?"
+grep -E 'FAIL|problem' doctor.out
+mv manifests/example.yaml.bak manifests/example.yaml
+rv doctor | tail -1
+```
+
+```text
+exit 1
+FAIL  engine: <scratch>/proj/manifests/example.yaml: `notes.write`: `effect` must be one of read_only, idempotent, reversible, compensable, irreversible
+1 problem to fix
+ok, with 1 warning
+```
+
+**What this proves:** a project is one folder with one config file; `doctor` finds a broken setup, names the file and the rule, and
+exits 1; the example contract and policy tests pass.
+
+## 2. Observe-first: a gateway with no manifests
+
+The aim is to put Reversi in front of an MCP server on day one, change nothing about the agent, and see what it does. The upstream
+is the real filesystem connector.
+
+```bash
+mkdir -p $T/gw/sandbox $T/gw/manifests && cd $T/gw
+echo hello > sandbox/notes.txt
+cat > reversi.config.yaml <<EOF
+manifests: ./manifests
+data: { dir: ./data, store: files }
+EOF
+cat > gateway.yaml <<EOF
+upstreams:
+  - name: fs
+    command: node
+    args: ["$REPO/packages/connectors/dist/main.js", "serve", "fs", "--root", "$T/gw/sandbox"]
+    namespace: false
+listen: { host: 127.0.0.1, port: 7700 }
+EOF
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml > gw.log 2>&1 &
+echo $! > gw.pid; waitfor 7700; cat gw.log
+```
+
+`manifests/` is empty and the config names no mode, so the gateway starts in **observe** mode. The startup banner lists every
+upstream tool and how it is classified:
+
+```text
+reversi-gateway: no manifests yet, so starting in observe mode: everything runs and is journaled. Run `reversi suggest-manifest` to draft manifests for what the upstream offers.
+reversi-connectors: serving fs on stdio
+Reversi gateway running in observe mode.
+
+WARN   fs.read_file - no manifest; treated as a change that could not be undone
+WARN   fs.list_dir - no manifest; treated as a change that could not be undone
+WARN   fs.write_file - no manifest; treated as a change that could not be undone
+...
+0 classified, 0 unclassified reads, 9 unclassified changes, 0 destructive without a manifest.
+
+9 tools have no manifest. They run (nothing is blocked) and are journaled as unclassified. Draft manifests with: reversi suggest-manifest.
+reversi-gateway: observe mode, agent endpoint http://127.0.0.1:7700/mcp, files store
+```
+
+Now act as an agent. `--run obs-1` makes every one-shot call continue the same run, as a real agent session would.
+
+```bash
+U=http://127.0.0.1:7700/mcp
+mcp $U list --run obs-1 | head -4
+mcp $U call fs.read_file '{"path":"notes.txt"}' --run obs-1
+mcp $U call fs.write_file '{"path":"todo.txt","content":"buy milk"}' --run obs-1 --reason "save a todo"
+mcp $U call fs.delete_file '{"path":"todo.txt"}' --run obs-1
+ls sandbox
+```
+
+```text
+fs.read_file                       Read a UTF-8 text file under the root.
+fs.list_dir                        List a directory under the root (default: the root itself).
+fs.write_file                      Create or overwrite a text file. The previous content is saved so roll
+fs.delete_file                     Delete a file. It is moved into the backup directory so rollback can r
+RESULT:
+{"path":"notes.txt","content":"hello\n","size":6}
+RESULT:
+{"path":"todo.txt","backup_id":"a2401029-...","existed":false}
+RESULT:
+{"path":"todo.txt","backup_id":"ce469e3d-..."}
+notes.txt
+```
+
+All three calls ran (the delete really deleted). Look at the journal:
+
+```bash
+rv runs list
+rv runs show obs-1
+```
+
+```text
+obs-1  actor=mcp-client  mode=observe  steps=3  complete
+run obs-1  actor=mcp-client  mode=observe  started 2026-10-16 17:19:18Z
+scope:
+
+steps
+    0  fs.read_file                 no manifest  succeeded
+    1  fs.write_file                no manifest  succeeded
+    2  fs.delete_file               no manifest  succeeded
+
+rollback: NOT fully reversible
+  step 2  fs.delete_file  unmanifested  no manifest was registered for this tool, so its effect is unknown
+  ...
+
+events
+      0  ...  run_started         -  by mcp-client  | mode=observe scope_seal=e3b0c442...
+      1  ...  would_block         fs.read_file  by mcp-client  | no manifest registered for tool `fs.read_file`
+      2  ...  intended            fs.read_file  by mcp-client
+      3  ...  succeeded           fs.read_file  by mcp-client
+      ...
+```
+
+Each call is a `would_block` (what enforce mode would have done), then `intended` (written before the call is forwarded), then the
+outcome. The same records as JSON Lines, and a check that the hash chain holds:
+
+```bash
+rv export --run obs-1 | wc -l
+rv export --run obs-1 | sed -n 3p | cut -c1-230
+rv verify
+```
+
+```text
+10
+{"seq":2,"ts_ms":1792171158850,"run_id":"obs-1","step":0,"actor":"mcp-client","tool":"fs.read_file","payload_hash":"327e0978...","reason":"MCP tools/call fs.read_file",...
+ok: 10 records, head d5bc5ac3...
+```
+
+**What this proves:** with no manifests and no changes to the agent, every call is forwarded and journaled with its reason, arguments
+only as a hash, and a hash-chained record; nothing is blocked; the banner tells you what to classify next.
+
+## 3. From unclassified to signed, approved manifests
+
+### 3.1 Draft manifests from the live server
+
+```bash
+kill $(cat gw.pid)
+rv suggest-manifest --gateway-config gateway.yaml --out drafts
+```
+
+```text
+reversi-connectors: serving fs on stdio
+drafts/fs.read_file.yaml  low
+drafts/fs.list_dir.yaml  low
+drafts/fs.write_file.yaml  medium
+drafts/fs.delete_file.yaml  medium
+drafts/fs.restore_file.yaml  medium
+drafts/fs.make_dir.yaml  low
+drafts/fs.remove_dir.yaml  medium
+drafts/fs.move_file.yaml  medium
+drafts/fs.unmove_file.yaml  medium
+9 drafted, 0 skipped (already have manifests)
+```
+
+The word after each file is the confidence. Every draft has `status: draft`, so none can be enforced until a person approves it.
+Read one:
+
+```bash
+cat drafts/fs.write_file.yaml
+```
+
+```text
+# DRAFT (medium confidence). Review before enforcing.
+# - undo guessed from the tool names: `fs.restore_file`; check the argument map and decide whether it is a true inverse (reversible) or leaves residue (compensable)
+tool: fs.write_file
+description: Create or overwrite a text file. The previous content is saved so rollback can restore it.
+effect: compensable
+permission: fs:write
+status: draft
+risk:
+  data_class: internal
+  blast_radius: medium
+compensation:
+  tool: fs.restore_file
+  argument_map:
+    path: $args.path
+    backup_id: $result.backup_id
+  kind: compensation
+  residue:
+    - TODO describe what the undo cannot take back
+schema_hash: 2e6a54497ec6003e
+```
+
+Tools with no obvious undo are drafted as `irreversible` with `approval: always` (the safe default); read-only names are drafted
+`read_only`. `schema_hash` is used in 5.5. Review means editing: name an owner, set a timeout, replace the `TODO`. Also remove
+two drafts on purpose, so two tools stay unclassified for scenario 4:
+
+```bash
+sed -i.bak -e 's/^    - TODO describe .*/    - the previous content comes back from the backup; the file modification time does not/' \
+           -e 's/^effect: compensable/effect: compensable\nowner: platform@example.com\ntimeout_ms: 30s/' drafts/fs.write_file.yaml
+rm drafts/fs.write_file.yaml.bak drafts/fs.move_file.yaml drafts/fs.unmove_file.yaml
+rv lint drafts | tail -4
+```
+
+```text
+warning L024  fs.restore_file: draft manifest: it is not enforceable until approved
+info    L016  fs.write_file: the undo is not verified: add compensation.verification to read back that it worked
+warning L024  fs.write_file: draft manifest: it is not enforceable until approved
+0 errors, 11 warnings, 8 notes
+```
+
+`lint` finds unsafe, incomplete or contradictory manifests (exit 1 on errors, or on warnings with `--strict`). With
+`--upstream-cmd`, `--upstream-url` or `--gateway-config` it also checks the manifests against the server's real tools.
+
+### 3.2 Contract tests for manifests
+
+A test file is a list of cases. Each runs in a sandbox: no system is touched. Write three:
+
+```bash
+mkdir tests
+cat > tests/fs.test.yaml <<'EOF'
+- name: writing a file can be undone from its backup
+  tool: fs.write_file
+  args: { path: todo.txt, content: buy milk }
+  result: { path: todo.txt, backup_id: b1, existed: false }
+  expect_plan: compensate
+  expect_handle: { path: todo.txt, backup_id: b1 }
+- name: a failed write leaves nothing to undo
+  tool: fs.write_file
+  args: { path: todo.txt, content: x }
+  fail: disk full
+- name: deleting a file is never undone
+  tool: fs.delete_file
+  args: { path: todo.txt }
+  result: { path: todo.txt, backup_id: b2 }
+  expect_plan: unrecoverable
+EOF
+rv test tests/fs.test.yaml -m drafts; echo "exit $?"
+```
+
+Drafts cannot be enforced, so the sandbox refuses them:
+
+```text
+FAIL writing a file can be undone from its backup
+       the call was refused: the manifest for `fs.write_file` is a draft: publish it before it can be enforced
+       ...
+       expected plan kind compensate, got none
+FAIL a failed write leaves nothing to undo
+       ...
+FAIL deleting a file is never undone
+       ...
+not covered by any test: fs.make_dir, fs.remove_dir, fs.restore_file
+3 of 3 failed
+exit 1
+```
+
+Test the content as it will be enforced, using a throwaway copy marked approved:
+
+```bash
+rm -rf reviewed && cp -r drafts reviewed
+sed -i.bak 's/^status: draft/status: approved/' reviewed/*.yaml && rm reviewed/*.bak
+rv test tests/fs.test.yaml -m reviewed; echo "exit $?"
+```
+
+```text
+ok   writing a file can be undone from its backup
+ok   a failed write leaves nothing to undo
+ok   deleting a file is never undone
+not covered by any test: fs.make_dir, fs.remove_dir, fs.restore_file
+3 passed
+exit 0
+```
+
+Break a test on purpose (the wrong backup id) to see a real failure:
+
+```bash
+sed 's/backup_id: b1 }/backup_id: b9 }/' tests/fs.test.yaml > tests/broken.yaml
+rv test tests/broken.yaml -m reviewed > broken.out; echo "exit $?"
+head -3 broken.out; rm tests/broken.yaml broken.out
+```
+
+```text
+exit 1
+FAIL writing a file can be undone from its backup
+       compensation argument `backup_id` is "b1", expected "b9"
+ok   a failed write leaves nothing to undo
+```
+
+### 3.3 Publish, approve and verify with a signing key
+
+```bash
+mkdir keys
+rv keygen keys/signing
+rv manifests publish drafts --registry registry --by alice --key keys/signing.key --note "first drafts from suggest-manifest"
+rv manifests approve fs.read_file --registry registry --by alice --four-eyes --key keys/signing.key; echo "exit $?"
+```
+
+```text
+wrote keys/signing.key and keys/signing.pub (key id ae0ce962c5978747)
+fs.delete_file  v1  draft  16c5f8580b19
+fs.list_dir  v1  draft  d7f9551d1c2a
+...
+fs.write_file  v1  draft  21b8d6991e45
+error: the author of a draft cannot approve it: ask someone else
+exit 1
+```
+
+`publish` makes drafts by default. `--four-eyes` forbids the author approving their own draft. A different person approves
+(each approval is a new, signed version):
+
+```bash
+for t in $(ls drafts | sed 's/\.yaml$//'); do
+  rv manifests approve $t --registry registry --by bob --four-eyes --key keys/signing.key --note reviewed
+done
+rv manifests list --registry registry
+rv manifests history fs.write_file --registry registry
+rv manifests diff fs.write_file 1 2 --registry registry | grep '^[-+]'
+rv manifests verify --registry registry --trust keys/signing.pub
+```
+
+```text
+fs.delete_file  v2  approved by bob
+...
+fs.delete_file                           v2  approved
+fs.list_dir                              v2  approved
+fs.make_dir                              v2  approved
+fs.read_file                             v2  approved
+fs.remove_dir                            v2  approved
+fs.restore_file                          v2  approved
+fs.write_file                            v2  approved
+v1  draft       2026-10-16T17:22:36Z  by alice  21b8d6991e45  signed  - first drafts from suggest-manifest
+v2  approved    2026-10-16T17:22:37Z  by alice, approved by bob  3cec779960c1  signed  - reviewed
+-  "version": 1,
+-  "status": "draft",
++  "version": 2,
++  "status": "approved",
+ok: 7 tools, every version verifies
+```
+
+(`manifests deprecate` and `manifests rollback <tool> <version>` complete the set; not run here.)
+
+### 3.4 Use the registry as the manifests source, then tamper with it
+
+Point the project at the registry and require its signature. The gateway, the server and the CLI all read these two settings:
+
+```bash
+cat > reversi.config.yaml <<EOF
+manifests: ./registry
+manifest_public_key: ./keys/signing.pub
+data: { dir: ./data, store: files }
+EOF
+rmdir manifests
+rv doctor | grep -E 'registry|manifests load'
+rv validate registry
+```
+
+```text
+ok    manifest registry <scratch>/gw/registry: every version verifies
+ok    7 manifests load
+ok: 7 tool manifests valid
+```
+
+`validate`, `lint`, `test` and `plan` read a registry folder too (the current non-draft version of each tool).
+
+Now change one registry file behind the registry's back (grant `fs.write_file` a weaker permission):
+
+```bash
+cp registry/tools/fs.write_file/v2.json $T/v2.good
+sed -i.bak 's/"permission": "fs:write"/"permission": "fs:read"/' registry/tools/fs.write_file/v2.json && rm registry/tools/fs.write_file/v2.json.bak
+rv manifests verify --registry registry --trust keys/signing.pub; echo "exit $?"
+rv doctor | grep FAIL
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml 2>&1 | head -1
+```
+
+```text
+BAD `fs.write_file` v2 was changed outside the registry: its checksum does not match the index
+exit 1
+FAIL  manifest registry: `fs.write_file` v2 was changed outside the registry: its checksum does not match the index
+FAIL  engine: `fs.write_file` v2 was changed outside the registry: its checksum does not match the index
+error: `fs.write_file` v2 was changed outside the registry: its checksum does not match the index
+```
+
+`verify`, `doctor` and the gateway all refuse the tampered registry; the gateway does not start: it prints that one-line error (exit code 64) followed by its usage text, not a stack trace. Restore
+the file:
+
+```bash
+cp $T/v2.good registry/tools/fs.write_file/v2.json
+rv manifests verify --registry registry --trust keys/signing.pub
+```
+
+```text
+ok: 7 tools, every version verifies
+```
+
+**What this proves:** drafts are generated from the real server, tests and lint run before anything is enforceable, approval is a
+separate signed step by a second person, and any after-the-fact edit to the registry is detected.
+
+## 4. Switch to enforce
+
+Create keys for an agent, an approver, an operator and an admin (only SHA-256 hashes are stored), and an enforcing config:
+
+```bash
+AGENT=agent-$(openssl rand -hex 8); APPR=appr-$(openssl rand -hex 8); OPS=ops-$(openssl rand -hex 8); ROOT=root-$(openssl rand -hex 8)
+cat > keys.json <<EOF
+[
+  { "name": "fs-agent", "role": "agent",    "key_sha256": "$(sha $AGENT)", "max_permissions": ["fs:read","fs:write","fs:admin"] },
+  { "name": "alice",    "role": "approver", "key_sha256": "$(sha $APPR)" },
+  { "name": "dana",     "role": "operator", "key_sha256": "$(sha $OPS)" },
+  { "name": "root",     "role": "admin",    "key_sha256": "$(sha $ROOT)" }
+]
+EOF
+sed -i.bak 's/^upstreams:/mode: enforce\nupstreams:/' gateway.yaml && rm gateway.yaml.bak
+echo 'auth: { keys: keys.json }' >> gateway.yaml
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml > gw.log 2>&1 &
+echo $! > gw.pid; waitfor 7700; cat gw.log
+```
+
+```text
+reversi-connectors: serving fs on stdio
+Reversi gateway running in enforce mode.
+
+OK     fs.read_file - read_only
+OK     fs.list_dir - read_only
+OK     fs.write_file - compensable
+OK     fs.delete_file - irreversible
+OK     fs.restore_file - idempotent
+OK     fs.make_dir - irreversible
+OK     fs.remove_dir - irreversible
+WARN   fs.move_file - no manifest; treated as a change that could not be undone
+WARN   fs.unmove_file - no manifest; treated as a change that could not be undone
+
+7 classified, 0 unclassified reads, 2 unclassified changes, 0 destructive without a manifest.
+
+2 tools have no manifest and are blocked. Draft them with: reversi suggest-manifest, review, then reversi manifests publish.
+reversi-gateway: enforce mode, agent endpoint http://127.0.0.1:7700/mcp, files store
+```
+
+The registry's manifests are enforced, and the observe-mode journal from scenario 2 is still in the same data directory.
+
+```bash
+agent() { mcp $U "$@" --token $AGENT --run enf-1; }
+echo "-- unclassified tool"
+agent call fs.move_file '{"from":"notes.txt","to":"moved.txt"}'
+echo "-- allowed call"
+agent call fs.write_file '{"path":"notes.txt","content":"changed by agent"}' --reason "update notes"
+cat sandbox/notes.txt; echo
+echo "-- approval required"
+agent call fs.delete_file '{"path":"notes.txt"}'
+rv approvals list
+```
+
+```text
+-- unclassified tool
+ERROR RESULT:
+Blocked by Reversi: no manifest registered for tool `fs.move_file`
+-- allowed call
+RESULT:
+{"path":"notes.txt","backup_id":"a5cda514-...","existed":true}
+changed by agent
+-- approval required
+ERROR RESULT:
+Blocked by Reversi: approval required: request apr_39763c04-... is pending an operator decision; retry after it is approved
+apr_39763c04-...  pending  run=enf-1  call  fs.delete_file  args=[path]  why: manifest requires approval
+```
+
+Approve from the CLI (it shares the data directory with the gateway), then the agent retries:
+
+```bash
+ID=$(rv approvals list | awk '{print $1}' | head -1)
+rv approvals approve $ID --as alice --note "checked the ticket"
+agent call fs.delete_file '{"path":"notes.txt"}'
+ls sandbox
+rv approvals list
+rv export --run enf-1 | jq -r 'select(.event=="approved") | .actor + ": " + .detail' | cut -c1-110
+```
+
+```text
+apr_39763c04-... approved by alice
+RESULT:
+{"path":"notes.txt","backup_id":"62beadea-..."}
+apr_39763c04-...  consumed  run=enf-1  call  fs.delete_file  args=[path]  why: manifest requires approval
+alice: approval apr_39763c04-... approved by alice; the call must be retried
+```
+
+The CLI decides through the engine, so the decision is in the ledger (an `approved` record with the approver as actor), delegations apply, and notification channels in the config are told.
+
+The approval is single-use (`consumed`). `ls sandbox` prints nothing: the file is gone.
+
+### Rollback
+
+Two writes in a new run, then see what a rollback would do:
+
+```bash
+echo restore-me > sandbox/keep.txt
+a3() { mcp $U "$@" --token $AGENT --run enf-3; }
+a3 call fs.write_file '{"path":"keep.txt","content":"overwritten"}' > /dev/null
+a3 call fs.write_file '{"path":"new.txt","content":"brand new"}' > /dev/null
+ls sandbox; cat sandbox/keep.txt; echo
+rv plan enf-3
+```
+
+```text
+keep.txt
+new.txt
+overwritten
+rollback plan for enf-3
+  step 1  fs.write_file  compensate  -> fs.restore_file
+  step 0  fs.write_file  compensate  -> fs.restore_file
+fully reversible (assuming each compensation succeeds)
+```
+
+The gateway holds the connection to the upstream, so the rollback that works against a gateway is the **operator endpoint**: it
+calls each compensation on the upstream, newest first. Without `confirm` it is a dry run.
+
+```bash
+op() { mcp http://127.0.0.1:7700/operator/mcp "$@" --token $OPS; }
+mcp http://127.0.0.1:7700/operator/mcp list --token $AGENT
+op call reversi.execute_rollback '{"run_id":"enf-3"}' | head -12
+op call reversi.execute_rollback '{"run_id":"enf-3","confirm":true}' | grep -E 'dry_run|complete'
+ls sandbox; cat sandbox/keep.txt
+rv runs show enf-3 | tail -5
+rv verify
+```
+
+```text
+could not connect: Streamable HTTP error: Error POSTing to endpoint: {"error":"auditor role or higher required"}
+RESULT:
+{
+  "dry_run": true,
+  "plan": {
+    "run_id": "enf-3",
+    "actions": [
+      {
+        "step": 1,
+        "tool": "fs.write_file",
+        "kind": "compensate",
+        "compensation_tool": "fs.restore_file",
+...
+  "dry_run": false,
+    "complete": true
+keep.txt
+restore-me
+     24  ...  compensating        fs.restore_file  by dana  | idempotency_key=f7b454af...
+     25  ...  compensated         fs.restore_file  by dana
+     26  ...  compensating        fs.restore_file  by dana  | idempotency_key=f49bdada...
+     27  ...  compensated         fs.restore_file  by dana
+ok: 28 records, head 4141ffba...
+```
+
+`new.txt` is gone and `keep.txt` has its old text. The agent key cannot even connect to the operator endpoint.
+
+<Note>
+`reversi rollback <run> --compensator-cmd '...'` is the CLI path for a compensator you supply (a script that undoes a call). It
+only trusts that command's exit code, so it is not used here: a command that exits 0 without undoing anything marks the step
+compensated. For a gateway, use the operator endpoint above (or the console).
+</Note>
+
+**What this proves:** the unclassified tool is blocked, an allowed call runs, an approval-required call is blocked until a named
+approver decides and then runs once, and a run is rolled back through the same upstream with every step in the ledger.
+
+Stop this gateway:
+
+```bash
+kill $(cat gw.pid)
+```
+
+## 5. Gateway features
+
+A small upstream of our own, so every feature can be triggered. It has four tools: `notes_get` and `notes_slow` and `notes_flaky`
+(read-only hint) and `notes_add`. `notes_flaky` fails twice per id, then works. Creating `drift.flag` changes `notes_add`'s schema.
+
+```bash
+mkdir $T/feat && cd $T/feat
+ln -s $REPO/node_modules node_modules          # so the script finds @modelcontextprotocol/sdk
+cat > notes-server.mjs <<'EOF'
+import { existsSync } from "node:fs";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+
+const notes = new Map();
+const attempts = new Map();
+const tools = () => [
+  { name: "notes_get", description: "Read a note.", annotations: { readOnlyHint: true },
+    inputSchema: { type: "object", properties: { id: { type: "string", minLength: 1 } }, required: ["id"], additionalProperties: false } },
+  { name: "notes_add", description: "Create a note (safe to repeat).",
+    inputSchema: { type: "object", properties: { title: { type: "string", minLength: 1 }, priority: { type: "integer", minimum: 1, maximum: 5 },
+      ...(existsSync("drift.flag") ? { tags: { type: "array", items: { type: "string" } } } : {}) }, required: ["title", "priority"], additionalProperties: false } },
+  { name: "notes_slow", description: "Answer after a delay.", annotations: { readOnlyHint: true },
+    inputSchema: { type: "object", properties: { ms: { type: "integer" } }, required: ["ms"] } },
+  { name: "notes_flaky", description: "Fails twice per id, then works.", annotations: { readOnlyHint: true },
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+];
+const server = new Server({ name: "notes", version: "1" }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: a = {} } = req.params;
+  const say = (o) => ({ content: [{ type: "text", text: JSON.stringify(o) }] });
+  if (name === "notes_add") { const id = `n${notes.size + 1}`; notes.set(id, a); return say({ id, ...a }); }
+  if (name === "notes_get") return say(notes.get(a.id) ?? { error: "no such note" });
+  if (name === "notes_slow") { await new Promise((r) => setTimeout(r, a.ms)); return say({ waited: a.ms }); }
+  if (name === "notes_flaky") {
+    const n = (attempts.get(a.id) ?? 0) + 1; attempts.set(a.id, n);
+    if (n < 3) throw new Error(`temporary failure (attempt ${n})`);
+    return say({ id: a.id, attempts: n });
+  }
+  throw new Error(`unknown tool ${name}`);
+});
+await server.connect(new StdioServerTransport());
+EOF
+rv suggest-manifest --upstream-cmd node --upstream-arg notes-server.mjs --server notes --out drafts > /dev/null 2>&1
+mkdir manifests && cp drafts/*.yaml manifests/
+sed -i.bak -e '/^# /d' -e 's/^status: draft/status: approved/' -e 's/^effect: irreversible/effect: idempotent/' -e 's/^approval: always/approval: never/' manifests/*.yaml && rm manifests/*.bak
+echo 'timeout_ms: 500ms' >> manifests/notes_slow.yaml
+printf 'timeout_ms: 2s\nretry: { attempts: 3, base_ms: 100 }\n' >> manifests/notes_flaky.yaml
+rv validate manifests
+rv lint manifests | tail -1
+```
+
+```text
+ok: 4 tool manifests valid
+0 errors, 1 warnings, 1 notes
+```
+
+Here the reviewed drafts were approved in bulk (the page's point is the gateway, not the review). `notes_add` is declared
+`idempotent` and `notes_slow` has a 500 ms timeout; `notes_flaky` allows 3 attempts (retry is only accepted for `read_only` and
+`idempotent` tools, because repeating anything else could repeat its effect).
+
+Keys for this gateway, a config in **advise** mode, and start it:
+
+```bash
+AGENT=agent-$(openssl rand -hex 8); OPS=ops-$(openssl rand -hex 8)
+cat > keys.json <<EOF
+[
+  { "name": "notes-agent", "role": "agent",    "key_sha256": "$(sha $AGENT)", "max_permissions": ["notes:read","notes:admin"] },
+  { "name": "dana",        "role": "operator", "key_sha256": "$(sha $OPS)" }
+]
+EOF
+cat > gateway.yaml <<EOF
+mode: advise
+upstreams:
+  - { name: notes, command: node, args: ["$T/feat/notes-server.mjs"], cwd: "$T/feat", namespace: false }
+listen: { host: 127.0.0.1, port: 7701 }
+auth: { keys: keys.json }
+EOF
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml --manifests manifests --data data5 > gw.log 2>&1 &
+echo $! > gw.pid; waitfor 7701; tail -9 gw.log
+```
+
+```text
+Reversi gateway running in advise mode.
+
+OK     notes_get - read_only
+OK     notes_add - idempotent
+OK     notes_slow - read_only
+OK     notes_flaky - read_only
+
+4 classified, 0 unclassified reads, 0 unclassified changes, 0 destructive without a manifest.
+reversi-gateway: advise mode, agent endpoint http://127.0.0.1:7701/mcp, files store
+```
+
+### 5.1 Advise mode: an advisory is appended, nothing is blocked
+
+```bash
+U=http://127.0.0.1:7701/mcp
+ag() { mcp $U "$@" --token $AGENT --run f-1; }
+ag call notes_add '{"title":"buy milk","priority":2}'
+ag call notes_add '{"title":"","priority":9}'
+rv search --event would_block --run f-1 -d data5 -m manifests
+```
+
+```text
+RESULT:
+{"id":"n1","title":"buy milk","priority":2}
+RESULT:
+{"id":"n2","title":"","priority":9}
+Reversi advisory (nothing was blocked): arguments do not match the tool's input schema: $.title: shorter than 1; $.priority: above maximum 5
+     3  ...  f-1#1  would_block         notes_add  notes-agent  | arguments do not match the tool's input schema: $.title: shorter than 1; $.priority: above
+```
+
+The call ran, the result carries an extra text block saying what enforce mode would have done, and the ledger has a `would_block`.
+
+### 5.2 Enforce: schema validation, timeout, retry
+
+Gateway arguments are checked against the upstream tool's own `inputSchema` (and results against its `outputSchema`) unless
+`validate_schemas: false`. Restart in enforce mode:
+
+```bash
+kill $(cat gw.pid)
+sed -i.bak 's/^mode: advise/mode: enforce/' gateway.yaml && rm gateway.yaml.bak
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml --manifests manifests --data data5 > gw.log 2>&1 &
+echo $! > gw.pid; waitfor 7701
+ag() { mcp $U "$@" --token $AGENT --run f-2; }
+ag call notes_add '{"title":"buy milk","priority":2}'
+ag call notes_add '{"title":"","priority":9}'
+ag call notes_add '{"title":"x"}'
+echo "-- timeout"
+ag call notes_slow '{"ms":100}'
+ag call notes_slow '{"ms":2000}'
+echo "-- retry"
+ag call notes_flaky '{"id":"a"}'
+```
+
+```text
+RESULT:
+{"id":"n1","title":"buy milk","priority":2}
+ERROR RESULT:
+Blocked by Reversi: arguments do not match the tool's input schema: $.title: shorter than 1; $.priority: above maximum 5
+ERROR RESULT:
+Blocked by Reversi: arguments do not match the tool's input schema: $: missing required `priority`
+-- timeout
+RESULT:
+{"waited":100}
+request failed: MCP error -32603: upstream did not answer within 500 ms
+-- retry
+RESULT:
+{"id":"a","attempts":3}
+```
+
+The 2000 ms call hits the manifest's `timeout_ms` and is journaled as `uncertain` (the gateway cannot know whether it finished; see
+`reversi runs show f-2`). `notes_flaky` threw twice; the gateway retried (100 ms, then 200 ms backoff) and the third attempt
+succeeded: `"attempts":3` is the upstream's own count. Retry never applies to a tool that is not `read_only` or `idempotent`.
+
+### 5.3 Hot reload: a manifest edit, and a broken edit
+
+The gateway polls the manifest files (every 2 s by default; `reload.watch` and `reload.interval` in the project config; `SIGHUP`
+forces it). Remove one manifest while it runs:
+
+```bash
+mkdir held && mv manifests/notes_get.yaml held/
+sleep 4; tail -1 gw.log
+mcp $U call notes_get '{"id":"n1"}' --token $AGENT --run f-3
+```
+
+```text
+reversi [info] reloaded: 3 manifests, policy none
+ERROR RESULT:
+Blocked by Reversi: no manifest registered for tool `notes_get`
+```
+
+Now a broken edit, then restore the file. The bad file must be rejected and the old configuration kept:
+
+```bash
+cp manifests/notes_slow.yaml held/
+sed -i.bak 's/^effect: read_only/effect: nonsense/' manifests/notes_slow.yaml && rm manifests/notes_slow.yaml.bak
+sleep 4; tail -2 gw.log
+mcp $U call notes_slow '{"ms":10}' --token $AGENT --run f-3
+cp held/notes_slow.yaml manifests/notes_slow.yaml
+```
+
+```text
+reversi [info] reloaded: 3 manifests, policy none
+reversi [error] reload failed, keeping the previous manifests and policy: manifests/notes_slow.yaml: `notes_slow`: `effect` must be one of read_only, idempotent, reversible, compensable, irreversible
+RESULT:
+{"waited":10}
+```
+
+The call still works under the previous, valid configuration.
+
+### 5.4 `unclassified_reads: observe`
+
+A tool with no manifest that the server itself annotates read-only can be let through (journaled as unclassified, in a separate
+observe-mode run named `<run>-reads`) while every other unclassified tool stays blocked. `notes_get` has no manifest right now:
+
+```bash
+kill $(cat gw.pid)
+sed -i.bak 's/^mode: enforce/mode: enforce\nunclassified_reads: observe/' gateway.yaml && rm gateway.yaml.bak
+node $REPO/packages/gateway/dist/main.js --config gateway.yaml --manifests manifests --data data5 >> gw.log 2>&1 &
+echo $! > gw.pid; waitfor 7701
+grep -E '^NOTE' gw.log | tail -1
+mcp $U call notes_get '{"id":"n1"}' --token $AGENT --run f-3
+rv runs list -d data5 -m manifests | grep f-3
+rv runs show f-3-reads -d data5 -m manifests | grep -E 'unclassified read|^steps|^ +0  notes'
+```
+
+```text
+NOTE   notes_get - no manifest; the server says it is read-only (unverified)
+RESULT:
+{"error":"no such note"}
+f-3  actor=notes-agent  mode=enforce  steps=1  complete
+f-3-reads  actor=notes-agent  mode=observe  steps=1  complete
+steps
+    0  notes_get                    no manifest  succeeded
+      24  ...  intended            notes_get  by notes-agent  | unclassified read: the server says it is read-only; this is unverified
+```
+
+(The `no such note` answer is the upstream's: it was restarted, so its notes are gone.) The call ran and is marked unverified. Put
+the manifest back; the running gateway picks it up:
+
+```bash
+mv held/notes_get.yaml manifests/
+sleep 4; tail -1 gw.log
+```
+
+```text
+reversi [info] reloaded: 4 manifests, policy none
+```
+
+### 5.5 Schema drift
+
+Each manifest can carry the `schema_hash` of the tool's schema as it was when someone reviewed it (`suggest-manifest` writes it).
+If the upstream later changes the schema, the gateway refuses the call until the manifest is reviewed again. Change the upstream's
+schema, wait out the gateway's 5 s tool-list cache, and call:
+
+```bash
+touch drift.flag; sleep 6
+mcp $U call notes_add '{"title":"after drift","priority":1}' --token $AGENT --run f-4
+```
+
+```text
+ERROR RESULT:
+Blocked by Reversi: the tool's input schema changed since its manifest was approved: review the manifest again
+```
+
+Review, then record the new hash. The new value comes from a fresh draft; the running gateway reloads the manifest:
+
+```bash
+rv suggest-manifest --upstream-cmd node --upstream-arg notes-server.mjs --server notes --out drafts2 > /dev/null 2>&1
+grep schema_hash manifests/notes_add.yaml drafts2/notes_add.yaml
+NEW=$(grep '^schema_hash' drafts2/notes_add.yaml | cut -d' ' -f2)
+sed -i.bak "s/^schema_hash: .*/schema_hash: $NEW/" manifests/notes_add.yaml && rm manifests/notes_add.yaml.bak
+sleep 4
+mcp $U call notes_add '{"title":"after drift","priority":1,"tags":["a"]}' --token $AGENT --run f-4
+```
+
+```text
+manifests/notes_add.yaml:schema_hash: 7941405d5073f08d
+drafts2/notes_add.yaml:schema_hash: f26233af61faf95f
+RESULT:
+{"id":"n1","title":"after drift","priority":1,"tags":["a"]}
+```
+
+### 5.6 `reversi.classification`, `reversi.preview_impact`, `reversi.suggest_manifest`
+
+`reversi.preview_impact` is on the agent endpoint (an agent can ask "would this be allowed, and could it be undone?" before it
+tries). `reversi.classification` and `reversi.suggest_manifest` are on the **operator** endpoint only, so they need an operator
+key. The tiny client is the same `mcp.mjs` used throughout.
+
+```bash
+op() { mcp http://127.0.0.1:7701/operator/mcp "$@" --token $OPS; }
+mcp $U call reversi.preview_impact '{"tool":"notes_add","arguments":{"title":"x","priority":1}}' --token $AGENT --run f-4 | grep -E '"(verdict|effect)"'
+mcp $U call reversi.preview_impact '{"tool":"nope"}' --token $AGENT --run f-4 | grep -E '"(verdict|known)"|unclassified'
+op call reversi.classification | grep -E '"(name|class)"'
+op call reversi.suggest_manifest
+mcp $U list --token $AGENT --run f-4 | grep -c -E 'classification|suggest_manifest'
+```
+
+```text
+  "effect": "idempotent",
+  "verdict": "allow",
+  "known": false,
+  "verdict": "block",
+    "unclassified tool"
+      "name": "notes_get",
+      "class": "classified",
+      "name": "notes_add",
+      "class": "classified",
+      "name": "notes_slow",
+      "class": "classified",
+      "name": "notes_flaky",
+      "class": "classified",
+RESULT:
+{
+  "suggestions": [],
+  "skipped": [
+    "notes_get",
+    "notes_add",
+    "notes_slow",
+    "notes_flaky"
+  ]
+}
+0
+```
+
+`suggestions` is empty because every upstream tool already has a manifest (they are `skipped`). The last line shows the agent
+cannot list the other two tools. Stop the gateway:
+
+```bash
+kill $(cat gw.pid)
+```
+
+**What this proves:** advise mode never blocks; enforce mode validates arguments against the upstream's schema, applies per-tool
+timeouts and safe retries, and notices schema drift; manifest edits take effect without a restart, and a broken one is rejected
+while the old set stays in force; the agent can ask what a call would do before making it.
+
+## 6. GitOps with `reversi apply`
+
+`reversi apply <dir>` makes a registry (and policy) match a directory kept in git. Only differences are published; **nothing is
+ever deleted** (`--prune` deprecates tools that left the directory). The directory holds `manifests/*.yaml` (or manifest files
+at the top level) and, optionally, `policy.yaml`.
+
+```bash
+mkdir -p $T/ap/desired/manifests && cd $T/ap
+cp $T/feat/manifests/*.yaml desired/manifests/
+cat > desired/policy.yaml <<'EOF'
+version: 1
+rules:
+  - id: no-big-priority
+    match: { tool: notes_add }
+    when: [{ path: $args.priority, op: gt, value: 3 }]
+    action: require_approval
+    reason: high priority notes need a person
+tests:
+  - { name: low priority is fine, input: { tool: notes_add, args: { priority: 1 } }, expect: allow }
+  - { name: high priority needs approval, input: { tool: notes_add, args: { priority: 5 } }, expect: require_approval }
+EOF
+ls -R desired
+```
+
+```text
+desired:
+manifests
+policy.yaml
+
+desired/manifests:
+notes_add.yaml
+notes_flaky.yaml
+notes_get.yaml
+notes_slow.yaml
+```
+
+### 6.1 Dry run and the drift check
+
+```bash
+rv apply desired --registry reg --policy-dir pol --by gitops --dry-run --detailed-exitcode; echo "exit $?"
+ls reg pol 2>&1
+```
+
+```text
++ manifest notes_add
++ manifest notes_flaky
++ manifest notes_get
++ manifest notes_slow
++ policy   policy
+5 changes (dry run: nothing applied)
+exit 2
+ls: pol: No such file or directory
+ls: reg: No such file or directory
+```
+
+Exit 2 means "there are changes" and nothing was written. `--detailed-exitcode` sets exit 2 only together with `--dry-run`
+(without `--dry-run` a successful apply exits 0). Use it as a CI drift check.
+
+### 6.2 Apply, re-apply, edit, prune
+
+```bash
+rv apply desired --registry reg --policy-dir pol --by gitops --key $T/gw/keys/signing.key --note "initial import"
+echo "-- again"
+rv apply desired --registry reg --policy-dir pol --by gitops --key $T/gw/keys/signing.key; echo "exit $?"
+rv manifests verify --registry reg --trust $T/gw/keys/signing.pub
+```
+
+```text
++ manifest notes_add
+...
+5 changes
+applied notes_add v1 (approved)
+applied notes_flaky v1 (approved)
+applied notes_get v1 (approved)
+applied notes_slow v1 (approved)
+applied policy v1
+-- again
+  manifest notes_add  unchanged
+  ...
+  policy   policy  unchanged
+up to date
+exit 0
+ok: 4 tools, every version verifies
+```
+
+Manifests are applied as `approved` because the directory in git is the reviewed source of truth (`--status draft` to apply drafts).
+The second run changes nothing. Edit one file and apply again:
+
+```bash
+sed -i.bak 's/^timeout_ms: 500ms/timeout_ms: 1s/' desired/manifests/notes_slow.yaml && rm desired/manifests/*.bak
+rv apply desired --registry reg --policy-dir pol --by gitops --key $T/gw/keys/signing.key --dry-run --detailed-exitcode; echo "exit $?"
+rv apply desired --registry reg --policy-dir pol --by gitops --key $T/gw/keys/signing.key --note "slow timeout 1s"
+rv manifests diff notes_slow 1 2 --registry reg | grep '^[-+]'
+```
+
+```text
+  manifest notes_add  unchanged
+  manifest notes_flaky  unchanged
+  manifest notes_get  unchanged
+~ manifest notes_slow  (v1 differs)
+  policy   policy  unchanged
+1 change (dry run: nothing applied)
+exit 2
+...
+applied notes_slow v2 (approved)
+-  "version": 1,
++  "version": 2,
+-  "timeout_ms": 500,
++  "timeout_ms": 1000,
+```
+
+Remove a file from the directory. Without `--prune` the dry run reports nothing; with it the tool is deprecated, not deleted:
+
+```bash
+rm desired/manifests/notes_flaky.yaml
+rv apply desired --registry reg --policy-dir pol --by gitops --dry-run | tail -1
+rv apply desired --registry reg --policy-dir pol --by gitops --key $T/gw/keys/signing.key --prune
+rv manifests list --registry reg
+```
+
+```text
+up to date
+  manifest notes_add  unchanged
+  manifest notes_get  unchanged
+  manifest notes_slow  unchanged
+- manifest notes_flaky  (not in the directory)
+  policy   policy  unchanged
+1 change
+deprecated notes_flaky
+notes_add                                v1  approved
+notes_flaky                              v2  deprecated
+notes_get                                v1  approved
+notes_slow                               v2  approved
+```
+
+### 6.3 Against a running server
+
+A server only accepts registry changes if its manifests and policy are versioned folders, so seed one with `apply`, then start the
+server on them with an admin key and an operator key:
+
+```bash
+mkdir -p seed/manifests && cp $T/feat/manifests/notes_get.yaml seed/manifests/ && printf 'version: 1\nrules: []\n' > seed/policy.yaml
+rv apply seed --registry srv-reg --policy-dir srv-pol --by seed --key $T/gw/keys/signing.key | tail -2
+SROOT=root-$(openssl rand -hex 8); SOPS=ops-$(openssl rand -hex 8)
+cat > srv-keys.json <<EOF
+[
+  { "name": "dana", "role": "operator", "key_sha256": "$(sha $SOPS)" },
+  { "name": "root", "role": "admin",    "key_sha256": "$(sha $SROOT)" }
+]
+EOF
+REVERSI_MANIFESTS=srv-reg REVERSI_POLICY=srv-pol REVERSI_KEYS=srv-keys.json REVERSI_DATA=srv-data \
+REVERSI_SIGNING_KEY=$T/gw/keys/signing.key PORT=7702 node $REPO/packages/server/dist/main.js > srv.log 2>&1 &
+echo $! > srv.pid; waitfor 7702; cat srv.log
+```
+
+```text
+applied notes_get v1 (approved)
+applied policy v1
+reversi-server listening on http://127.0.0.1:7702 (1 tools, files store, console off)
+```
+
+```bash
+S=http://127.0.0.1:7702
+rv apply desired --server $S --token $SROOT --dry-run --detailed-exitcode; echo "exit $?"
+echo "-- operator key"
+rv apply desired --server $S --token $SOPS; echo "exit $?"
+echo "-- admin key"
+rv apply desired --server $S --token $SROOT --note "from git"; echo "exit $?"
+rv apply desired --server $S --token $SROOT | tail -1
+cat srv.log | tail -3
+```
+
+```text
++ manifest notes_add
+  manifest notes_get  unchanged
++ manifest notes_slow
+~ policy   policy
+3 changes (dry run: nothing applied)
+exit 2
+-- operator key
++ manifest notes_add
+  manifest notes_get  unchanged
++ manifest notes_slow
+~ policy   policy
+3 changes
+error: POST /v1/registry/manifests: 403 admin role required
+exit 1
+-- admin key
+...
+applied notes_add v1 (approved)
+applied notes_slow v1 (approved)
+applied policy v2
+exit 0
+up to date
+reversi [info] reloaded: 2 manifests, policy 10ddd32c
+reversi [info] reloaded: 3 manifests, policy 10ddd32c
+reversi [info] reloaded: 3 manifests, policy 4cd2f41a
+```
+
+An operator key can read the registry (so it can compute the plan) but is refused when the plan would publish an approved
+manifest or a policy: that takes the admin role. The server reloads its configuration after each applied change. Stop everything
+and clean up:
+
+```bash
+kill $(cat srv.pid)
+rm -rf $T
+```
+
+**What this proves:** a directory in git is the source of truth; `--dry-run --detailed-exitcode` detects drift without changing
+anything; apply is idempotent and signs what it publishes; removal is a deprecation, never a deletion; and a server applies only
+for an admin key.
+
+## Not covered here
+
+- The console (browser) screens for manifests, policy versions and connector health; see [the console](/console).
+- `reversi manifests deprecate` and `manifests rollback`, and policy versions on their own.
+- A remote `https` manifests source and `manifest_public_key` against it; only a local registry folder was exercised.
+- `reversi rollback --compensator-cmd` with a real compensator (shown only as a caution in scenario 4), and `--verify-cmd` and `--reader-cmd`.
+- Gateway OIDC authentication, `allow` and `deny` lists, and several upstreams at once.
+- The Helm chart, Dockerfile and live third-party connectors are written but not exercised against real clusters or services in this
+  repository's own test pass.
+- OIDC browser-redirect login for the console is not built (login is an API key or an OIDC access token).

@@ -9,6 +9,7 @@ import {
   type ApiKey,
   type Capability,
   type Principal,
+  type Role,
   ApprovalError,
   LedgerError,
   RUN_ID_PATTERN,
@@ -20,11 +21,13 @@ import {
   renderReport,
   toJsonl,
   type Approvals,
+  type Delegations,
   type Mode,
   type Outcome,
   type SigningKey,
 } from "@multimindlab/reversi";
-import { mountConsole } from "./console.js";
+import { mountConsole, type ConsoleMode } from "./console.js";
+import { ApiError, mountExtras, type ExtraOptions } from "./extras.js";
 import { Metrics } from "./metrics.js";
 
 export interface LogEntry {
@@ -36,10 +39,14 @@ export interface LogEntry {
   principal: string | null;
 }
 
-export interface AppOptions {
+export type { ConnectorInfo, RollbackState } from "./extras.js";
+
+export interface AppOptions extends ExtraOptions {
   /** The engine's approver should be `approvals.asApprover()`. */
   reversi: Reversi;
   approvals: Approvals;
+  /** Enables delegation endpoints. */
+  delegations?: Delegations;
   keys: ApiKey[] | KeyRing;
   oidc?: OidcVerifier;
   /** Enables signed evidence bundles. */
@@ -52,6 +59,12 @@ export interface AppOptions {
   /** Signs console session cookies. Random per process by default, so sessions end on restart. */
   session_secret?: string;
   secure_cookies?: boolean;
+  /**
+   * The operator console. `off` (default) serves nothing. `open` has no login, answers only requests addressed to the
+   * loopback interface from the same origin, and acts with a fixed role (default operator, never admin). `login` asks
+   * for an API key or OIDC token.
+   */
+  console?: { mode: ConsoleMode; role?: Role };
   now?: () => number;
 }
 
@@ -202,9 +215,9 @@ export function createApp(opts: AppOptions): Hono {
       if (extra.length) throw new HttpError(403, `permissions exceed this key's cap: ${extra.join(", ")}`);
     }
     const mode = b.mode ?? "enforce";
-    if (mode !== "enforce" && mode !== "observe") throw new HttpError(400, "`mode` must be enforce or observe");
-    // Observe mode lets violating calls run, so an agent must not be able to pick it for itself.
-    if (mode === "observe" && !who.allow_observe) {
+    if (mode !== "enforce" && mode !== "observe" && mode !== "advise") throw new HttpError(400, "`mode` must be enforce, observe or advise");
+    // Observe and advise mode let violating calls run, so an agent must not be able to pick them for itself.
+    if (mode !== "enforce" && !who.allow_observe) {
       throw new HttpError(403, "this credential may not open observe-mode runs (key option `allow_observe`)");
     }
     const run = reversi.startRun({
@@ -212,6 +225,7 @@ export function createApp(opts: AppOptions): Hono {
       actor: who.name,
       scope: SealedScope.seal(perms as string[]),
       mode: mode as Mode,
+      tenant: who.tenant,
       reason: str(b, "reason", { optional: true }),
     });
     const s = run.state();
@@ -314,20 +328,72 @@ export function createApp(opts: AppOptions): Hono {
     return c.json({ approvals: approvals.list({ status: status as never, run_id: c.req.query("run_id") }) });
   });
 
+  const identityOf = (p: Principal) => ({ roles: p.roles as string[], groups: p.groups ?? [] });
   for (const decision of ["approve", "deny"] as const) {
     app.post(`/v1/approvals/:id/${decision}`, async (c) => {
       need(c, "approve");
       const b = c.req.header("content-length") === "0" ? {} : await body(c).catch(() => ({}));
       const note = typeof b.note === "string" && b.note.trim() ? b.note : undefined;
-      const by = c.get("who").name;
+      const who = c.get("who");
       try {
-        return c.json(decision === "approve" ? approvals.approve(c.req.param("id"), by, note) : approvals.deny(c.req.param("id"), by, note));
+        return c.json(
+          decision === "approve"
+            ? approvals.approve(c.req.param("id"), who.name, note, identityOf(who))
+            : approvals.deny(c.req.param("id"), who.name, note, identityOf(who)),
+        );
       } catch (e) {
-        if (e instanceof ApprovalError) throw new HttpError(/not found/.test(e.message) ? 404 : 409, e.message);
+        if (e instanceof ApprovalError) throw new HttpError(/not found/.test(e.message) ? 404 : /needs an approver|cannot decide|already decided/.test(e.message) ? 403 : 409, e.message);
         throw e;
       }
     });
   }
+
+  /** Emergency override of an approval: admin only, with a mandatory reason and evidence reference. */
+  app.post("/v1/approvals/:id/break-glass", async (c) => {
+    need(c, "halt");
+    const b = await body(c);
+    const who = c.get("who");
+    try {
+      return c.json(approvals.breakGlass(c.req.param("id"), who.name, { reason: String(b.reason ?? ""), evidence: String(b.evidence ?? "") }, identityOf(who)));
+    } catch (e) {
+      if (e instanceof ApprovalError) throw new HttpError(/not found/.test(e.message) ? 404 : /needs the admin/.test(e.message) ? 403 : /needs a (reason|reference)/.test(e.message) ? 400 : 409, e.message);
+      throw e;
+    }
+  });
+
+  // ---- delegation: hand your approval authority to someone for a while ----
+  app.get("/v1/delegations", (c) => {
+    need(c, "read");
+    if (!opts.delegations) throw new HttpError(404, "delegation is not enabled on this server");
+    return c.json({ delegations: opts.delegations.list() });
+  });
+  app.post("/v1/delegations", async (c) => {
+    need(c, "approve");
+    if (!opts.delegations) throw new HttpError(404, "delegation is not enabled on this server");
+    const b = await body(c);
+    const who = c.get("who");
+    // You delegate your own authority. An admin may delegate on behalf of someone else.
+    const from = typeof b.from === "string" && b.from !== who.name ? (can(who, "halt") ? b.from : (() => { throw new HttpError(403, "you can only delegate your own approval authority"); })()) : who.name;
+    const hours = Number(b.hours);
+    if (!Number.isFinite(hours) || hours <= 0) throw new HttpError(400, "`hours` must be a positive number");
+    try {
+      return c.json(
+        opts.delegations.grant({ from, to: str(b, "to") as string, until_ms: now() + hours * 3_600_000, groups: Array.isArray(b.groups) ? (b.groups as string[]) : undefined, reason: str(b, "reason") as string }),
+        201,
+      );
+    } catch (e) {
+      throw new HttpError(400, e instanceof Error ? e.message : "invalid delegation");
+    }
+  });
+  app.delete("/v1/delegations/:id", (c) => {
+    need(c, "approve");
+    if (!opts.delegations) throw new HttpError(404, "delegation is not enabled on this server");
+    const d = opts.delegations.list().find((x) => x.id === c.req.param("id"));
+    if (!d) throw new HttpError(404, "delegation not found");
+    if (d.from !== c.get("who").name && !can(c.get("who"), "halt")) throw new HttpError(403, "only the delegator or an admin can revoke it");
+    opts.delegations.revoke(d.id);
+    return c.json({ ok: true });
+  });
 
   /** Pre-approve a tool in a run, for any arguments (counts down per use). */
   app.post("/v1/runs/:id/approvals", async (c) => {
@@ -378,15 +444,31 @@ export function createApp(opts: AppOptions): Hono {
   app.post("/v1/halt", async (c) => {
     need(c, "halt");
     const b = await body(c);
-    reversi.halt(`${str(b, "reason")} (by ${c.get("who").name})`);
-    return c.json({ halted: reversi.halted() });
+    const scope: Record<string, string> = {};
+    for (const k of ["tool", "actor", "tenant", "environment"]) {
+      if (b[k] !== undefined) {
+        if (typeof b[k] !== "string" || !b[k]) throw new HttpError(400, `\`${k}\` must be a non-empty string`);
+        scope[k] = b[k] as string;
+      }
+    }
+    const h = reversi.halt(`${str(b, "reason")} (by ${c.get("who").name})`, scope, c.get("who").name);
+    return c.json({ halted: reversi.halted(), halt: h });
   });
-  app.post("/v1/resume", (c) => {
+  app.get("/v1/halts", (c) => {
+    need(c, "read");
+    return c.json({ halts: reversi.halts() });
+  });
+  app.post("/v1/resume", async (c) => {
     need(c, "halt");
-    reversi.resume();
-    return c.json({ halted: reversi.halted() });
+    const b = c.req.header("content-length") === "0" || !c.req.header("content-type") ? {} : await body(c).catch(() => ({}));
+    const lifted = reversi.resume(typeof b.id === "string" ? b.id : undefined);
+    return c.json({ halted: reversi.halted(), lifted });
   });
 
+  const extras = mountExtras(app, { opts, ring, now, need, body, str, identityOf });
+
+  const openRole = opts.console?.role ?? "operator";
+  if (opts.console?.mode === "open" && openRole === "admin") throw new Error("the open console never runs as admin: use operator, or log in");
   mountConsole(app as unknown as Hono, {
     reversi,
     approvals,
@@ -399,11 +481,16 @@ export function createApp(opts: AppOptions): Hono {
     report: runReport,
     bundle: evidenceBundle,
     now,
+    mode: opts.console?.mode ?? "off",
+    open_role: openRole,
+    opts,
+    extras,
+    ring,
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
   app.onError((e, c) => {
-    if (e instanceof HttpError) return c.json({ error: e.message }, e.status);
+    if (e instanceof HttpError || e instanceof ApiError) return c.json({ error: e.message }, e.status);
     if (e instanceof LedgerError) return c.json({ error: "ledger unavailable; request refused" }, 503);
     if (e instanceof ReversiError) return c.json({ error: e.message }, 409);
     if (e instanceof Error && /^invalid run id/.test(e.message)) return c.json({ error: e.message }, 400);

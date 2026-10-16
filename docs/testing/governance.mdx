@@ -1,0 +1,1031 @@
+---
+title: Manual testing - policy, approvals and evidence analysis
+description: Hand-test rich manifests, policy rules, budgets, freezes, approvals, delegation, halts, simulation, replay and the console editors, with the output to expect.
+---
+
+Every command here was run in a scratch folder against the built code, in the order shown. Run them from the **repository root**
+in `bash` or `zsh`. Scratch files go in `try/gov/` (delete the folder to start over). The general guide is
+[Manual testing guide](/testing); this page covers the governance features only.
+
+<Note>
+You need Node 22.13 or newer, a built repository (`npm install && npm run build`), `curl`, `openssl` and `jq`.
+The server listens on port 7750 here. Ids (`apr_...`), timestamps and hashes differ on every run; the rest of each output should match.
+</Note>
+
+## 0. Setup
+
+### 0.1 Helpers and files
+
+```bash
+mkdir -p try/gov
+rv()  { node packages/cli/dist/main.js "$@"; }
+rvg() { rv --config try/gov/reversi.config.yaml "$@"; }    # the CLI with this guide's config file
+```
+
+Nine tool manifests. Read them: they show the risk fields, the idempotency key, the timeout and the undo of each tool.
+
+```bash
+cat > try/gov/manifests.yaml <<'EOF2'
+- tool: read_balance
+  effect: read_only
+  permission: payments:read
+- tool: refund
+  effect: idempotent
+  permission: payments:write
+- tool: charge_card
+  description: Charge a customer's card
+  effect: compensable
+  permission: payments:write
+  owner: payments-team
+  oncall: "#payments-oncall"
+  risk: { data_class: financial, blast_radius: high }
+  timeout_ms: 5s
+  idempotency: { key: "charge-{{args.order_id}}", scope: run }
+  compensation:
+    tool: refund
+    kind: compensation
+    residue: ["the charge stays visible on the customer's statement"]
+    argument_map: { charge_id: $result.charge_id }
+- tool: payout
+  effect: compensable
+  permission: payments:write
+  risk: { data_class: financial, blast_radius: medium }
+  compensation:
+    tool: refund
+    argument_map: { charge_id: $result.payout_id }
+- tool: revoke_access
+  effect: idempotent
+  permission: access:write
+- tool: grant_access
+  effect: reversible
+  permission: access:write
+  compensation:
+    tool: revoke_access
+    argument_map: { user: $args.user }
+- tool: rollback_release
+  effect: idempotent
+  permission: deploy:write
+- tool: deploy_release
+  effect: reversible
+  permission: deploy:write
+  compensation:
+    tool: rollback_release
+    argument_map: { version: $args.version }
+- tool: old_charge
+  effect: compensable
+  permission: payments:write
+  compensation:
+    tool: refund
+    argument_map: { charge_id: $result.charge_id }
+EOF2
+cat > try/gov/draft.yaml <<'EOF2'
+- tool: export_report
+  description: Export a customer report
+  effect: read_only
+  permission: reports:read
+EOF2
+```
+
+The baseline policy (version 1): a rule that routes big payouts to two people of the `finance` group, one that routes access grants to the `security`
+group and escalates after 3 seconds, a rate limit, a cumulative budget and risk scoring.
+
+```bash
+cat > try/gov/policy.yaml <<'EOF2'
+version: 1
+rules:
+  - id: big-payouts
+    match: { tool: payout }
+    when: [{ path: $args.amount, op: gt, value: 1000 }]
+    action: require_approval
+    reason: payouts over 1000 need two finance approvers
+    approvers: [finance]
+    quorum: 2
+  - id: grant-needs-security
+    match: { tool: grant_access }
+    action: require_approval
+    reason: access grants need the security group
+    approvers: [security]
+    approval_timeout: 3s
+    on_timeout: escalate
+    escalate_to: [operator]
+limits:
+  - { id: balance-polling, match: { tool: read_balance }, max_calls: 3, window_seconds: 60, per: run }
+budgets:
+  - id: charge-budget
+    match: { tool: charge_card }
+    metric: sum
+    path: $args.amount
+    max: 1000
+    window_seconds: 86400
+    per: actor
+    action: deny
+risk:
+  amount: { path: $args.amount, bands: [{ over: 500, points: 15 }, { over: 5000, points: 30 }] }
+  thresholds: { approve: 80, deny: 100 }
+tests:
+  - { name: small charge is allowed, input: { tool: charge_card, effect: compensable, args: { order_id: o1, amount: 100 } }, expect: allow }
+  - { name: big payout needs approval, input: { tool: payout, effect: compensable, args: { amount: 5000 } }, expect: require_approval, rule: big-payouts }
+EOF2
+```
+
+### 0.2 Registry, policy versions, config and keys
+
+The console can only edit manifests that live in a **registry folder** and a policy that lives in a **policy versions folder**. Create both
+with the CLI, and a project config file that points at them.
+
+```bash
+rvg manifests publish try/gov/manifests.yaml --registry try/gov/registry --status approved --by root --note "initial set" > /dev/null
+rvg manifests publish try/gov/draft.yaml --registry try/gov/registry --by root --note "new report export"
+rvg manifests deprecate old_charge --registry try/gov/registry --replaced-by charge_card --by root
+rvg policy publish try/gov/policy.yaml --dir try/gov/policies --by root --note baseline
+cat > try/gov/reversi.config.yaml <<'EOF2'
+manifests: registry
+policy: policies
+data: { dir: data }
+EOF2
+```
+
+Expect:
+
+```text
+export_report  v1  draft  b49830181892
+old_charge  v2  deprecated; use charge_card
+policy v1  2 tests passed  active  ce2efb2232f0
+```
+
+`manifests publish` stores every manifest with the status you pass (`draft` by default) and ignores a `status:` written in the file. A draft is not enforced.
+
+Keys: an agent, a second agent that belongs to tenant `acme`, an auditor, two approvers in the `finance` group,
+one in `security`, an operator and an admin.
+
+```bash
+sha() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+for n in AGENT ACME AUD ALICE BOB SAM DANA ROOT; do eval "$n=$(echo $n | tr A-Z a-z)-$(openssl rand -hex 8)"; done
+cat > try/gov/keys.json <<EOF2
+[
+  { "name": "pay-agent",  "role": "agent",    "key_sha256": "$(sha $AGENT)", "max_permissions": ["payments:read","payments:write","access:write","deploy:write","reports:read","customers:read"] },
+  { "name": "acme-agent", "role": "agent",    "key_sha256": "$(sha $ACME)",  "tenant": "acme", "max_permissions": ["payments:read"] },
+  { "name": "audrey",     "role": "auditor",  "key_sha256": "$(sha $AUD)" },
+  { "name": "alice",      "role": "approver", "key_sha256": "$(sha $ALICE)", "groups": ["finance"] },
+  { "name": "bob",        "role": "approver", "key_sha256": "$(sha $BOB)",   "groups": ["finance"] },
+  { "name": "sam",        "role": "approver", "key_sha256": "$(sha $SAM)",   "groups": ["security"] },
+  { "name": "dana",       "role": "operator", "key_sha256": "$(sha $DANA)" },
+  { "name": "root",       "role": "admin",    "key_sha256": "$(sha $ROOT)" }
+]
+EOF2
+printf 'AGENT=%s\nACME=%s\nAUD=%s\nALICE=%s\nBOB=%s\nSAM=%s\nDANA=%s\nROOT=%s\n' $AGENT $ACME $AUD $ALICE $BOB $SAM $DANA $ROOT > try/gov/.env.sh   # new terminals: . try/gov/.env.sh
+```
+
+### 0.3 Start the server (terminal A)
+
+```bash Terminal A
+REVERSI_CONFIG=try/gov/reversi.config.yaml REVERSI_KEYS=try/gov/keys.json REVERSI_CONSOLE=login PORT=7750 \
+node packages/server/dist/main.js
+```
+
+Expect `reversi-server listening on http://127.0.0.1:7750 (9 tools, files store, console login)`. The registry holds ten tools but the draft is not loaded.
+
+### 0.4 Helpers (terminal B)
+
+```bash
+. try/gov/.env.sh
+rv()  { node packages/cli/dist/main.js "$@"; }
+rvg() { rv --config try/gov/reversi.config.yaml "$@"; }
+j()   { curl -s -H "Authorization: Bearer $1" -H 'content-type: application/json' "${@:2}"; echo; }
+B=localhost:7750
+PERMS='"permissions":["payments:read","payments:write","access:write","deploy:write","reports:read","customers:read"]'
+newrun() { j $AGENT -X POST $B/v1/runs -d "{\"run_id\":\"$1\",$PERMS}" | jq -c '{run_id,mode}'; }
+call()   { j $AGENT -X POST $B/v1/runs/$1/intents -d "{\"tool\":\"$2\",\"args\":$3,\"reason\":\"manual test\"}"; }
+finish() { j $AGENT -X POST $B/v1/runs/$1/steps/$2/outcome -d "{\"status\":\"succeeded\",\"result\":$3}"; }
+pend()   { rvg approvals list --status pending | grep " run=$1 " | awk '{print $1}' | head -1; }
+curl -s $B/readyz | jq -c .
+```
+
+Expect `{"ok":true,"ledger_head":"0000...","halted":null}`.
+
+## 1. Rich manifests in action
+
+**What this proves:** the extra manifest fields change what the engine does, and the ledger says why.
+
+### 1.1 The fields are stored
+
+```bash
+jq -c '{tool,owner,oncall,risk,timeout_ms,idempotency,status}' try/gov/registry/tools/charge_card/v1.json
+```
+
+Expect owner `payments-team`, risk `financial` / `high`, `timeout_ms:"5s"`, and the idempotency template.
+
+### 1.2 A duplicate call is blocked
+
+```bash
+newrun m-1
+call m-1 charge_card '{"order_id":"A100","amount":200}'
+finish m-1 0 '{"charge_id":"ch_1"}'
+call m-1 charge_card '{"order_id":"A100","amount":200}'
+```
+
+Expect `allow`, then the second identical order is refused:
+
+```text
+{"decision":"block","reasons":["duplicate call: idempotency key matches step 0 of run m-1 (succeeded)"]}
+```
+
+The key is `charge-A100`, rendered from the arguments, and `scope: run` means a different run could charge A100 again (use `scope: actor` or `global` to widen it).
+
+### 1.3 A deprecated tool still runs, and is flagged
+
+```bash
+call m-1 old_charge '{"amount":10}'
+finish m-1 1 '{"charge_id":"ch_old"}'
+rvg search --run m-1 --event intended,blocked | cut -c1-170
+```
+
+Expect the call to be allowed (`{"decision":"allow","step":1}`), and the events to carry the risk score, the duplicate refusal and the deprecation note:
+
+```text
+     1  ...Z  m-1#0  intended   charge_card  pay-agent  | risk 70 (effect compensable +30, blast radius high +20, data class financial +20)
+     3  ...Z  m-1    blocked    charge_card  pay-agent  | duplicate call: idempotency key matches step 0 of run m-1 (succeeded)
+     4  ...Z  m-1#1  intended   old_charge   pay-agent  | manifest deprecated; use charge_card; risk 30 (effect compensable +30)
+```
+
+### 1.4 A draft is not enforced
+
+```bash
+call m-1 export_report '{}'
+```
+
+With a registry, a draft is simply not loaded, so the call is refused as unknown:
+
+```text
+{"decision":"block","reasons":["no manifest registered for tool `export_report`"]}
+```
+
+With a plain manifest file, `status: draft` is loaded and refused by name. Try it on a throwaway second server (port 7751):
+
+```bash
+cat > try/gov/draft-demo.yaml <<'EOF2'
+- tool: export_report
+  effect: read_only
+  permission: reports:read
+  status: draft
+EOF2
+REVERSI_MANIFESTS=try/gov/draft-demo.yaml REVERSI_KEYS=try/gov/keys.json REVERSI_DATA=try/gov/draft-data PORT=7751 node packages/server/dist/main.js &
+SRV=$!; sleep 2
+j $AGENT -X POST localhost:7751/v1/runs -d '{"run_id":"d-1","permissions":["reports:read"]}' | jq -c .run_id
+j $AGENT -X POST localhost:7751/v1/runs/d-1/intents -d '{"tool":"export_report","args":{},"reason":"x"}'
+kill $SRV
+```
+
+Expect `{"decision":"block","reasons":["the manifest for `export_report` is a draft: publish it before it can be enforced"]}`.
+
+### 1.5 Timeout
+
+`timeout_ms` bounds the **upstream call made by the [gateway](/gateway)**: after that many milliseconds the gateway reports
+`upstream did not answer within N ms`. The HTTP server does not call tools itself, so there is nothing to time out here; this page does not exercise it (see "Not covered here").
+
+## 2. Policy: rules, limits, budgets, risk, windows, freezes, versions
+
+**What this proves:** policy can refuse or hold a call for reasons other than the manifest, and each refusal names the rule.
+
+### 2.1 Check and test the file
+
+```bash
+rvg policy check try/gov/policy.yaml
+rvg policy test try/gov/policy.yaml
+```
+
+```text
+ok: 2 rules, 1 limits, default allow
+ok   small charge is allowed
+ok   big payout needs approval
+2 passed
+```
+
+### 2.2 A rate limit
+
+```bash
+newrun p-1
+for i in 1 2 3 4; do call p-1 read_balance '{"account":"acc1"}'; done
+```
+
+Expect three `allow` lines, then `{"decision":"block","reasons":["limit `balance-polling`: 3 calls per 60s exceeded"]}`.
+
+### 2.3 Risk scoring
+
+Thresholds are `approve: 80`, `deny: 100`. A 600 charge scores 30 + 20 + 20 + 15 = 85, so a human is needed. A 9000 charge scores 100 and is refused.
+
+```bash
+call p-1 charge_card '{"order_id":"R1","amount":600}'
+call p-1 charge_card '{"order_id":"R2","amount":9000}'
+```
+
+```text
+{"decision":"block","reasons":["approval required: request apr_... is pending an operator decision; retry after it is approved"]}
+{"decision":"block","reasons":["budget `charge-budget`: 200 of 1000 used in 86400s, this call would make it 9200","risk score 100 is at or above the deny threshold 100 (effect compensable +30, blast radius high +20, data class financial +20, amount over 5000 +30)"]}
+```
+
+Both reasons are reported: the 9000 charge also breaks the budget of section 2.4.
+
+The pending request for R1 is decided in section 3.
+
+### 2.4 A cumulative budget
+
+The budget is 1000 per actor per day, and `m-1` already spent 200. Two charges of 300 fit; the warning at 80 percent is written to the ledger; the third does not fit.
+
+```bash
+call p-1 charge_card '{"order_id":"B1","amount":300}'
+call p-1 charge_card '{"order_id":"B2","amount":300}'
+call p-1 charge_card '{"order_id":"B3","amount":300}'
+rvg search --run p-1 --text budget | cut -c1-200
+```
+
+```text
+{"decision":"allow","step":3}
+{"decision":"allow","step":4}
+{"decision":"block","reasons":["budget `charge-budget`: 800 of 1000 used in 86400s, this call would make it 1100"]}
+    13  ...Z  p-1    blocked   charge_card  pay-agent  | budget `charge-budget`: 200 of 1000 used in 86400s, this call would make it 9200; risk sco
+    15  ...Z  p-1#4  intended  charge_card  pay-agent  | budget `charge-budget` at 80% (800 of 1000); risk 70 (effect compensable +30, blast radius high +20, ...
+    16  ...Z  p-1    blocked   charge_card  pay-agent  | budget `charge-budget`: 800 of 1000 used in 86400s, this call would make it 1100
+```
+
+The budget counts only calls that were allowed to start, and is shared by every run of the same actor (`per: actor`).
+
+### 2.5 Version 2: a time window, a freeze, and a window that is closed
+
+The next file is version 1 plus the lines marked `new`. The day names and the freeze period are computed so that one window covers **now**
+and one does not. All times are UTC.
+
+```bash
+TODAY=$(node -e 'console.log(["sun","mon","tue","wed","thu","fri","sat"][new Date().getUTCDay()])')
+TOMORROW=$(node -e 'console.log(["sun","mon","tue","wed","thu","fri","sat"][(new Date().getUTCDay()+1)%7])')
+FROM=$(node -e 'console.log(new Date(Date.now()-3600e3).toISOString())')
+TO=$(node -e 'console.log(new Date(Date.now()+3600e3).toISOString())')
+cat > try/gov/policy-v2.yaml <<EOF2
+version: 1
+rules:
+  - id: big-payouts
+    match: { tool: payout }
+    when: [{ path: \$args.amount, op: gt, value: 1000 }]
+    action: require_approval
+    reason: payouts over 1000 need two finance approvers
+    approvers: [finance]
+    quorum: 2
+  - id: grant-needs-security
+    match: { tool: grant_access }
+    action: require_approval
+    reason: access grants need the security group
+    approvers: [security]
+    approval_timeout: 3s
+    on_timeout: escalate
+    escalate_to: [operator]
+  - id: payouts-paused-today          # new: the window covers now
+    match: { tool: payout }
+    window: { days: [$TODAY] }
+    action: deny
+    reason: the payout run is paused today
+  - id: refunds-closed-tomorrow       # new: the window does not cover now
+    match: { tool: refund }
+    window: { days: [$TOMORROW] }
+    action: deny
+    reason: refunds are closed tomorrow
+freezes:                              # new
+  - id: release-freeze
+    from: "$FROM"
+    to: "$TO"
+    reason: quarterly release freeze
+    match: { tool: "deploy_*" }
+limits:
+  - { id: balance-polling, match: { tool: read_balance }, max_calls: 3, window_seconds: 60, per: run }
+budgets:
+  - id: charge-budget
+    match: { tool: charge_card }
+    metric: sum
+    path: \$args.amount
+    max: 1000
+    window_seconds: 86400
+    per: actor
+    action: deny
+risk:
+  amount: { path: \$args.amount, bands: [{ over: 500, points: 15 }, { over: 5000, points: 30 }] }
+  thresholds: { approve: 80, deny: 100 }
+tests:
+  - { name: small charge is allowed, input: { tool: charge_card, effect: compensable, args: { order_id: o1, amount: 100 } }, expect: allow }
+  - { name: payouts are paused today, input: { tool: payout, effect: compensable, args: { amount: 50 } }, expect: deny, rule: payouts-paused-today }
+  - { name: tomorrow's window does not fire today, input: { tool: refund, effect: idempotent, args: {} }, expect: allow }
+  - { name: deploys are frozen, input: { tool: deploy_release, effect: reversible, args: {} }, expect: deny, rule: release-freeze }
+  - { name: reads are never frozen, input: { tool: read_balance, effect: read_only, args: {} }, expect: allow }
+EOF2
+rvg policy test try/gov/policy-v2.yaml
+```
+
+```text
+ok   small charge is allowed
+ok   payouts are paused today
+ok   tomorrow's window does not fire today
+ok   deploys are frozen
+ok   reads are never frozen
+5 passed
+```
+
+<Note>
+A window rule fires only while the time is inside the window (`days`, `between: "09:00-17:00"`, `timezone`; `outside: true` inverts it).
+A freeze with no `match` blocks every call that is not `read_only`. Both read the real clock, so this file is only valid on the day you create it.
+I dropped the version-1 "big payout" test because payouts are now paused.
+</Note>
+
+### 2.6 Publish it, watch it enforce, then roll back
+
+```bash
+rvg policy publish try/gov/policy-v2.yaml --by root --note "pause payouts today, release freeze, closed-tomorrow refunds"
+sleep 3          # the server notices the new active version within a few seconds
+newrun p-2
+call p-2 payout '{"amount":50}'
+call p-2 deploy_release '{"version":"1.4"}'
+call p-2 refund '{"charge_id":"ch_1"}'
+call p-2 read_balance '{"account":"x"}'
+```
+
+```text
+policy v2  5 tests passed  active  ...
+{"run_id":"p-2","mode":"enforce"}
+{"decision":"block","reasons":["policy `payouts-paused-today`: the payout run is paused today"]}
+{"decision":"block","reasons":["freeze `release-freeze`: quarterly release freeze (until 2026-...Z)"]}
+{"decision":"allow","step":0}
+{"decision":"allow","step":1}
+```
+
+The open window blocks the payout, the freeze blocks the deploy, the closed window lets the refund through, and a read is never frozen.
+Now the history, the diff, and the rollback to version 1 (a policy version is activated, never edited):
+
+```bash
+rvg policy history
+rvg policy diff 1 2 | grep -E '^[+-]' | head -12
+rvg policy activate 1
+sleep 3
+call p-2 deploy_release '{"version":"1.4"}'
+```
+
+```text
+v1            ...Z  by root  2 tests  ce2efb2232f0  - baseline
+v2  *active*  ...Z  by root  5 tests  ...  - pause payouts today, release freeze, closed-tomorrow refunds
++  - id: payouts-paused-today
+...
+policy v1 is now active
+{"decision":"allow","step":2}
+```
+
+(`history` prints `*active*` on v2 before the rollback; the last command shows the deploy allowed again once v1 is back.)
+
+## 3. Approvals
+
+**What this proves:** approvals can be routed to groups, need N different people, can be delegated, escalate when nobody answers, and can be forced
+only by an admin with evidence. The requester can never approve their own call.
+
+### 3.1 Routing to a group, quorum 2
+
+```bash
+newrun a-1
+call a-1 payout '{"amount":5000,"to":"acct_9"}'
+rvg approvals list --status pending
+ID=$(pend a-1); echo $ID
+j $AGENT -X POST $B/v1/approvals/$ID/approve -d '{}'
+j $SAM   -X POST $B/v1/approvals/$ID/approve -d '{}'
+j $ALICE -X POST $B/v1/approvals/$ID/approve -d '{"note":"invoice 8841 matches"}' | jq -c '{status,quorum,decisions:[.decisions[]|{by,basis}]}'
+j $ALICE -X POST $B/v1/approvals/$ID/approve -d '{"note":"again"}'
+j $BOB   -X POST $B/v1/approvals/$ID/approve -d '{"note":"second look done"}' | jq -c '{status,decided_by}'
+call a-1 payout '{"amount":5000,"to":"acct_9"}'
+finish a-1 0 '{"payout_id":"po_1"}'
+```
+
+```text
+{"decision":"block","reasons":["approval required: request apr_... is pending an operator decision (needs 2 approvers from finance); retry after it is approved"]}
+apr_...  pending  run=p-1  call  charge_card  args=[order_id,amount]  why: risk score 85 is at or above the approval threshold 80 (...)
+apr_...  pending  run=a-1  call  payout  args=[amount,to]  why: policy `big-payouts`: payouts over 1000 need two finance approvers
+{"error":"approver role required"}
+{"error":"this request needs an approver from: finance"}
+{"status":"pending","quorum":2,"decisions":[{"by":"alice","basis":"group:finance"}]}
+{"error":"you have already decided this request"}
+{"status":"approved","decided_by":"alice, bob"}
+{"decision":"allow","step":0}
+```
+
+The list also holds the risk-score request from section 2.3. It shows argument **names** (`amount`, `to`), never values. The approval is bound to the exact arguments and used once.
+
+### 3.2 The same from the CLI, with `--groups`
+
+The CLI trusts the host, so you say who you are and which groups you decide as:
+
+```bash
+call a-1 payout '{"amount":2500,"to":"acct_7"}' | cut -c1-80
+ID=$(pend a-1)
+rvg approvals approve $ID --as sam --groups security --note "wrong group"
+rvg approvals approve $ID --as alice --groups finance --note ok
+rvg approvals approve $ID --as bob --groups finance --note ok
+rvg approvals list --status approved | tail -1 | cut -c1-60
+```
+
+```text
+error: this request needs an approver from: finance
+apr_... pending by null
+apr_... approved by alice, bob
+apr_...  approved  run=a-1  call  payout ...
+```
+
+(`pending by null` after the first vote means the quorum is not reached yet.) The CLI decides through the engine, so the
+decision is in the ledger too, and notification channels in the config would be told:
+
+```bash
+rvg export --run a-1 | jq -r 'select(.event=="approved") | .actor + ": " + .detail' | tail -1 | cut -c1-120
+```
+
+```text
+bob: approval apr_... approved by alice, bob [quorum 2]; the call must be retried
+```
+
+Deny works the same way, and a denied call stays blocked with the reason:
+
+```bash
+call a-1 payout '{"amount":8000,"to":"acct_6"}' | cut -c1-70
+ID=$(pend a-1); rvg approvals deny $ID --as alice --groups finance --note "not today"
+call a-1 payout '{"amount":8000,"to":"acct_6"}'
+```
+
+```text
+{"decision":"block","reasons":["approval required: request apr_...
+apr_... denied by alice
+{"decision":"block","reasons":["approval apr_... was denied: not today"]}
+```
+
+### 3.3 Delegation: grant, use, expire
+
+Alice hands her `finance` authority to dana for a very short time (0.005 hours is 18 seconds; the console's form takes whole hours). Dana is an operator, not in `finance`.
+
+```bash
+call a-1 payout '{"amount":3000,"to":"acct_5"}' | cut -c1-70
+ID=$(pend a-1)
+j $DANA -X POST $B/v1/approvals/$ID/approve -d '{}'
+rvg delegate add --from alice --to dana --hours 0.005 --reason "alice on leave" --group finance
+rvg delegate list
+j $DANA  -X POST $B/v1/approvals/$ID/approve -d '{"note":"covering for alice"}' | jq -c '{status,decisions:[.decisions[]|{by,on_behalf_of,basis}]}'
+j $ALICE -X POST $B/v1/approvals/$ID/approve -d '{}'
+j $BOB   -X POST $B/v1/approvals/$ID/approve -d '{}' | jq -c '{status,decided_by}'
+```
+
+```text
+{"error":"this request needs an approver from: finance"}
+dlg_...  alice -> dana  until ...Z
+dlg_...  alice -> dana  until ...Z  active  alice on leave
+{"status":"pending","decisions":[{"by":"dana","on_behalf_of":"alice","basis":"delegated by alice (finance)"}]}
+{"error":"you have already decided this request"}
+{"status":"approved","decided_by":"dana, bob"}
+```
+
+A delegate's vote counts as the delegator's, so Alice cannot also vote. After 18 seconds the delegation is spent:
+
+```bash
+call a-1 payout '{"amount":4000,"to":"acct_4"}' | cut -c1-70
+ID4=$(pend a-1)
+sleep 20
+rvg delegate list
+j $DANA -X POST $B/v1/approvals/$ID4/approve -d '{}'
+```
+
+```text
+dlg_...  alice -> dana  until ...Z  expired  alice on leave
+{"error":"this request needs an approver from: finance"}
+```
+
+Delegation is honoured everywhere a decision is made, including the CLI on the host. Repeat the first half with a fresh request, and let Dana decide with `reversi approvals approve` instead of the API (no `--groups`; the delegation supplies `finance`):
+
+```bash
+call a-1 payout '{"amount":3500,"to":"acct_3"}' | cut -c1-70
+ID=$(pend a-1)
+rvg delegate add --from alice --to dana --hours 1 --reason "alice on leave" --group finance
+rvg approvals approve $ID --as dana --note "covering for alice"
+rvg approvals approve $ID --as bob --groups finance
+rvg export --run a-1 | jq -r 'select(.event=="approved") | .detail' | tail -1 | cut -c1-120
+```
+
+```text
+apr_... pending by null
+apr_... approved by dana, bob
+approval apr_... approved by dana, bob [quorum 2]; the call must be retried
+```
+
+That delegation stays active for an hour; end it with `rvg delegate revoke <id>` (the id is in `rvg delegate list`) before the later sections.
+
+### 3.4 Escalation on timeout
+
+`grant_access` goes to the `security` group with a 3 second timeout, then to `operator`. Approve quickly after the escalation: the approval itself lapses at the same deadline.
+
+```bash
+newrun e-1
+call e-1 grant_access '{"user":"newhire","role":"admin"}'
+j $DANA "$B/v1/approvals?status=pending&run_id=e-1" | jq -c '.approvals[] | {required_roles,escalated,on_timeout,escalate_to}'
+sleep 4
+j $DANA "$B/v1/approvals?status=pending&run_id=e-1" | jq -c '.approvals[] | {required_roles,escalated}'
+ID=$(pend e-1)
+j $SAM -X POST $B/v1/approvals/$ID/approve -d '{}'
+j $DANA -X POST $B/v1/approvals/$ID/approve -d '{"note":"security did not answer"}' | jq -c '{status,decided_by}'; call e-1 grant_access '{"user":"newhire","role":"admin"}'
+rvg search --run e-1 | cut -c1-150
+```
+
+```text
+{"decision":"block","reasons":["approval required: request apr_... is pending ... (needs an approver from security); ..."]}
+{"required_roles":["security"],"escalated":false,"on_timeout":"escalate","escalate_to":["operator"]}
+{"required_roles":["operator"],"escalated":true}
+{"error":"this request needs an approver from: operator"}
+{"status":"approved","decided_by":"dana"}
+{"decision":"allow","step":0}
+ ... e-1  escalated  grant_access  reversi  | escalated to operator
+```
+
+After escalation `sam` (security) is refused and any `operator` is accepted.
+
+### 3.5 Break-glass
+
+Only an admin can force a pending approval, with a reason of at least 10 characters and a reference to the evidence. It is recorded as break-glass, not as a normal approval.
+
+```bash
+j $DANA -X POST $B/v1/approvals/$ID4/break-glass -d '{"reason":"payroll outage, vendor will cancel","evidence":"INC-2041"}'
+j $ROOT -X POST $B/v1/approvals/$ID4/break-glass -d '{"reason":"too short","evidence":"INC-2041"}'
+j $ROOT -X POST $B/v1/approvals/$ID4/break-glass -d '{"reason":"payroll outage, vendor will cancel","evidence":"INC-2041"}' | jq -c '{status,decided_by,decision_note,break_glass}'
+call a-1 payout '{"amount":6000,"to":"acct_3"}' | cut -c1-60
+ID5=$(pend a-1)
+rvg break-glass $ID5 --reason "audit deadline today" --evidence INC-2042 --by root
+rvg search --run a-1 --event approved | grep BREAK | cut -c1-170
+```
+
+```text
+{"error":"admin role required"}
+{"error":"break-glass needs a reason of at least 10 characters"}
+{"status":"approved","decided_by":"root","decision_note":"BREAK-GLASS: payroll outage, vendor will cancel","break_glass":{...,"evidence":"INC-2041",...}}
+apr_... approved by break-glass (root); evidence INC-2042
+... a-1  approved  payout  root  | BREAK-GLASS: approval apr_... forced by root; evidence: INC-2041
+```
+
+### 3.6 Decide in the console (login mode, key paste)
+
+1. Create a request:
+
+```bash
+call a-1 payout '{"amount":7000,"to":"acct_2"}' | cut -c1-70
+```
+
+2. Open [http://localhost:7750/console/login](http://localhost:7750/console/login), paste the value of `$SAM` (print it with `echo $SAM`), **Sign in**.
+3. Click **Approvals**. In the *Pending* table the row for `payout` shows **Who may decide: finance (0/2)**, the policy reason, and the argument names. Type a note and click **Approve**: the page says *Could not decide: this request needs an approver from: finance*.
+4. **Log out**, sign in with `$ALICE`, **Approvals**, **Approve**. The row now shows `finance (1/2)`. Alice cannot vote twice.
+5. **Log out**, sign in with `$BOB`, **Approve**. The request moves to *Recent decisions* as `approved` by `alice, bob`.
+6. Sign in with `$ROOT` (admin): pending rows also have a **Break-glass** form (reason and ticket). Under *Delegation* you can hand authority to someone for whole hours and **Revoke** it.
+7. Sign in with `$AUD` (auditor): the page has no **Approve** buttons.
+
+Then let the agent use it:
+
+```bash
+call a-1 payout '{"amount":7000,"to":"acct_2"}'
+```
+
+Expect `{"decision":"allow","step":...}`.
+
+## 4. Scoped halts and kill switches
+
+**What this proves:** a halt can be narrowed to a tool, an actor or a tenant, only an admin can set it, and lifting it restores service.
+
+```bash
+rvg halt add "drill: stop payouts" --tool payout --by dana
+rvg halt list
+call a-1 payout '{"amount":10,"to":"x"}'
+call a-1 read_balance '{"account":"x"}'
+rvg halt lift $(rvg halt list | awk '{print $1}' | head -1)
+```
+
+```text
+halt_...  drill: stop payouts  ({"tool":"payout"})
+halt_...  drill: stop payouts  scope={"tool":"payout"}  by dana
+{"decision":"block","reasons":["kill switch: drill: stop payouts (scope: tool=payout)"]}
+{"decision":"allow","step":...}
+lifted 1
+```
+
+Scope by **actor** from the API (admin only), then by **tenant** from the CLI. The `acme-agent` key carries `tenant: acme`:
+
+```bash
+j $ROOT -X POST $B/v1/halt -d '{"reason":"stop one agent","actor":"pay-agent"}' | jq -c .halt.scope
+call a-1 read_balance '{"account":"y"}'
+j $DANA -X POST $B/v1/halt -d '{"reason":"x"}'
+j $ROOT -X POST $B/v1/resume -d '{}'
+rvg halt add "acme maintenance" --tenant acme --by dana
+j $ACME -X POST $B/v1/runs -d '{"run_id":"t-1","permissions":["payments:read"]}' | jq -c .run_id
+j $ACME -X POST $B/v1/runs/t-1/intents -d '{"tool":"read_balance","args":{},"reason":"x"}'
+call a-1 read_balance '{"account":"z"}'
+rvg halt lift
+```
+
+```text
+{"actor":"pay-agent"}
+{"decision":"block","reasons":["kill switch: stop one agent (by root) (scope: actor=pay-agent)"]}
+{"error":"admin role required"}
+{"halted":null,"lifted":1}
+"t-1"
+{"decision":"block","reasons":["kill switch: acme maintenance (scope: tenant=acme)"]}
+{"decision":"allow","step":...}
+lifted 1
+```
+
+In the console: sign in as `$ROOT`, **Evidence**, *Kill switches*. Fill **reason** and one of **tool glob / actor / tenant / environment**, click **Block new calls**; the new row shows its scope and a
+**Lift** button. A red *Kill switch active* card appears on every page only for a global halt (no scope) or the kill-switch file; a scoped halt appears in the table only. An operator sees the table but not the form.
+
+## 5. Capture, simulation, replay, impact and speculation
+
+**What this proves:** with capture off the history features say so and nothing breaks; with capture on you can test a policy change against real calls before you publish it.
+
+### 5.1 With capture off (the default)
+
+Create a candidate policy first (it is used again below), then ask for each history feature:
+
+```bash
+cat > try/gov/candidate.yaml <<'EOF2'
+version: 1
+rules:
+  - id: payouts-need-approval
+    match: { tool: payout }
+    when: [{ path: $args.amount, op: gt, value: 400 }]
+    action: require_approval
+    reason: any payout over 400 needs a human
+EOF2
+rvg capture list
+rvg simulate --policy try/gov/candidate.yaml; echo "exit $?"
+rvg replay a-1 --set amount=9000; echo "exit $?"
+j $DANA -X POST $B/v1/simulate -d '{}'
+```
+
+```text
+capture is off. Turn it on with `capture: { enabled: true }` in reversi.config.yaml, or REVERSI_CAPTURE=1
+error: simulation needs captured calls: turn capture on first (it keeps redacted arguments for a limited time)
+exit 1
+error: replay needs captured calls: turn capture on first
+exit 1
+{"error":"capture is off, so there is no history to simulate against"}
+```
+
+In the browser (sign in as `$DANA` or `$ROOT`): open `/console/replay/a-1`, type path `amount`, value `9000`, **Replay**: *Nothing is captured for that run (capture must be on, and captures expire).*
+**Policy**, then **Simulate against captured history**: *Capture is off, so there is no history to simulate against.*
+
+Impact preview and speculation work without capture, because they only read manifests and policy:
+
+```bash
+rvg impact payout --args '{"amount":5000}'
+rvg impact charge_card --args '{"order_id":"Z1","amount":600}'
+```
+
+```text
+payout: compensable
+decision now: needs_approval  (approval required: simulated)
+risk 75: effect compensable +30, blast radius medium +10, data class financial +20, amount over 500 +15
+data class financial, blast radius medium
+rollback: undo by calling refund
+warning: the undo is not verified: nothing reads back that it worked
+```
+
+The second command prints the same layout for `charge_card`: `decision now: needs_approval`, `risk 85`, the owner, and
+`rollback: but the charge stays visible on the customer's statement` (the residue from its manifest).
+
+Compare three plans without running anything:
+
+```bash
+cat > try/gov/plans.yaml <<'EOF2'
+plans:
+  - name: one big payout
+    calls:
+      - { tool: payout, args: { amount: 2000, to: acct_1 }, result: { payout_id: po_1 } }
+  - name: two small payouts
+    calls:
+      - { tool: payout, args: { amount: 900, to: acct_1 }, result: { payout_id: po_1 } }
+      - { tool: payout, args: { amount: 900, to: acct_1 }, result: { payout_id: po_2 } }
+  - name: ship it
+    calls:
+      - { tool: deploy_release, args: { version: "2.1" } }
+      - { tool: export_report, args: {} }
+EOF2
+rvg speculate try/gov/plans.yaml
+```
+
+```text
+two small payouts   <- recommended
+  can run to the end; approvals needed: 0; highest risk: 75; fully reversible
+one big payout
+  can run to the end; approvals needed: 1; highest risk: 75; fully reversible
+ship it
+  blocked at call 1: no manifest registered for tool `export_report`; approvals needed: 0; highest risk: 15; fully reversible
+  note: some results were synthesized from the manifests, so the rollback outlook assumes compensation arguments are available
+```
+
+It also shows a real gap: splitting one payout in two avoids the per-call approval rule. A budget on payouts (like `charge-budget`) is the way to close it.
+
+The console equivalent is **Approvals**, the *impact preview* link on a pending row, or `/console/impact`: type a tool, JSON arguments, **Preview**.
+The API equivalents are `GET /v1/impact?tool=...&args=...` and `POST /v1/speculate`:
+
+```bash
+curl -s -G -H "Authorization: Bearer $AUD" $B/v1/impact --data-urlencode tool=payout --data-urlencode 'args={"amount":5000}' | jq -c '{tool,verdict,risk_score}'
+```
+
+### 5.2 Turn capture on
+
+Stop terminal A with Ctrl-C, add the setting, start it again with the same command as in 0.3. (Browser sessions end when the server restarts.)
+
+```bash
+printf 'capture: { enabled: true }\n' >> try/gov/reversi.config.yaml
+```
+
+```bash Terminal A
+REVERSI_CONFIG=try/gov/reversi.config.yaml REVERSI_KEYS=try/gov/keys.json REVERSI_CONSOLE=login PORT=7750 \
+node packages/server/dist/main.js
+```
+
+Now make a run to analyse. Only calls made from now on are captured, with secrets redacted and a time limit.
+
+```bash
+newrun c-1
+call c-1 read_balance '{"account":"acc1"}'
+call c-1 payout '{"amount":500,"to":"acct_2"}'
+finish c-1 1 '{"payout_id":"po_c1"}'
+call c-1 payout '{"amount":1500,"to":"acct_3"}' | cut -c1-90
+call c-1 deploy_release '{"version":"2.0"}'
+rvg capture list
+```
+
+```text
+...Z  c-1#0  read_balance               allow         args={"account":"acc1"}
+...Z  c-1#1  payout                     allow       succeeded  args={"amount":500,"to":"acct_2"}
+...Z  c-1    payout                     block         args={"amount":1500,"to":"acct_3"}
+...Z  c-1#2  deploy_release             allow         args={"version":"2.0"}
+```
+
+### 5.3 Simulate a policy against that history
+
+```bash
+rvg simulate --policy try/gov/candidate.yaml
+```
+
+```text
+4 captured calls in 1 runs: 3 unchanged
+
+newly needing approval (1)
+  c-1#1  payout  allow -> needs_approval  approval required: simulated
+```
+
+The 500 payout was allowed; under the candidate (over 400 needs approval) it would have needed one. In the browser: **Policy**, edit the text (change `value: 1000` to `value: 400`),
+click **Simulate against captured history**: *Last 7 days of captured calls ... Newly needing approval*. Nothing is published by simulating.
+
+### 5.4 Replay one run with a changed argument
+
+```bash
+rvg replay c-1 --set 'tool:payout/amount=9000'
+```
+
+```text
+run c-1: 4 captured calls
+  0  read_balance                 as recorded: allow   with your changes: allow
+  1  payout                       as recorded: allow   with your changes: needs_approval  (approval required: simulated)
+  2  payout                       as recorded: needs_approval   with your changes: needs_approval  (approval required: simulated)
+  3  deploy_release               as recorded: allow   with your changes: allow
+1 decision would change
+rollback as recorded: fully reversible; with changes: fully reversible
+```
+
+In the browser: **Runs**, open `c-1`: the page links **Replay with a change** (only when capture is on). Fill *Tool* `payout`, *Argument path* `amount`, *New value* `9000`, **Replay**:
+a table of *As recorded* against *With your change*, ending *1 decision would change*. Replay needs the operator role.
+
+Equivalent API calls: `POST /v1/simulate` with `{"policy":"<yaml text>"}` and `POST /v1/runs/c-1/replay` with `{"changes":[{"tool":"payout","path":"amount","value":9000}]}`, both with an operator key.
+
+## 6. Console editors
+
+**What this proves:** a manifest or policy change can be authored, validated, reviewed and activated in the browser, with the right role at each step.
+
+Requirements: manifests must come from a **registry folder** (created in 0.2) and the policy from a **policy versions folder**. If you point the server at plain files the
+console shows them read-only and says so. Roles: *operator* can save a manifest as a draft; only *admin* can approve a draft, publish as approved, and publish or activate a policy.
+
+### 6.1 A manifest with the form builder
+
+1. Sign in as `$DANA` (operator). **Manifests** lists the 9 enforced tools and, in a box, *Drafts waiting for approval: export_report*.
+2. Click **New manifest**. Fill the form: Tool name `lookup_customer`, Description `Look up a customer record`, Effect `read_only`, Permission `customers:read`, Owner `support-team`, Data class `pii`, Blast radius `low`, Timeout `10s`. Leave Undo empty. Click **Build the YAML**.
+3. Below, *The YAML* shows the manifest and a green *Valid. Lint: no findings*. Click **Validate** to re-check (edit the text to see errors, for example set `effect: nope`).
+4. Add a note and click **Save as draft**. You land on the manifest page: status *draft*, v1, with a *History* table.
+5. Check the agent cannot use it yet:
+
+```bash
+newrun m-2
+call m-2 lookup_customer '{"id":"c1"}'
+```
+
+```text
+{"decision":"block","reasons":["no manifest registered for tool `lookup_customer`"]}
+```
+
+6. As operator you cannot approve: there is no **Approve the latest draft** button. Log out, sign in as `$ROOT` (admin), open **Manifests**, click `lookup_customer`, tick *the author may not approve it*, click **Approve the latest draft**.
+   History now has v2 *approved*, "by dana, approved by root". The server reloads itself.
+7. Reload the agent side: the same call is now allowed.
+
+```bash
+call m-2 lookup_customer '{"id":"c1"}'
+rvg manifests history lookup_customer
+```
+
+```text
+{"decision":"allow","step":0}
+v1  draft       ...Z  by dana  ...  - customer lookup for support
+v2  approved    ...Z  by dana, approved by root  ...  - approved from v1
+```
+
+Also on that page: *Contract tests* (a YAML list, **Run the tests**), **Deprecate** (with a replacement tool), and **Restore** on any older version.
+
+A manifest's `approval:` object (roles, quorum, timeout) and the *Approver groups* field are kept intact by save, approve, deprecate and restore, and the registry loads with them. This page routes approvals with policy rules instead; see section 3 for the effect of each.
+
+### 6.2 The policy editor
+
+1. Sign in as `$ROOT`. Click **Policy**. The top line reads *2 rules, 1 limits, 1 budgets, 0 freezes ... active v1* and *2 of 2 of the policy's own tests pass*.
+2. Use the **Rule builder** if you like (it appends a rule to the text), or edit the text directly: change the `big-payouts` condition `value: 1000` to `value: 400`.
+3. Click **Validate and run its tests**: *Valid. 2 tests pass* and a *Changes from the active version* diff.
+4. Click **Simulate against captured history**: the 500 payout is *Newly needing approval*.
+5. Type a note (`lower payout threshold to 400`) and click **Publish and activate** (admin). The *Versions* table now lists v1, v2 and v3; v3 has the *active* badge.
+6. Click **diff** on the v3 row (v2 to v3), then **Activate** on any other row to roll back. The server reloads on every activation.
+
+```bash
+rvg policy history
+call c-1 payout '{"amount":500,"to":"acct_9"}' | cut -c1-110
+```
+
+```text
+v1  ...Z  by root  2 tests  ce2efb2232f0  - baseline
+v2  ...Z  by root  5 tests  ...  - pause payouts today, release freeze, closed-tomorrow refunds
+v3  *active*  ...Z  by root  2 tests  ...  - lower payout threshold to 400
+{"decision":"block","reasons":["approval required: request apr_... is pending an operator decision (needs 2 approvers from finance); retry after it is approved"]}
+```
+
+## 7. Run inspection and search
+
+**What this proves:** every run and call can be found and explained afterwards, from the CLI, the API and the console.
+
+```bash
+rvg runs list
+rvg runs list --status needs_attention --tool payout
+rvg actions list --tool payout --limit 3
+rvg actions show a-1 0
+rvg actions show c-1 1 | grep captured
+rvg search --event blocked --text budget | cut -c1-150
+```
+
+```text
+a-1  actor=pay-agent  mode=enforce  steps=4  needs_attention  UNRESOLVED=1,2,3
+c-1  actor=pay-agent  mode=enforce  steps=3  needs_attention  UNRESOLVED=0,2
+e-1  actor=pay-agent  mode=enforce  steps=1  needs_attention  UNRESOLVED=0
+m-1  actor=pay-agent  mode=enforce  steps=2  complete
+...
+t-1  actor=acme-agent  mode=enforce  steps=0  blocked_only  tenant=acme
+a-1  actor=pay-agent  mode=enforce  steps=4  needs_attention  UNRESOLVED=1,2,3
+c-1  ...
+p-2  ...
+2026-10-16 ...Z  a-1#0  payout    compensable  succeeded   pay-agent  risk 75
+...
+a-1 step 0: payout  [compensable]  succeeded
+why: manual test
+manifest v1, risk 75
+undo: refund (compensation)
+undo arguments: {"charge_id":"po_1"}
+result hash: ...
+arguments are not stored (only their hash is in the ledger); turn on capture to keep redacted copies
+...
+  approval apr_...: consumed by alice, bob
+...
+captured arguments (redacted): {"amount":500,"to":"acct_2"}
+    13  ...Z  p-1  blocked  charge_card  pay-agent  | budget `charge-budget`: 200 of 1000 used in 86400s, this call would make it 9200; risk sco
+    16  ...Z  p-1  blocked  charge_card  pay-agent  | budget `charge-budget`: 800 of 1000 used in 86400s, this call would make it 1100
+```
+
+Runs with an unresolved step (an intent whose outcome was never reported, like most of these test calls) show as `needs_attention`.
+`actions show` lists the approvals behind a call; `a-1` was run before capture was on, so it can only say the arguments were not kept, while `c-1` shows the redacted copy.
+
+The search API needs an auditor key or better:
+
+```bash
+j $AUD "$B/v1/search/runs?tool=payout&limit=2" | jq -c '{runs:[.runs[]|{run_id,status,tools}],next}'
+j $AUD "$B/v1/search/records?event=blocked&text=limit" | jq -c '.records[]|{seq,run_id,event,detail}'
+```
+
+```text
+{"runs":[{"run_id":"a-1","status":"needs_attention","tools":["payout","read_balance"]},{"run_id":"c-1",...}],"next":"c-1"}
+{"seq":...,"run_id":"p-1","event":"blocked","detail":"limit `balance-polling`: 3 calls per 60s exceeded"}
+```
+
+Both take `actor`, `tool`, `since`, `until`, `text` and `limit` (runs also `status`, `tenant`, `mode`, `after`; records also `run`, `event`, `after_seq`). Page through with `next`.
+
+In the console: **Runs** has filters (actor, tenant, tool, *needs attention*). Open any run for steps, the rollback plan, approvals and the event trail. Click **Compare two runs** (or open
+`/console/compare?a=a-1&b=c-1`): the two step lists sit side by side.
+
+## Not covered here
+
+- Manifest `timeout_ms` is enforced by the gateway on the upstream call; it was checked by reading the code, not run.
+- Manifest-level `approval:` roles, quorum and timeout, and the *Approver groups* field of the form builder, are not exercised by this guide.
+- Delegation expiry in the console (its form takes whole hours); expiry was tested with the CLI.
+- Policy `environment` rules, `default: deny`, `content:` checks, PII handling in capture and the capture time limit.
+- OIDC login, notifications to Slack or email, `reversi apply`, the Helm chart, and the gateway.

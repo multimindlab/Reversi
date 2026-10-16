@@ -31,6 +31,16 @@ const FIXTURES: Array<[string, unknown, boolean]> = [
   ["irreversible", { tool: "send_email", effect: "irreversible", permission: "mail:send" }, true],
   ["irreversible, explicit approval", { tool: "send_email", effect: "irreversible", permission: "mail:send", approval: "always" }, true],
   ["with requires", { tool: "b", effect: "read_only", permission: "p", requires: ["a"] }, true],
+  [
+    "rich manifest",
+    { tool: "pay.create", effect: "compensable", permission: "p", version: 2, status: "deprecated", replaced_by: "pay.v2", owner: "o", risk: { data_class: "financial", blast_radius: "high" }, timeout_ms: "30s", idempotency: { key: "{{args.order_id}}", scope: "actor" }, audit: { retention_days: 30, evidence_export: "required", redaction: ["$args.secret"] }, approval: { roles: ["fin"], quorum: 2, timeout: "15m", on_timeout: "escalate" }, compensation: comp("pay.cancel", { kind: "compensation", residue: ["notification sent"], verification: { tool: "pay.get", arguments: { id: "$result.id" }, expect: { status: "canceled" }, retries: 3, backoff_ms: "2s" } }) },
+    true,
+  ],
+  ["retry on read_only", { tool: "x", effect: "read_only", permission: "p", retry: { attempts: 3 } }, true],
+  ["retry on compensable", { tool: "x", effect: "compensable", permission: "p", retry: { attempts: 3 }, compensation: comp("y") }, false],
+  ["bad status", { tool: "x", effect: "read_only", permission: "p", status: "retired" }, false],
+  ["idempotency without template", { tool: "x", effect: "read_only", permission: "p", idempotency: { key: "plain" } }, false],
+  ["verification without expect", { tool: "x", effect: "reversible", permission: "p", compensation: comp("y", { verification: { tool: "g" } }) }, false],
   ["compensable without compensation", { tool: "x", effect: "compensable", permission: "p" }, false],
   ["reversible without compensation", { tool: "x", effect: "reversible", permission: "p" }, false],
   ["read_only with compensation", { tool: "x", effect: "read_only", permission: "p", compensation: comp("y") }, false],
@@ -154,5 +164,30 @@ describe("resolveRef", () => {
   it("does not walk the prototype chain", () => {
     expect(resolveRef("$args.constructor", "args", {})).toBeUndefined();
     expect(resolveRef("$args.__proto__", "args", {})).toBeUndefined();
+  });
+});
+
+describe("richer manifests", () => {
+  it("normalizes defaults and parses durations", () => {
+    const r = validateManifest({ tool: "x", effect: "reversible", permission: "p", timeout_ms: "30s", compensation: { tool: "y", timeout_ms: "1m", verification: { tool: "g", expect: { a: 1 }, backoff_ms: "2s" } } });
+    expect(r.ok && r.manifest).toMatchObject({ version: 1, status: "approved", timeout_ms: 30000, compensation: { kind: "compensation", residue: [], timeout_ms: 60000, verification: { retries: 3, backoff_ms: 2000 } } });
+  });
+
+  it("the approval object normalizes into rules and still forces approval", () => {
+    const r = validateManifest({ tool: "x", effect: "read_only", permission: "p", approval: { roles: ["fin"], quorum: 2, timeout: "15m", on_timeout: "escalate", escalate_to: ["cfo"] } });
+    expect(r.ok && r.manifest).toMatchObject({ approval: "always", approval_rules: { roles: ["fin"], quorum: 2, timeout_ms: 900000, on_timeout: "escalate", escalate_to: ["cfo"] } });
+  });
+
+  it("accepts requires as objects and an inverse without residue", () => {
+    const r = validateManifest({ tool: "x", effect: "reversible", permission: "p", requires: [{ tool: "a", status: "succeeded" }, "b"], compensation: { tool: "y", kind: "inverse" } });
+    expect(r.ok && r.manifest.requires).toEqual(["a", "b"]);
+  });
+
+  it("registry checks that a verification tool exists and is read-only, and that replaced_by exists", () => {
+    const base = { tool: "x", effect: "reversible", permission: "p", compensation: { tool: "y", verification: { tool: "get_x", expect: { gone: true } } } };
+    expect(() => Registry.from([base, { tool: "y", effect: "idempotent", permission: "p" }])).toThrow(/verification tool `get_x` is not registered/);
+    expect(() => Registry.from([base, { tool: "y", effect: "idempotent", permission: "p" }, { tool: "get_x", effect: "idempotent", permission: "p" }])).toThrow(/must be read_only/);
+    expect(() => Registry.from([{ tool: "old", effect: "read_only", permission: "p", status: "deprecated", replaced_by: "new" }])).toThrow(/replaced_by `new` is not registered/);
+    expect(Registry.from([base, { tool: "y", effect: "idempotent", permission: "p" }, { tool: "get_x", effect: "read_only", permission: "p" }]).size).toBe(3);
   });
 });

@@ -18,7 +18,11 @@ import type { ContentChecker } from "./content.js";
 import { Ledger, type LedgerEvent } from "./ledger.js";
 import { redactSecrets } from "./redact.js";
 import { Registry, resolveRef } from "./manifest.js";
-import type { Policy, PolicyInput } from "./policy.js";
+import type { Verification } from "./manifest.js";
+import type { CaptureStore } from "./capture.js";
+import type { KvStore } from "./kv.js";
+import type { ApprovalRequirement, Policy, PolicyInput } from "./policy.js";
+import { globAny } from "./glob.js";
 import { SealedScope } from "./scope.js";
 import {
   MemoryRunStore,
@@ -68,6 +72,14 @@ export interface ApprovalRequest {
   triggers?: string[];
   /** Names of the arguments (never values). */
   arg_keys?: string[];
+  /** The actor of the run, so the requester cannot approve their own request. */
+  requested_by?: string;
+  /** Roles or groups that may approve; empty means any approver. */
+  required_roles?: string[];
+  quorum?: number;
+  timeout_ms?: number;
+  on_timeout?: "deny" | "escalate";
+  escalate_to?: string[];
 }
 /** `true`/`false`, or a decision with a message that is shown to the caller when not approved. */
 export type ApprovalDecision = boolean | { approved: boolean; message?: string };
@@ -86,6 +98,25 @@ export interface ReversiOptions {
   environment?: string;
   /** If this file exists, every new call is blocked (rollback still works). */
   kill_switch_file?: string;
+  /** Opt-in capture of redacted arguments and results, for replay, simulation and impact previews. */
+  capture?: CaptureStore;
+  /** Shared settings store: halts are kept here so every process using the same data store sees them. */
+  kv?: KvStore;
+}
+
+/** What a halt applies to. An empty scope halts everything. */
+export interface HaltScope {
+  tool?: string;
+  actor?: string;
+  tenant?: string;
+  environment?: string;
+}
+export interface Halt {
+  id: string;
+  reason: string;
+  scope: HaltScope;
+  by: string;
+  ts_ms: number;
 }
 
 export interface StartRunOptions {
@@ -95,6 +126,8 @@ export interface StartRunOptions {
   /** `enforce` blocks violations. `observe` journals them as `would_block` and lets the call run. */
   mode?: Mode;
   reason?: string;
+  /** Customer or team the run belongs to. */
+  tenant?: string;
 }
 
 export interface BeginInput {
@@ -103,6 +136,10 @@ export interface BeginInput {
   reason: string;
   /** Steps this call depends on beyond the manifest's `requires`. */
   depends_on?: number[];
+  /** Violations found by the caller before asking (for example schema validation in the gateway). Treated like policy denials. */
+  extra_violations?: string[];
+  /** Notes for the ledger record of the intent. */
+  extra_notes?: string[];
 }
 
 export type BeginResult =
@@ -111,7 +148,14 @@ export type BeginResult =
   | { decision: "block"; reasons: string[] };
 
 export type Outcome =
-  | { status: "succeeded"; result?: unknown }
+  | {
+      status: "succeeded";
+      result?: unknown;
+      /** Appended to the ledger detail. */
+      notes?: string[];
+      /** The result does not match what the tool promised: its `$result` references cannot be trusted for compensation. */
+      invalid_result?: boolean;
+    }
   | { status: "failed"; error?: string }
   | { status: "uncertain"; error?: string };
 
@@ -125,6 +169,11 @@ export interface PlanAction {
   step: number;
   tool: string;
   kind: PlanKind;
+  /** What the undo will not take back. */
+  residue?: string[];
+  compensation_kind?: "inverse" | "compensation";
+  /** The undo is read back before it counts as complete. */
+  verified?: boolean;
   compensation_tool?: string;
   args?: Record<string, unknown>;
   idempotency_key?: string;
@@ -167,6 +216,8 @@ export interface RollbackReport {
   skipped: number[];
   failed: Array<{ step: number; error: string }>;
   unrecoverable: number[];
+  /** Compensations that ran but whose declared read-back could not be performed (no verifier) or was not possible. */
+  unverified: number[];
   unresolved: number[];
   unmanifested: number[];
   deferred: Array<{ step: number; blocked_by: number[] }>;
@@ -177,6 +228,52 @@ export interface RollbackReport {
 
 export function idempotencyKey(run_id: string, step: number, tool: string): string {
   return sha256Hex(canonicalize([run_id, step, tool]));
+}
+
+/** Several approval requirements on one call: any listed role may approve, the biggest quorum wins, the shortest timeout wins. */
+export function mergeRequirements(reqs: ApprovalRequirement[]): Pick<ApprovalRequest, "required_roles" | "quorum" | "timeout_ms" | "on_timeout" | "escalate_to"> {
+  if (reqs.length === 0) return {};
+  const timeouts = reqs.map((r) => r.timeout_ms).filter((t): t is number => t !== undefined);
+  return {
+    required_roles: [...new Set(reqs.flatMap((r) => r.roles))],
+    quorum: Math.max(...reqs.map((r) => r.quorum)),
+    ...(timeouts.length ? { timeout_ms: Math.min(...timeouts) } : {}),
+    on_timeout: reqs.some((r) => r.on_timeout === "deny" || r.on_timeout === undefined) ? "deny" : "escalate",
+    escalate_to: [...new Set(reqs.flatMap((r) => r.escalate_to ?? []))],
+  };
+}
+
+/** `{{args.a.b}}` placeholders rendered from the call arguments; undefined if any is missing or not a scalar. */
+export function renderIdempotencyKey(template: string, args: unknown): string | undefined {
+  let missing = false;
+  const out = template.replace(/\{\{\s*(args(?:\.[A-Za-z0-9_-]+)+)\s*\}\}/g, (_m, path: string) => {
+    const v = resolveRef(`$${path}`, "args", args);
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
+    missing = true;
+    return "";
+  });
+  return missing ? undefined : out;
+}
+
+const LIVE_STATUSES = new Set<StepStatus>(["intended", "succeeded", "uncertain", "compensating", "compensation_failed"]);
+
+/** Compare a verification result with its `expect` (dotted path -> value). Returns a description of the first mismatch, or null. */
+export function expectMismatch(actual: unknown, expect: Record<string, unknown>): string | null {
+  for (const [path, want] of Object.entries(expect)) {
+    let cur: unknown = actual;
+    for (const seg of path.split(".")) {
+      if (Array.isArray(cur) && /^\d+$/.test(seg)) cur = cur[Number(seg)];
+      else if (typeof cur === "object" && cur !== null && Object.prototype.hasOwnProperty.call(cur, seg)) cur = (cur as Record<string, unknown>)[seg];
+      else {
+        cur = undefined;
+        break;
+      }
+    }
+    if (canonicalize(cur === undefined ? null : cur) !== canonicalize(want === undefined ? null : want) || (cur === undefined && want !== undefined)) {
+      return `\`${path}\` is ${cur === undefined ? "missing" : JSON.stringify(cur)}, expected ${JSON.stringify(want)}`;
+    }
+  }
+  return null;
 }
 
 function isArgObject(v: unknown): v is Record<string, unknown> {
@@ -228,6 +325,9 @@ function classify(state: RunState, s: StepState): PlanAction | null {
         args: s.handle ?? {},
         idempotency_key: idempotencyKey(state.run_id, s.step, s.tool),
         needs_approval: s.compensation_requires_approval,
+        ...(s.residue?.length ? { residue: s.residue } : {}),
+        ...(s.compensation_kind ? { compensation_kind: s.compensation_kind } : {}),
+        ...(s.verification ? { verified: true } : {}),
       };
     }
     case "skip":
@@ -251,18 +351,22 @@ function classify(state: RunState, s: StepState): PlanAction | null {
 }
 
 export class Reversi {
-  readonly registry: Registry;
+  registry: Registry;
   readonly ledger: Ledger;
   readonly runs: RunStore;
-  readonly policy: Policy | undefined;
-  readonly content: ContentChecker | undefined;
+  policy: Policy | undefined;
+  content: ContentChecker | undefined;
   readonly environment: string;
   private readonly approver: Approver | undefined;
   private readonly clock: () => number;
   private readonly killFile: string | undefined;
-  private haltReason: string | null = null;
+  private readonly memoryHalts = new Map<string, Halt>();
+  private readonly kv: KvStore | undefined;
+  readonly capture: CaptureStore | undefined;
 
   constructor(opts: ReversiOptions) {
+    this.kv = opts.kv;
+    this.capture = opts.capture;
     this.policy = opts.policy;
     this.content = opts.content;
     this.environment = opts.environment ?? "default";
@@ -288,6 +392,7 @@ export class Reversi {
         parent_seal: opts.scope.parentSeal,
       },
       created_ms: this.clock(),
+      ...(opts.tenant ? { tenant: opts.tenant } : {}),
       steps: [],
     };
     this.ledger.append({
@@ -313,16 +418,56 @@ export class Reversi {
     return this.runs.list();
   }
 
-  /** Emergency stop: block every new call until {@link Reversi.resume}. Rollbacks are not affected. */
-  halt(reason: string): void {
-    this.haltReason = reason || "halted by operator";
+  /**
+   * Swap in new manifests, policy or content checks without a restart (hot reload). Calls already in flight finish under
+   * the rules they started with; the next call sees the new ones.
+   */
+  reload(parts: { registry?: Registry; policy?: Policy | undefined; content?: ContentChecker | undefined }): void {
+    if (parts.registry) this.registry = parts.registry;
+    if ("policy" in parts) this.policy = parts.policy;
+    if ("content" in parts) this.content = parts.content;
   }
-  resume(): void {
-    this.haltReason = null;
+
+  /**
+   * Emergency stop: block new calls until {@link Reversi.resume}. With no scope it stops everything; a scope narrows it to
+   * a tool (glob), actor, tenant or environment. Rollbacks are never affected. Halts live in the shared settings store when
+   * there is one, so every process sees them.
+   */
+  halt(reason: string, scope: HaltScope = {}, by = "operator"): Halt {
+    const h: Halt = { id: `halt_${randomUUID()}`, reason: reason || "halted by operator", scope, by, ts_ms: this.clock() };
+    if (this.kv) this.kv.put("halts", h.id, h);
+    else this.memoryHalts.set(h.id, h);
+    return h;
   }
-  /** The reason new calls are blocked, or null. Also true while the kill-switch file exists. */
-  halted(): string | null {
-    if (this.haltReason !== null) return this.haltReason;
+
+  /** Lift one halt by id, or all of them. Returns how many were lifted. */
+  resume(id?: string): number {
+    const all = this.halts().filter((h) => !id || h.id === id);
+    for (const h of all) {
+      if (this.kv) this.kv.delete("halts", h.id);
+      else this.memoryHalts.delete(h.id);
+    }
+    return all.length;
+  }
+
+  halts(): Halt[] {
+    return this.kv ? this.kv.list<Halt>("halts").map((e) => e.value) : [...this.memoryHalts.values()];
+  }
+
+  /** The reason new calls (matching `ctx`, if given) are blocked, or null. The kill-switch file halts everything. */
+  halted(ctx?: { tool?: string; actor?: string; tenant?: string; environment?: string }): string | null {
+    for (const h of this.halts()) {
+      const s = h.scope;
+      const applies =
+        (s.tool === undefined || (ctx?.tool !== undefined && globAny(s.tool, ctx.tool))) &&
+        (s.actor === undefined || (ctx?.actor !== undefined && globAny(s.actor, ctx.actor))) &&
+        (s.tenant === undefined || (ctx?.tenant !== undefined && globAny(s.tenant, ctx.tenant))) &&
+        (s.environment === undefined || (ctx?.environment !== undefined && globAny(s.environment, ctx.environment)));
+      if (applies) {
+        const scope = Object.entries(s).map(([k, v]) => `${k}=${v}`).join(", ");
+        return scope ? `${h.reason} (scope: ${scope})` : h.reason;
+      }
+    }
     if (this.killFile && existsSync(this.killFile)) return `kill switch file ${this.killFile} exists`;
     return null;
   }
@@ -411,6 +556,29 @@ export class Run {
       else violations.push(`depends_on step ${d} does not exist`);
     }
 
+    if (manifest?.status === "draft") violations.push(`the manifest for \`${call.tool}\` is a draft: publish it before it can be enforced`);
+    if (call.extra_violations?.length) violations.push(...call.extra_violations);
+
+    // Duplicate-call guard: the same rendered idempotency key must not run twice while the first still stands.
+    let idemKey: string | undefined;
+    if (manifest?.idempotency) {
+      const rendered = renderIdempotencyKey(manifest.idempotency.key, call.args);
+      if (rendered === undefined) {
+        violations.push(`idempotency key \`${manifest.idempotency.key}\` needs arguments that are missing or not simple values`);
+      } else {
+        idemKey = `${call.tool}|${rendered}`;
+        const scope = manifest.idempotency.scope;
+        const runs = scope === "run" ? [state] : this.rv.runIds().map((id) => this.rv.runs.get(id)).filter((r): r is RunState => !!r && (scope === "global" || r.actor === state.actor));
+        for (const r of runs) {
+          const dup = r.steps.find((x) => x.idem_key === idemKey && LIVE_STATUSES.has(x.status));
+          if (dup) {
+            violations.push(`duplicate call: idempotency key matches step ${dup.step} of run ${r.run_id} (${dup.status})${dup.status === "intended" ? ", which is still in flight" : ""}`);
+            break;
+          }
+        }
+      }
+    }
+
     // Arguments with no canonical form (Infinity, NaN, BigInt...) would all share one hash, which would let an
     // approval granted for one call cover another. Treat them as a violation and never match an approval.
     let argsHash: string;
@@ -421,8 +589,9 @@ export class Run {
       violations.push(`arguments cannot be canonicalized: ${e instanceof Error ? e.message : "unsupported value"}`);
     }
     const triggers: string[] = [];
-    const notes: string[] = [];
-    const halted = this.rv.halted();
+    const notes: string[] = [...(call.extra_notes ?? [])];
+    if (manifest?.status === "deprecated") notes.push(`manifest deprecated${manifest.replaced_by ? `; use ${manifest.replaced_by}` : ""}`);
+    const halted = this.rv.halted({ tool: call.tool, actor: state.actor, tenant: state.tenant, environment: this.rv.environment });
     if (halted) violations.push(`kill switch: ${halted}`);
     const policyInput: PolicyInput = {
       tool: call.tool,
@@ -432,11 +601,26 @@ export class Run {
       run_id: this.run_id,
       environment: this.rv.environment,
       args: call.args,
+      tenant: state.tenant,
+      data_class: manifest?.risk?.data_class,
+      blast_radius: manifest?.risk?.blast_radius,
     };
+    const requirements: ApprovalRequirement[] = [];
+    let riskScore: number | undefined;
     if (this.rv.policy) {
       const d = this.rv.policy.evaluate(policyInput);
       violations.push(...d.deny);
       triggers.push(...d.approve);
+      requirements.push(...d.requirements);
+      notes.push(...d.warnings);
+      if (d.risk) {
+        riskScore = d.risk.score;
+        notes.push(`risk ${d.risk.score}${d.risk.factors.length ? ` (${d.risk.factors.join(", ")})` : ""}`);
+      }
+    }
+    if (manifest?.approval_rules) {
+      const a = manifest.approval_rules;
+      requirements.push({ roles: a.roles, quorum: a.quorum, timeout_ms: a.timeout_ms, on_timeout: a.on_timeout, escalate_to: a.escalate_to, source: `manifest \`${manifest.tool}\`` });
     }
     if (this.rv.content) {
       const succeeded = state.steps.filter((x) => x.status === "succeeded").map((x) => x.tool);
@@ -453,6 +637,7 @@ export class Run {
     const enforce = state.mode === "enforce";
     if (violations.length && enforce) {
       this.emit("blocked", null, call.tool, call.args, call.reason, violations.join("; "));
+      this.captureCall(state, call, manifest?.audit?.redaction, null, "block", violations, riskScore, manifest?.version);
       return { decision: "block", reasons: violations };
     }
     const observed = [...violations];
@@ -469,6 +654,8 @@ export class Run {
             args_hash: argsHash,
             triggers,
             arg_keys: isArgObject(call.args) ? Object.keys(call.args).slice(0, 50) : [],
+            requested_by: state.actor,
+            ...mergeRequirements(requirements),
           })
         : false;
       const approved = typeof decision === "boolean" ? decision : decision.approved;
@@ -483,6 +670,7 @@ export class Run {
               : "approval required but no approver is configured";
         if (enforce) {
           this.emit("blocked", null, call.tool, call.args, call.reason, `${msg} [${triggers.join("; ")}]`);
+          this.captureCall(state, call, manifest?.audit?.redaction, null, "block", [msg], riskScore, manifest?.version);
           return { decision: "block", reasons: [msg] };
         }
         observed.push(msg);
@@ -522,9 +710,81 @@ export class Run {
       handle_missing: missing,
       error: null,
       ts_ms: this.rv.internals.now(),
+      ...(manifest ? { manifest_version: manifest.version } : {}),
+      ...(manifest?.compensation
+        ? {
+            compensation_kind: manifest.compensation.kind,
+            residue: manifest.compensation.residue,
+            ...(manifest.compensation.timeout_ms ? { compensation_timeout_ms: manifest.compensation.timeout_ms } : {}),
+            ...(manifest.compensation.verification ? { verification: this.resolveVerification(manifest.compensation.verification, call.args, undefined, "call") } : {}),
+          }
+        : {}),
+      ...(idemKey ? { idem_key: idemKey } : {}),
+      ...(riskScore !== undefined ? { risk_score: riskScore } : {}),
     });
     this.rv.runs.put(st);
+    this.captureCall(state, call, manifest?.audit?.redaction, step, observed.length ? "would_block" : "allow", observed, riskScore, manifest?.version);
     return observed.length ? { decision: "would_block", step, reasons: observed } : { decision: "allow", step };
+  }
+
+  /**
+   * Resolve a verification's argument references. At call time only `$args.*` are known; when the call succeeds the
+   * `$result.*` ones are filled in (`result` given). Anything that cannot be resolved is listed in `missing`, and the
+   * verification is then reported as unverifiable instead of being skipped.
+   */
+  private resolveVerification(
+    v: Verification,
+    args: unknown,
+    result: unknown,
+    stage: "call" | "result",
+    previous?: NonNullable<StepState["verification"]>,
+  ): NonNullable<StepState["verification"]> {
+    const resolved: Record<string, unknown> = { ...(previous?.args ?? {}) };
+    const missing = new Set(previous?.missing ?? []);
+    for (const [key, ref] of Object.entries(v.arguments)) {
+      const fromArgs = ref.startsWith("$args.");
+      if (fromArgs && stage === "call") {
+        const val = resolveRef(ref, "args", args);
+        if (val === undefined) missing.add(key);
+        else resolved[key] = val;
+      } else if (!fromArgs && stage === "result") {
+        const val = result === undefined ? undefined : resolveRef(ref, "result", result);
+        if (val === undefined) missing.add(key);
+        else resolved[key] = val;
+      }
+    }
+    return { tool: v.tool, refs: v.arguments, args: resolved, expect: v.expect, retries: v.retries, backoff_ms: v.backoff_ms, missing: [...missing] };
+  }
+
+  private captureCall(
+    state: RunState,
+    call: BeginInput,
+    redact: string[] | undefined,
+    step: number | null,
+    decision: "allow" | "would_block" | "block",
+    reasons: string[],
+    risk: number | undefined,
+    manifest_version: number | undefined,
+  ): void {
+    if (!this.rv.capture?.enabled) return;
+    try {
+      this.rv.capture.record({
+        run_id: this.run_id,
+        step,
+        tool: call.tool,
+        actor: state.actor,
+        tenant: state.tenant,
+        environment: this.rv.environment,
+        args: call.args,
+        decision,
+        reasons,
+        manifest_version,
+        risk_score: risk,
+        redact_paths: redact,
+      });
+    } catch {
+      /* capture is a convenience: it must never stop a call */
+    }
   }
 
   /** Record the outcome of a call that {@link Run.begin} allowed. */
@@ -591,13 +851,26 @@ export class Run {
       const missing = [...s.handle_missing];
       for (const [key, ref] of Object.entries(s.argument_map)) {
         if (!ref.startsWith("$result.")) continue;
-        const v = resolveRef(ref, "result", outcome.result);
+        const v = outcome.invalid_result ? undefined : resolveRef(ref, "result", outcome.result);
         if (v === undefined) missing.push(key);
         else handle[key] = v;
       }
+      if (s.verification) {
+        const sp = s.verification;
+        s.verification = this.resolveVerification(
+          { tool: sp.tool, arguments: sp.refs, expect: sp.expect, retries: sp.retries, backoff_ms: sp.backoff_ms },
+          undefined,
+          outcome.invalid_result ? undefined : outcome.result,
+          "result",
+          sp,
+        );
+      }
+      s.result_hash = hashPayload(outcome.result);
       const flagged = this.rv.content?.inspect(outcome.result).filter((f) => f.kind === "injection" || f.kind === "encoded_payload") ?? [];
       const detail = [
         missing.length ? `compensation arguments unavailable: ${missing.join(", ")}` : "",
+        outcome.invalid_result ? "result does not match the tool's declared output" : "",
+        ...(outcome.notes ?? []),
         ...flagged.map((f) => `result content check (${f.kind}): ${f.detail}`),
         who,
       ].filter(Boolean);
@@ -612,6 +885,13 @@ export class Run {
       s.error = error || null;
     }
     this.rv.runs.put(st);
+    if (this.rv.capture?.enabled && (s.status === "succeeded" || s.status === "failed" || s.status === "uncertain")) {
+      try {
+        this.rv.capture.complete(this.run_id, step, s.status, outcome.status === "succeeded" ? outcome.result : undefined, this.rv.registry.get(s.tool)?.audit?.redaction);
+      } catch {
+        /* see above */
+      }
+    }
     return { step, status: s.status };
   }
 
@@ -792,6 +1072,44 @@ export class Run {
     this.rv.runs.put(st);
   }
 
+  private async runVerification(
+    step: number,
+    v: NonNullable<StepState["verification"]>,
+    verifier: ((tool: string, args: Record<string, unknown>) => unknown | Promise<unknown>) | undefined,
+    actor: string | undefined,
+    sleep: (ms: number) => Promise<void>,
+    _base: number,
+    _cap: number,
+  ): Promise<"verified" | "failed" | "impossible" | "unverified"> {
+    const reason = `rollback of run ${this.run_id}: verify the undo of step ${step}`;
+    const who = actor ?? "operator";
+    if (v.missing.length) {
+      this.emit("verification_failed", step, v.tool, null, reason, `cannot verify: arguments unavailable (${v.missing.join(", ")})`, who);
+      return "impossible";
+    }
+    if (!verifier) {
+      this.emit("unverified", step, v.tool, v.args, reason, "no verifier is available to run the declared read-back", who);
+      return "unverified";
+    }
+    let last = "";
+    for (let attempt = 1; attempt <= v.retries; attempt++) {
+      try {
+        const got = await verifier(v.tool, v.args);
+        const mismatch = expectMismatch(got, v.expect);
+        if (!mismatch) {
+          this.emit("verified", step, v.tool, v.args, reason, `${v.tool} matched the expected state${attempt > 1 ? ` on attempt ${attempt}` : ""}`, who);
+          return "verified";
+        }
+        last = mismatch;
+      } catch (e) {
+        last = `verifier error: ${messageOf(e)}`;
+      }
+      if (attempt < v.retries) await sleep(v.backoff_ms * 2 ** (attempt - 1));
+    }
+    this.emit("verification_failed", step, v.tool, v.args, reason, `after ${v.retries} attempts: ${last}`, who);
+    return "failed";
+  }
+
   /**
    * Undo the run: newest step first, skipping nothing silently. A step is never undone while a step
    * depending on it is still standing. Failures do not stop independent steps. Safe to call again:
@@ -804,6 +1122,12 @@ export class Run {
     retry?: { attempts?: number; base_ms?: number; max_ms?: number; sleep?: (ms: number) => Promise<void> };
     /** After a compensation reports success, confirm the undo is visible downstream. `false` or a throw counts as failure. */
     verify?: (call: CompensationCall) => boolean | Promise<boolean>;
+    /**
+     * Executes a manifest-declared verification: call `tool` with `args` and return what it returned (parsed). The engine
+     * compares it with the declared `expect`, retrying with backoff. Without a verifier, a step that declares one is
+     * reported as `unverified` and the rollback is not complete.
+     */
+    verifier?: (tool: string, args: Record<string, unknown>) => unknown | Promise<unknown>;
   }): Promise<RollbackReport> {
     const attempts = Math.max(1, opts.retry?.attempts ?? 1);
     const base = opts.retry?.base_ms ?? 200;
@@ -819,6 +1143,7 @@ export class Run {
       unmanifested: [],
       deferred: [],
       awaiting_approval: [],
+      unverified: [],
       complete: false,
     };
     const order = this.load()
@@ -841,9 +1166,20 @@ export class Run {
                 if (attempt < attempts) await sleep(Math.min(cap, base * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2));
               }
             }
+            let unverified = false;
+            if (error === null) {
+              const sv = this.load().steps.find((x) => x.step === n)?.verification;
+              if (sv) {
+                const outcome = await this.runVerification(n, sv, opts.verifier, opts.actor, sleep, base, cap);
+                if (outcome === "failed") error = `verification failed: ${sv.tool} did not show the expected state after the undo`;
+                else if (outcome === "impossible") error = `verification impossible: arguments unavailable (${sv.missing.join(", ")})`;
+                else if (outcome === "unverified") unverified = true;
+              }
+            }
             if (error === null) {
               this.completeCompensation(n, { status: "compensated" }, { actor: opts.actor });
               report.compensated.push(n);
+              if (unverified) report.unverified.push(n);
             } else {
               const msg = attempts > 1 ? `${error} (after ${attempts} attempts)` : error;
               this.completeCompensation(n, { status: "failed", error: msg }, { actor: opts.actor });
@@ -873,7 +1209,8 @@ export class Run {
       report.unresolved.length === 0 &&
       report.unmanifested.length === 0 &&
       report.deferred.length === 0 &&
-      report.awaiting_approval.length === 0;
+      report.awaiting_approval.length === 0 &&
+      report.unverified.length === 0;
     return report;
   }
 }

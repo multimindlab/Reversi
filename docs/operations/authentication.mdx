@@ -1,6 +1,6 @@
 ---
 title: Authentication and roles
-description: API keys with rotation, OIDC bearer tokens, and what each role may do.
+description: API keys with rotation and groups, OIDC bearer tokens, console modes, and what each role may do.
 ---
 
 | Role | Capabilities |
@@ -9,7 +9,7 @@ description: API keys with rotation, OIDC bearer tokens, and what each role may 
 | `auditor` | Read runs, plans, ledger, evidence, metrics |
 | `approver` | Auditor + decide approvals |
 | `operator` | Approver + rollback, resolve |
-| `admin` | Operator + kill switch |
+| `admin` | Operator + kill switch, break-glass, holds, retention, anchors, key management |
 
 A principal may have several roles. Agents are scoped to their own runs; every other role sees all runs.
 
@@ -17,13 +17,25 @@ A principal may have several roles. Agents are scoped to their own runs; every o
 
 ```json keys.json
 [
-  { "name": "support-agent", "role": "agent", "key_sha256": "<hex sha256 of the key>", "max_permissions": ["orders:write"] },
-  { "name": "alice", "role": "approver", "key_sha256": "…" },
+  { "name": "support-agent", "role": "agent", "key_sha256": "<hex sha256 of the key>", "max_permissions": ["orders:write"], "tenant": "acme" },
+  { "name": "fiona", "role": "approver", "groups": ["finance"], "key_sha256": "…" },
   { "name": "ops", "roles": ["operator"], "key_sha256": "…", "not_before": "2026-11-01T00:00:00Z", "expires_at": "2027-05-01T00:00:00Z" }
 ]
 ```
 
-`max_permissions` caps what an agent's runs may request. Agents open runs in `enforce` mode only; set `allow_observe: true` on a key to let it open `observe` runs (which let violating calls proceed, so keep it for lab agents).
+| Field | Meaning |
+|---|---|
+| `name` | The caller. For agents it is the `actor` recorded in the ledger. Several keys may share a name |
+| `role` or `roles` | One role, or a list. Required |
+| `key_sha256` | Lowercase hex SHA-256 of the key (64 characters). Or `key` for a plain key; prefer the hash |
+| `groups` | Group names for [approval routing](/concepts/approvals), such as `finance` |
+| `tenant` | The customer or team. Runs this key opens carry it (used by policy, holds and retention) |
+| `max_permissions` | Caps what an agent's runs may request |
+| `allow_observe` | Let this agent key open `observe` runs. Default false: agents open `enforce` runs only. Observe lets violating calls proceed, so keep it for lab agents |
+| `not_before`, `expires_at` | ISO date or epoch milliseconds. The key is rejected before and from these times |
+| `disabled` | `true` switches the key off immediately |
+
+A key needs `key` or `key_sha256` and a valid role, or the whole file is rejected.
 
 Hash keys (`printf '%s' "$KEY" | shasum -a 256`) rather than storing them. Generate keys with at least 128 bits of entropy
 (`openssl rand -hex 24`). Keys are compared in constant time across all entries.
@@ -31,6 +43,21 @@ Hash keys (`printf '%s' "$KEY" | shasum -a 256`) rather than storing them. Gener
 **Rotation without downtime:** add the new key under the same `name` with a `not_before`, give the old one an `expires_at`,
 hand out the new key, and remove the old entry later. The server reloads the file on `SIGHUP` or when it changes (checked
 every two seconds); a reload that fails to parse keeps the old keys. `disabled: true` switches a key off immediately.
+
+### Managing keys from the server
+
+When the server runs with `REVERSI_KEYS`, an admin can manage the file over HTTP or in the console instead of editing it.
+The server rewrites the file (mode `0600`) and applies the change at once.
+
+| Call | Does |
+|---|---|
+| `GET /v1/keys` | Lists keys with index, name, roles, groups, tenant, dates, `disabled` and a 12-character `fingerprint`. Never the key or its hash |
+| `POST /v1/keys` | Body `name`, `role` or `roles`, optional `groups`, `tenant`, `max_permissions`, `expires_in_days`. Returns a new `rv_…` key **once** |
+| `PATCH /v1/keys/{index}` | `disabled: true or false`, `expires_at` (a date, or `null` to clear) |
+| `DELETE /v1/keys/{index}` | Removes the key. Later indexes shift down, so list again first |
+
+All four need the `admin` role. In the console, **Settings** has a Users and API keys table with create (name, role,
+groups, tenant, days to expiry), disable, enable and remove; a new key is shown once, in the response.
 
 ## OIDC
 
@@ -43,13 +70,63 @@ REVERSI_OIDC_ROLE_MAP='{"reversi-ops":"operator","reversi-approvers":"approver",
 REVERSI_OIDC_ROLE_CLAIM=realm_access.roles     # default: roles
 ```
 
-Checked on every request: signature against the issuer's JWKS (fetched from the discovery document, cached, refreshed at most
-every 10 seconds when an unknown `kid` appears), **RS256 or ES256 only** (never `none`, never HMAC), `iss`, `aud` containing your
-audience, `exp` and `nbf` (60 s skew). The principal's name is `sub`, or the claim named by `REVERSI_OIDC_ACTOR_CLAIM`. Tokens with no mapped role are rejected. The audience check is what stops a token minted for another service
-from working here: set it.
+Checked on every request: signature against the issuer's JWKS, **RS256 or ES256 only** (never `none`, never HMAC), a `kid` in
+the header, `iss`, `aud` containing your audience, `exp` and `nbf` (60 s skew). The audience check is what stops a token
+minted for another service from working here: it is required.
+
+- **JWKS.** Found through the issuer's discovery document (`/.well-known/openid-configuration`) and cached. The key set is
+  re-read every 10 minutes even for known keys, so a key the issuer withdrew stops verifying, and when an unknown `kid`
+  appears, at most once every 10 seconds so a flood of bad tokens cannot hammer the issuer.
+- **Roles.** The role claim may be a string, a list, or a nested path like `realm_access.roles`. Each value is looked up in
+  the role map; unmapped values are ignored, and a token with no mapped role is rejected.
+- **Groups.** Every value of the role claim also counts as a group name, so an approval can be routed to an identity
+  provider group (`approvers: [finance-approvers]`) with no extra mapping.
+- **Name.** `sub`, or the claim named by `REVERSI_OIDC_ACTOR_CLAIM`.
+- **Tenant.** The verifier can read a tenant from a claim (`tenant_claim` in the library), but the server has no setting for
+  it yet, so OIDC principals carry no tenant there.
 
 The server also accepts API keys at the same time, which is handy for service accounts.
 
-## Console login
+## Console modes
 
-Paste a key or token into the [console](/console) login form. A session is a signed cookie, re-checked against the key ring on every request: disabling, expiring or demoting the key ends or narrows the session at once. An OIDC session never outlives its token. Logging out invalidates the cookie.
+The [console](/console) is controlled by `REVERSI_CONSOLE` (or `console.mode` in `reversi.config.yaml`).
+
+| Mode | Meaning |
+|---|---|
+| `off` (default) | Nothing is served under `/console`; it answers 404 with a note on how to turn it on |
+| `open` | No login. Acts as one fixed role (`REVERSI_CONSOLE_ROLE`: `auditor`, `approver` or `operator`; default `operator`). For your own machine; `reversi console` starts it |
+| `login` | Paste an API key or an OIDC access token with a console role. Agent-only credentials are refused |
+
+`open` refuses to start unless `HOST` is loopback (`127.0.0.1`, `::1` or `localhost`), and refuses `admin` as its role. While
+running it answers only requests whose `Host` is a loopback name and whose `Origin`, if any, is the same host; anything else
+gets 403. So key management, break-glass, holds and the kill switch are not available in `open`: use `login` for those.
+
+OIDC browser redirect login (a "Sign in with SSO" button) is not built. In `login` mode a person pastes an OIDC access
+token; there is no redirect flow.
+
+### Sessions
+
+A login produces a signed cookie (HMAC-SHA-256, `HttpOnly`, `SameSite=Strict`, eight hours). For API keys the cookie holds the
+key's **fingerprint**, and every request looks the fingerprint up in the live key ring. Disabling, expiring or removing the
+key ends the session at once, and changing its roles or groups changes what the session may do on the next click. An OIDC
+session never outlives its token. Logging out invalidates the cookie. Set `REVERSI_SESSION_SECRET` so sessions survive a
+restart, and `REVERSI_SECURE_COOKIES=1` behind HTTPS.
+
+## Slack approvals: user mapping
+
+Slack buttons approve as a Reversi person. The Slack user id is looked up in a map you provide. `reversi-server` turns the
+callback (`POST /integrations/slack/actions`) on when both `REVERSI_SLACK_SIGNING_SECRET` and `REVERSI_SLACK_USERS` are set;
+`REVERSI_SLACK_USERS` is the path of a JSON file:
+
+```json
+{ "U123": { "name": "fiona", "roles": ["approver"], "groups": ["finance"] } }
+```
+
+Without the secret the route answers `404 Slack approvals are not enabled`; a secret without the map file stops the server at
+start. In code the same map is `createApp({ slack: { signing_secret, users } })`.
+
+`roles` defaults to `["approver"]`. A mapped user whose roles do not include `approver` or higher (an `auditor`, say) cannot
+decide: they get the same "not set up as an approver" answer as an unmapped user. The request must carry a valid Slack
+signature and a timestamp within five minutes (otherwise 401). Checked locally with signed requests: an unmapped user and a
+mapped auditor are refused, a mapped approver decides the request. Not tested against real Slack. See
+[approvals](/concepts/approvals).

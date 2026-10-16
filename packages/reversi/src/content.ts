@@ -7,11 +7,14 @@
  * they do not prove a call is safe.
  */
 import { globAny } from "./glob.js";
+import { detectPii } from "./pii.js";
 import { findSecrets } from "./redact.js";
 
 export type CheckAction = "flag" | "require_approval" | "deny";
 
 export interface ContentConfig {
+  /** Personal data (emails, phone numbers, card numbers, SSNs, IBANs) in arguments. Off unless set. */
+  pii?: CheckAction;
   secrets: CheckAction;
   encoded_payloads: CheckAction;
   injection: CheckAction;
@@ -36,7 +39,7 @@ export const DEFAULT_CONTENT: ContentConfig = {
 };
 
 export interface Finding {
-  kind: "secret" | "encoded_payload" | "injection" | "cumulative";
+  kind: "secret" | "encoded_payload" | "injection" | "cumulative" | "pii";
   action: CheckAction;
   detail: string;
 }
@@ -139,6 +142,10 @@ export class ContentChecker {
       const s = raw.length > this.config.max_string_bytes ? raw.slice(0, this.config.max_string_bytes) : raw;
       for (const h of direct(s)) {
         add({ kind: h.kind, action: this.config[h.kind === "secret" ? "secrets" : "injection"], detail: h.what });
+      }
+      if (this.config.pii) {
+        const kinds = detectPii(s);
+        if (kinds.length) add({ kind: "pii", action: this.config.pii, detail: `personal data (${kinds.join(", ")})` });
       }
       let layer = [{ via: "", text: s }];
       for (let depth = 1; depth <= MAX_DEPTH; depth++) {

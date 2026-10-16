@@ -4,20 +4,23 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Approvals, ContentChecker, Ledger, Policy, Registry, Reversi, type Principal, type PolicyDoc } from "@multimindlab/reversi";
 import { Gateway, UpstreamPool, type GatewayOptions } from "../src/index.js";
+import { PASS_THROUGH_VALIDATOR } from "../src/upstream.js";
 
 export type Handler = (args: Record<string, unknown> | undefined, meta: Record<string, unknown> | undefined) => CallToolResult | Promise<CallToolResult>;
 export interface Fake {
-  entry: { name: string; client: Client; namespace: boolean };
+  entry: { name: string; client: Client; namespace: boolean; kind: "stdio" | "http" };
   calls: Array<{ name: string; args: unknown; meta: unknown }>;
 }
 
 export const json = (v: unknown): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(v) }] });
 
-export async function fakeUpstream(name: string, tools: Record<string, Handler>, namespace = false): Promise<Fake> {
+export type ToolMeta = Record<string, { inputSchema?: object; outputSchema?: object; annotations?: Record<string, unknown> }>;
+
+export async function fakeUpstream(name: string, tools: Record<string, Handler>, namespace = false, meta: ToolMeta = {}): Promise<Fake> {
   const calls: Fake["calls"] = [];
   const server = new Server({ name, version: "1" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: Object.keys(tools).map((n) => ({ name: n, description: n, inputSchema: { type: "object" as const, properties: {} } })),
+    tools: Object.keys(tools).map((n) => ({ name: n, description: n, inputSchema: { type: "object" as const, properties: {}, ...(meta[n]?.inputSchema ?? {}) }, ...(meta[n]?.outputSchema ? { outputSchema: meta[n]?.outputSchema } : {}), ...(meta[n]?.annotations ? { annotations: meta[n]?.annotations } : {}) })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     calls.push({ name: req.params.name, args: req.params.arguments, meta: req.params._meta });
@@ -27,9 +30,9 @@ export async function fakeUpstream(name: string, tools: Record<string, Handler>,
   });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await server.connect(a);
-  const client = new Client({ name: "gw", version: "1" });
+  const client = new Client({ name: "gw", version: "1" }, { jsonSchemaValidator: PASS_THROUGH_VALIDATOR as never });
   await client.connect(b);
-  return { entry: { name, client, namespace }, calls };
+  return { entry: { name, client, namespace, kind: "stdio" }, calls };
 }
 
 export const MANIFESTS = [
@@ -42,7 +45,7 @@ export const MANIFESTS = [
 export const AGENT: Principal = { name: "agent-1", roles: ["agent"], via: "api_key" };
 export const OPERATOR: Principal = { name: "ops", roles: ["admin"], via: "api_key" };
 
-export function build(opts: { fakes: Fake[]; manifests?: unknown[]; mode?: "observe" | "enforce"; policy?: PolicyDoc; content?: boolean; gw?: Partial<GatewayOptions> }) {
+export function build(opts: { fakes: Fake[]; manifests?: unknown[]; mode?: "observe" | "enforce" | "advise"; policy?: PolicyDoc; content?: boolean; gw?: Partial<GatewayOptions> }) {
   const approvals = new Approvals();
   const reversi = new Reversi({
     registry: Registry.from(opts.manifests ?? MANIFESTS),

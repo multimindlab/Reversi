@@ -1,0 +1,151 @@
+---
+title: Retention, holds and data residency
+description: How long run data is kept, how a legal hold stops deletion, where Reversi may send data, and how personal data is masked.
+---
+
+The ledger is append-only and holds hashes, reasons and details, never argument values, so **it is never deleted**.
+Retention removes the working data around a run: its run state, its approval requests and its captured (redacted)
+arguments. Without a `retention:` section in the policy, nothing is ever deleted.
+
+## The retention policy
+
+```yaml policy.yaml
+retention:
+  default_days: 30
+  rules:
+    - { match: { tool: "mail.*" }, days: 365 }
+    - { match: { data_class: pii, environment: prod }, days: 90 }
+```
+
+- `default_days` is required (a positive integer).
+- Each rule has a `match` and `days`. `match` fields, all optional and all must hold: `tool` (glob, matched against the
+  tools the run called), `tenant`, `environment`, `data_class` (from the manifest's `risk.data_class`).
+- A run is kept for the **longest** of its default, every matching rule, and `audit.retention_days` on the manifest of any
+  tool it called.
+- A manifest with `audit.evidence_export: required` means the run cannot be deleted until its evidence has been archived as
+  a signed bundle (see below).
+
+```yaml tools.yaml
+- tool: mail.send
+  effect: irreversible
+  permission: mail:send
+  audit: { retention_days: 365, evidence_export: required }
+```
+
+Retention runs when you ask it to: there is no built-in timer, so run `reversi retention apply` from cron or a job.
+
+## Plan and apply
+
+```bash
+reversi retention plan
+# r1  0d old  keep 30d  keep
+reversi retention apply --dry-run
+reversi retention apply --archive-dir ./archive --key signing.key
+# deleted: r1
+# archived r1 -> archive/r1.json
+```
+
+`plan` lists every run with its age, how long it is kept and what would happen: `keep`, `due`, `due; needs an evidence
+bundle first`, or `HELD (<reason>)`. `--days <n>` replaces the policy's setting for a one-off run. `apply` deletes the
+due runs, prints `deleted: …` (`would delete: …` with `--dry-run`) and a `kept <run>: <reason>` line for each run it left
+alone.
+
+- **Holds win.** A held run is skipped with `legal hold hold_…: <reason>`.
+- **Evidence export.** With `--archive-dir` and a signing key (`--key`, or the configured `signing_key`) every deleted run
+  first gets a signed bundle at `<archive-dir>/<run_id>.json`, verifiable with `reversi verify-bundle`. A run whose
+  manifest requires export and that has no archive folder or key is skipped:
+  `a manifest requires an evidence bundle before deletion; give an archive directory and a signing key`.
+- **Recorded.** Each deletion appends a `purged` record to the ledger (`retention: older than N days`, with the archive
+  path) and sends a `retention_purged` [notification](/operations/notifications).
+
+The same actions exist on the server and in the console:
+
+| Where | Plan | Apply |
+|---|---|---|
+| HTTP | `GET /v1/retention/plan` (auditor) | `POST /v1/retention/apply` with `{"dry_run": true}` or `{"archive_dir": "…"}` (admin) |
+| Console | **Settings**, Retention: how many runs are due | Dry run and Apply now (admin). The console has no archive folder, so runs that require export are skipped there |
+
+Both answer `404 no retention settings` when the policy has no `retention:` section. The server archives with its signing
+key (`REVERSI_SIGNING_KEY`) and writes to the `archive_dir` you give it, on the server's disk.
+
+## Legal holds
+
+A hold stops retention for the runs it covers, for as long as it is active.
+
+```bash
+reversi hold add --run r1 --reason "case 42"
+# hold_3e81e022-…  holding run_id=r1
+reversi hold add --tenant acme --tool payments.refund --reason "audit 2026-Q4"
+reversi hold list
+reversi hold release hold_3e81e022-…
+```
+
+- **Scope.** Any of `--run`, `--tenant`, `--actor`, `--tool`; all given fields must match. `--tool` is an exact tool name and matches a
+  run that called that tool at least once. A hold with no scope is refused (`a legal hold needs a scope: a run, tenant, actor or
+  tool`), and the reason must be at least 5 characters (a case or matter reference).
+- **Effect.** Retention skips covered runs. A hold does not touch the ledger, which is never deleted anyway, and it does not
+  extend the time-to-live of [captured](#personal-data-in-capture) arguments.
+- **Release** keeps the record (`hold list --all` shows it as released) and makes the run due again.
+- **HTTP:** `GET /v1/holds` (auditor, `?all=1` for released ones), `POST /v1/holds` with `run_id`, `tenant`, `actor`,
+  `tool`, `reason` (admin), `DELETE /v1/holds/{id}` (admin). **Console:** Settings, Legal holds (admin).
+
+## Data residency and egress controls
+
+Reversi itself sends data out in a few places: notification channels, anchor webhooks, OpenTelemetry export, remote
+manifest registries and the gateway's upstream servers. The `egress` settings control where.
+
+```yaml reversi.config.yaml
+egress:
+  allow: ["*.eu.example.com", "hooks.slack.com"]   # host globs; unset means any host
+  block_private: true                              # refuse loopback, private and link-local addresses
+  region: eu-west-1                                # a label recorded in anchors and PDF reports
+```
+
+| Setting | Env | Default | Effect |
+|---|---|---|---|
+| `allow` | `REVERSI_EGRESS_ALLOW` (comma separated) | unset: any host | A destination must match one of these globs |
+| `block_private` | `REVERSI_EGRESS_BLOCK_PRIVATE=1` | off, so local development works | Refuses hosts that are, or resolve to, loopback, private, link-local and carrier-grade NAT addresses |
+| `allow_metadata` | none | off | Cloud metadata addresses (`169.254.169.254` and friends) are **always refused**; this is the only way to lift it and you should not |
+| `region` | `REVERSI_REGION` | none | A label: recorded in anchors and PDF reports. It enforces nothing by itself; `allow` does |
+
+Only `http` and `https` are allowed. Hostnames are resolved before connecting, so a name that points inside the network is
+caught too, and every redirect (at most three) is checked the same way. Refusals read, for example:
+
+```text
+hooks.other.com is not in the egress allowlist (region eu-west-1)
+127.0.0.1 resolves to a private or loopback address (127.0.0.1) and egress.block_private is on
+169.254.169.254 resolves to a cloud metadata address (169.254.169.254), which is never allowed
+```
+
+`reversi doctor` checks each configured notification, trace and webhook URL against these rules. The single
+`REVERSI_APPROVAL_WEBHOOK` goes through the guard too. The server's own Settings page
+says whether egress rules are in force.
+
+## Personal data in capture
+
+The ledger never stores arguments. Replay, simulating a policy against history and impact previews need them, so there is
+an opt-in **capture** store, off by default.
+
+```yaml reversi.config.yaml
+capture:
+  enabled: true        # or REVERSI_CAPTURE=1
+  ttl: 7d              # default 7 days (REVERSI_CAPTURE_TTL_DAYS)
+  redact_pii: true     # default true
+```
+
+Everything is redacted on the way in, before it is stored:
+
+```json
+{"note":"mail [PII:email] card [PII:credit_card] ssn [PII:ssn]","api_key":"[REDACTED:stripe_key]","amount":5}
+```
+
+- **Credentials** (API keys, tokens, private keys and similar patterns) are always replaced, in any field.
+- **Personal data**, while `redact_pii` is on: emails, phone numbers, card numbers (must pass the Luhn check), US social
+  security numbers and IBANs (must pass the checksum). Patterns are conservative on purpose, so an ordinary number is not
+  masked. Set `redact_pii: false` only if you accept storing them.
+- **Named fields.** A manifest can list more paths: `audit.redaction: ["$args.client_secret", "$result.token"]`. They become
+  `[REDACTED]`.
+- **Size.** Strings are cut at 20,000 characters, and long lists and objects at 200 entries.
+- **Expiry.** Records past their time-to-live are no longer returned; `reversi capture purge` deletes them, and
+  `reversi capture purge --run <id>` deletes everything captured for a run. Retention also purges a run's captures when it
+  deletes the run.

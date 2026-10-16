@@ -161,6 +161,9 @@ export interface Sent {
   ok: boolean;
   json: unknown;
   text: string;
+  /** Raw body, set only when the request was sent with `binary: true`. */
+  bytes?: Uint8Array;
+  headers: Headers;
 }
 
 export interface SendOptions {
@@ -168,6 +171,8 @@ export interface SendOptions {
   mutating: boolean;
   secrets: string[];
   timeoutMs: number;
+  /** Read the body as bytes (object downloads) instead of text. */
+  binary?: boolean;
 }
 
 /**
@@ -177,9 +182,15 @@ export interface SendOptions {
 export async function send(f: Fetch, url: string, init: RequestInit, o: SendOptions): Promise<Sent> {
   let res: Response;
   let text: string;
+  let bytes: Uint8Array | undefined;
   try {
     res = await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
-    text = await res.text();
+    if (o.binary) {
+      bytes = new Uint8Array(await res.arrayBuffer());
+      text = res.status >= 200 && res.status < 300 ? "" : new TextDecoder().decode(bytes);
+    } else {
+      text = await res.text();
+    }
   } catch (e) {
     const msg = redact(e instanceof Error ? e.message : String(e), o.secrets);
     if (o.mutating) throw new EffectUncertainError(`${o.label}: no response (${msg}); the effect may have happened`);
@@ -191,7 +202,7 @@ export async function send(f: Fetch, url: string, init: RequestInit, o: SendOpti
   } catch {
     json = undefined;
   }
-  return { status: res.status, ok: res.status >= 200 && res.status < 300, json, text };
+  return { status: res.status, ok: res.status >= 200 && res.status < 300, json, text, bytes, headers: res.headers };
 }
 
 export function snippet(s: Sent, secrets: string[]): string {
@@ -208,4 +219,40 @@ export function snippet(s: Sent, secrets: string[]): string {
 
 export function asRecord(x: unknown): Args {
   return isRecord(x) ? x : {};
+}
+
+/** Text of the first `<tag>` element, with the five XML entities decoded. */
+export function xmlText(xml: string, tag: string): string | undefined {
+  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`).exec(xml);
+  return m ? xmlDecode(m[1]!) : undefined;
+}
+
+/** Inner XML of every `<tag>` element. */
+export function xmlBlocks(xml: string, tag: string): string[] {
+  return [...xml.matchAll(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, "g"))].map((m) => m[1]!);
+}
+
+export function xmlDecode(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** A zero-or-more integer argument. */
+export function nonNegInt(args: Args, key: string): number {
+  const v = args[key];
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
+    throw new Error(`\`${key}\` must be a non-negative integer`);
+  }
+  return v;
+}
+
+/** Prefix under which object-store connectors keep the previous version of an object they overwrite or delete. */
+export const BACKUP_PREFIX = ".reversi-backups/";
+
+export function assertNotBackupKey(key: string, what: string): void {
+  if (key.startsWith(BACKUP_PREFIX)) throw new Error(`\`${what}\` points into ${BACKUP_PREFIX}, which is reserved`);
 }

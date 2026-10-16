@@ -43,6 +43,10 @@ Open `viewer/index.html` in a browser and choose that file. The chain is verifie
 reversi validate tools.yaml
 ```
 
+Or start from a project: `reversi init my-project` writes a config, example manifests, a starter policy and tests, then
+`reversi doctor` checks the setup and `reversi test` runs the contract tests and the policy's own tests without touching any
+system. `reversi lint` flags unsafe or incomplete manifests (a missing owner, no timeout, a mutating tool with no undo).
+
 ## 4. Wrap calls
 
 <CodeGroup>
@@ -88,11 +92,22 @@ reversi rollback <run_id> -m tools.yaml -d ./reversi-data --compensator-cmd "./u
 
 ## 6. Or put the gateway in front of an MCP server
 
-No code changes in the agent: point its MCP client at `reversi-gateway`, and it journals, enforces policy,
-asks for approval and can roll the run back. See the [gateway guide](/gateway).
+No code changes in the agent: point its MCP client at `reversi-gateway`. You do not need manifests to begin. With none, the
+gateway starts in **observe** mode: everything runs and is journaled, nothing is blocked, and a banner on stderr lists which
+upstream tools are unclassified.
 
 ```bash
-reversi-gateway --manifests tools.yaml --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+reversi gateway --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
 ```
 
-Run it in `--mode observe` first to see what would have been blocked before you enforce anything.
+Draft manifests from what the server actually offers, review them, approve them, then enforce:
+
+```bash
+reversi suggest-manifest --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server -o drafts
+reversi manifests publish drafts --registry ./registry --by bob          # drafts are not enforceable yet
+reversi manifests approve my.tool --registry ./registry --by alice --four-eyes
+reversi gateway --manifests ./registry --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+```
+
+Look at what happened in a browser with `reversi console` (open mode, your machine only). The [gateway guide](/gateway) covers
+modes, schema checks, approvals and rollback; [GitOps](/operations/gitops) covers keeping all of this in git.

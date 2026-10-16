@@ -27,7 +27,13 @@ export type LedgerEvent =
   | "compensated"
   | "compensation_failed"
   | "unrecoverable"
-  | "deferred";
+  | "deferred"
+  | "verified"
+  | "verification_failed"
+  | "unverified"
+  | "escalated"
+  | "purged"
+  | "reloaded";
 
 export interface LedgerRecord {
   seq: number;
@@ -240,6 +246,7 @@ export interface AppendInput {
 }
 
 export class Ledger {
+  private readonly listeners = new Set<(r: LedgerRecord) => void>();
   constructor(private readonly store: LedgerStore = new MemoryLedgerStore()) {
     const v = verifyRecords(store.all());
     if (!v.ok) {
@@ -270,12 +277,25 @@ export class Ledger {
       const record: LedgerRecord = { ...body, hash: hashOf(body) };
       try {
         this.store.append(record);
+        for (const l of this.listeners) {
+          try {
+            l(record);
+          } catch {
+            /* a listener (notifications, tracing) must never break journaling */
+          }
+        }
         return record;
       } catch (e) {
         if (e instanceof LedgerConflictError && attempt < 8) continue; // re-read the tail and try again
         throw e;
       }
     }
+  }
+
+  /** Be told about every record this process appends. Returns an unsubscribe function. */
+  onAppend(listener: (r: LedgerRecord) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   records(): readonly LedgerRecord[] {

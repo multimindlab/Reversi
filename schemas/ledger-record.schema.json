@@ -18,7 +18,7 @@
     "event": {
       "enum": [
         "run_started", "intended", "approved", "blocked", "would_block", "succeeded", "failed",
-        "uncertain", "compensating", "compensated", "compensation_failed", "unrecoverable", "deferred"
+        "uncertain", "compensating", "compensated", "compensation_failed", "unrecoverable", "deferred", "verified", "verification_failed", "unverified", "escalated", "purged", "reloaded"
       ]
     },
     "detail": { "type": "string" },

@@ -1,0 +1,1952 @@
+---
+title: Operations, security and integrations
+description: Hand-test the console modes, API keys, OIDC, notifications, alerts, tracing, evidence, retention, egress rules and the three stores, with the output to expect.
+---
+
+This page tests what you need in order to run Reversi for other people: who may sign in, who gets told, what evidence you can
+hand to an auditor, how long data is kept, where it may be sent, and where it lives. The first guide, [Manual testing](/testing),
+covers the core product; do its section 5.1 and 5.2 first if you have never run the server.
+
+Run everything from the **repository root**, in `bash` or `zsh`, after `npm install && npm run build`. Scratch files go in
+`try/ops/` (delete the folder to start over). Services use ports 7800 to 7849 on `127.0.0.1` only; change them if they are busy.
+
+<Note>
+Every command and output below comes from a real run against this repository, in the order shown. IDs, timestamps and hashes
+will differ on your machine. Slack, Teams, email, PagerDuty, Opsgenie and OpenTelemetry are exercised **only against fakes you
+start on localhost**, never against the real services. The console is checked with `curl` (it is server-rendered HTML); open the
+same URLs in a browser to see them drawn. See [Not covered here](#not-covered-here) for the full list.
+</Note>
+
+A block that starts with `# Terminal A` runs in its own terminal, which you leave running; every other block goes in your
+working terminal, called B here. Stop a terminal with Ctrl-C when the text says so.
+
+## 0. Setup
+
+You need Node 22.13 or newer, Python 3, `curl`, `openssl` and `shasum`. The `psql` client is optional (section 9).
+
+Manifests, a policy (an approval rule, secret detection and a `retention:` section) and one API key per role:
+
+```bash
+mkdir -p try/ops/manifests
+cat > try/ops/manifests/tools.yaml <<'EOF2'
+- tool: lookup_customer
+  effect: read_only
+  permission: customers:read
+
+- tool: create_order
+  effect: reversible
+  permission: orders:write
+  compensation:
+    tool: cancel_order
+    argument_map:
+      order_id: $result.order_id
+
+- tool: cancel_order
+  effect: idempotent
+  permission: orders:write
+
+- tool: charge_card
+  effect: compensable
+  permission: payments:write
+  compensation:
+    tool: refund
+    argument_map:
+      charge_id: $result.charge_id
+      amount: $args.amount
+  audit:
+    evidence_export: required
+
+- tool: refund
+  effect: idempotent
+  permission: payments:write
+
+- tool: delete_customer
+  effect: irreversible
+  permission: customers:admin
+EOF2
+cat > try/ops/policy.yaml <<'EOF2'
+version: 1
+rules:
+  - id: big-charges
+    match: { tool: charge_card }
+    when: [{ path: $args.amount, op: gt, value: 100 }]
+    action: require_approval
+    reason: charges over 100 need a human
+content:
+  secrets: deny
+retention:
+  default_days: 30
+EOF2
+sha() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+AGENT=agent-$(openssl rand -hex 8); AUD=aud-$(openssl rand -hex 8); APPR=appr-$(openssl rand -hex 8)
+OPS=ops-$(openssl rand -hex 8); ROOT=root-$(openssl rand -hex 8)
+cat > try/ops/keys.json <<EOF2
+[
+  { "name": "order-agent", "role": "agent",    "key_sha256": "$(sha $AGENT)", "max_permissions": ["customers:read","orders:write","payments:write"] },
+  { "name": "audrey",      "role": "auditor",  "key_sha256": "$(sha $AUD)" },
+  { "name": "alice",       "role": "approver", "key_sha256": "$(sha $APPR)" },
+  { "name": "dana",        "role": "operator", "key_sha256": "$(sha $OPS)" },
+  { "name": "root",        "role": "admin",    "key_sha256": "$(sha $ROOT)" }
+]
+EOF2
+```
+
+The keys, the environment every terminal shares, and a few helpers: `rv` is the CLI, `j` calls the API with a key, `post` calls a
+console page and prints its status and text, `login` signs a key in to the console and keeps the cookie in `try/ops/jar-NAME`.
+Each new terminal starts with `. try/ops/.env.sh`.
+
+```bash
+cat > try/ops/.env.sh <<EOF2
+AGENT=$AGENT; AUD=$AUD; APPR=$APPR; OPS=$OPS; ROOT=$ROOT
+export HOOK_SECRET=$(openssl rand -hex 16)
+EOF2
+cat >> try/ops/.env.sh <<'EOF2'
+export REVERSI_MANIFESTS=try/ops/manifests REVERSI_KEYS=try/ops/keys.json REVERSI_POLICY=try/ops/policy.yaml
+export REVERSI_SIGNING_KEY=try/ops/signing.key REVERSI_DATA=try/ops/data
+rv() { node packages/cli/dist/main.js "$@"; }
+j() { curl -s -H "Authorization: Bearer $1" -H 'content-type: application/json' "${@:2}"; echo; }
+msg() { sed -n 's/.*<main>\(.*\)<\/main>.*/\1/p' | sed -E 's#</(p|h1|h2|td|th|li|tr)>#  #g; s/<[^>]*>//g' | tr -s ' '; }
+post() { curl -s -o try/ops/out.html -w "%{http_code} " "$@"; msg < try/ops/out.html; echo; }
+login() { rm -f try/ops/jar-$1; curl -s -c try/ops/jar-$1 -o /dev/null -w "$1: login %{http_code}\n" --data-urlencode "key=$2" localhost:${3:-7800}/console/login; }
+csrf() { curl -s -b try/ops/jar-$1 localhost:${2:-7800}/console/runs | grep -o 'name="csrf" value="[^"]*"' | head -1 | cut -d'"' -f4; }
+kix() { curl -s -H "Authorization: Bearer $ROOT" localhost:7800/v1/keys | python3 -c "import sys,json;print([k['index'] for k in json.load(sys.stdin)['keys'] if k['name']=='$1'][0])"; }
+pending() { curl -s -H "Authorization: Bearer $APPR" "localhost:7800/v1/approvals?status=pending" | python3 -c "import sys,json;print([a['id'] for a in json.load(sys.stdin)['approvals'] if a['run_id']=='$1'][0])"; }
+EOF2
+. try/ops/.env.sh; B=localhost:7800
+```
+
+```bash
+rv validate $REVERSI_MANIFESTS
+rv keygen try/ops/signing
+```
+
+Expect:
+
+```text
+ok: 6 tool manifests valid
+wrote try/ops/signing.key and try/ops/signing.pub (key id d67bfe0ef2ea4b10)
+```
+
+## 1. Console modes
+
+The console is **off by default**. Choose a mode with `REVERSI_CONSOLE` on the server, `--console` on the gateway, or
+`console: { mode: … }` in `reversi.config.yaml`:
+
+| Mode | Login | Who can reach it | Role |
+|---|---|---|---|
+| `off` | none | nobody: `/console` answers 404 | none |
+| `open` | none | requests to `localhost` from the same origin only, on a loopback listener | fixed: `operator` by default, or `auditor` or `approver`; never `admin` |
+| `login` | paste an API key or an OIDC access token | anyone who can reach the port and holds a credential | the credential's roles |
+
+### 1.1 Off
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+PORT=7800 node packages/server/dist/main.js
+```
+
+Expect: `reversi-server listening on http://127.0.0.1:7800 (6 tools, files store, console off)`.
+
+```bash
+curl -s -i $B/console | head -1
+curl -s $B/console; echo
+j $OPS $B/v1/status
+```
+
+Expect:
+
+```text
+HTTP/1.1 404 Not Found
+The console is off. Start Reversi with REVERSI_CONSOLE=open (on your own machine, no login) or REVERSI_CONSOLE=login.
+{"halted":null,"environment":"default","runs":0,"pending_approvals":0}
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** with no setting the console does not exist, while the API works.
+
+### 1.2 Open: no login, this machine only, never admin
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONSOLE=open PORT=7800 node packages/server/dist/main.js
+```
+
+Expect `… (6 tools, files store, console open)`. Give the console something to show: a charge over 100 waits for approval.
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"c-1","permissions":["payments:write"]}'
+j $AGENT -X POST $B/v1/runs/c-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'
+curl -s $B/console/runs | grep -o '<title>[^<]*</title>'
+curl -s $B/console/runs | grep -o 'local-console[^<]*'
+```
+
+Expect:
+
+```text
+{"run_id":"c-1","mode":"enforce","scope_seal":"3ef3832df527…"}
+{"decision":"block","reasons":["approval required: request apr_… is pending an operator decision; retry after it is approved"]}
+<title>Runs · Reversi Console</title>
+local-console (operator) - open console, no login
+```
+
+Open [http://localhost:7800/console](http://localhost:7800/console) in a browser too: there is no login page, and the top bar says
+"local-console (operator) - open console, no login".
+
+Now abuse it. Open mode answers only requests addressed to `localhost` and made from the same origin:
+
+```bash
+post -H 'Host: evil.example.com' http://127.0.0.1:7800/console/runs
+CSRF=$(curl -s $B/console/approvals | grep -o 'name="csrf" value="[^"]*"' | head -1 | cut -d'"' -f4)
+post -X POST -H 'Origin: http://evil.example.com' -d "csrf=$CSRF&reason=x" $B/console/halt
+```
+
+Expect:
+
+```text
+403 Not allowed The console in open mode only answers requests made from this machine to localhost. Use REVERSI_CONSOLE=login to serve it to other people.
+403 Not allowed The console in open mode only answers requests made from this machine to localhost. Use REVERSI_CONSOLE=login to serve it to other people.
+```
+
+The open console is never admin, so the kill switch and publishing are refused even from the right origin with a valid CSRF
+token. (The token sits on any page with a form; the approvals page has them.)
+
+```bash
+post -X POST -H "Origin: http://$B" -d "csrf=$CSRF&reason=x" $B/console/halt
+post -X POST -H "Origin: http://$B" -d "csrf=$CSRF" $B/console/manifests/charge_card/approve
+post -X POST -H "Origin: http://$B" -d "reason=x" $B/console/halt
+```
+
+Expect:
+
+```text
+403 Forbidden Your role does not allow this.
+403 Forbidden Your role does not allow this.
+403 Forbidden Invalid or missing CSRF token. Go back, reload the page and try again.
+```
+
+What it can do is what its role allows. As operator it can approve, and the ledger names it `local-console`:
+
+```bash
+ID=$(pending c-1)
+post -X POST -H "Origin: http://$B" -d "csrf=$CSRF&note=looks+fine" $B/console/approvals/$ID/approve
+j $APPR "$B/v1/approvals?status=approved" | python3 -c 'import sys,json;a=json.load(sys.stdin)["approvals"][0];print(a["status"],a["decided_by"])'
+curl -s -o /dev/null -w "the API without a key: %{http_code}\n" $B/v1/status
+```
+
+Expect:
+
+```text
+303
+approved local-console
+the API without a key: 401
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+The server also **refuses to start** open on a non-loopback address, or open as admin:
+
+```bash
+HOST=0.0.0.0 REVERSI_CONSOLE=open PORT=7801 node packages/server/dist/main.js; echo "exit $?"
+REVERSI_CONSOLE=open REVERSI_CONSOLE_ROLE=admin PORT=7801 node packages/server/dist/main.js; echo "exit $?"
+```
+
+Expect:
+
+```text
+error: the open console has no login, so it only runs on a loopback HOST (127.0.0.1, ::1, localhost), not 0.0.0.0. Use REVERSI_CONSOLE=login.
+exit 64
+error: the open console never runs as admin
+exit 64
+```
+
+`reversi console` is the shortcut for your own laptop: it opens the engine on your data directory and serves the open console
+(default port 7421, here 7802). Its `--role` is `auditor`, `approver` or `operator`.
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+rv console --port 7802 --role auditor
+```
+
+```bash
+sleep 1
+curl -s localhost:7802/console/runs | grep -o 'local-console[^<]*'
+post -H 'Host: evil.example.com' http://127.0.0.1:7802/console/runs | cut -c1-48
+```
+
+Expect:
+
+```text
+local-console (auditor) - open console, no login
+403 Not allowed The console in open mode only an
+```
+
+Expect the terminal to print `console: http://localhost:7802/console  (open mode as auditor; Ctrl-C to stop)`.
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** open mode needs no credential but refuses any request that is not plainly your own browser talking to
+`localhost`; it can never become admin; and it cannot be started where other people could reach it.
+
+### 1.3 Login: paste a key, roles apply, a disabled key ends the session
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js 2>&1 | tee try/ops/a.log
+```
+
+Expect `… console login)`. In a browser, open [http://localhost:7800/console](http://localhost:7800/console): it sends you to a sign-in form.
+Here the same with `curl`. Wrong keys and agent keys are refused; then sign in as the auditor, approver and admin:
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"l-1","permissions":["payments:write"]}' | cut -c1-40
+j $AGENT -X POST $B/v1/runs/l-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}' | cut -c1-60
+curl -s -o /dev/null -w "no session: %{http_code} -> %{redirect_url}\n" $B/console/runs
+post -d "key=nope" $B/console/login
+post -d "key=$AGENT" $B/console/login
+login aud $AUD; login appr $APPR; login root $ROOT
+```
+
+Expect:
+
+```text
+{"run_id":"l-1","mode":"enforce","scope_
+{"decision":"block","reasons":["approval required: request a
+no session: 302 -> http://localhost:7800/console/login
+401 Sign in That credential was not accepted, or it has no console role. Try again
+401 Sign in That credential was not accepted, or it has no console role. Try again
+aud: login 303
+appr: login 303
+root: login 303
+```
+
+Roles differ. The auditor has no approve button and no kill-switch form; the approver can approve; only the admin has the kill switch:
+
+```bash
+for u in aud appr root; do
+  a=$(curl -s -b try/ops/jar-$u $B/console/approvals | grep -q '/approve"' && echo yes || echo no)
+  h=$(curl -s -b try/ops/jar-$u $B/console/evidence | grep -q 'action="/console/halt"' && echo yes || echo no)
+  echo "$u: approve buttons=$a kill-switch form=$h"
+done
+ID=$(pending l-1)
+post -b try/ops/jar-aud -d "csrf=$(csrf aud)" $B/console/approvals/$ID/approve
+curl -s -b try/ops/jar-root $B/console/runs | grep -o 'root ([a-z]*)'
+```
+
+Expect:
+
+```text
+aud: approve buttons=no kill-switch form=no
+appr: approve buttons=yes kill-switch form=no
+root: approve buttons=yes kill-switch form=yes
+403 Forbidden Your role does not allow this.
+root (admin)
+```
+
+The cookie is `HttpOnly; SameSite=Strict`, and it follows the key. Disable the auditor's key and the session ends at once:
+
+```bash
+curl -s -D - -o /dev/null -d "key=$AUD" $B/console/login | grep -i set-cookie | sed 's/rv_session=[^;]*/rv_session=…/'
+curl -s -b try/ops/jar-aud -o /dev/null -w "auditor session: %{http_code}\n" $B/console/runs
+j $ROOT -X PATCH $B/v1/keys/$(kix audrey) -d '{"disabled":true}'
+curl -s -b try/ops/jar-aud -o /dev/null -w "after disabling the key: %{http_code} -> %{redirect_url}\n" $B/console/runs
+j $AUD $B/v1/status
+j $ROOT -X PATCH $B/v1/keys/$(kix audrey) -d '{"disabled":false}'
+curl -s -b try/ops/jar-aud -o /dev/null -w "after enabling it again: %{http_code}\n" $B/console/runs
+```
+
+Expect:
+
+```text
+set-cookie: rv_session=…; Path=/console; HttpOnly; SameSite=Strict; Max-Age=28800
+auditor session: 200
+{"ok":true}
+after disabling the key: 302 -> http://localhost:7800/console/login
+{"error":"missing or invalid API key"}
+{"ok":true}
+after enabling it again: 200
+```
+
+Leave Terminal A running for section 2.
+
+**What this proves:** login mode needs a credential with a console role (agent keys are refused), pages and buttons follow the role,
+a forged POST from a lower role is refused even with a valid CSRF token, and disabling a key ends its sessions without a restart.
+
+### 1.4 The same switch on the gateway
+
+The gateway serves the console on its own port, so it needs a `listen:` section. Build its config and manifests:
+
+```bash
+mkdir -p try/ops/sandbox try/ops/gw-manifests
+node packages/connectors/dist/main.js manifests fs --format yaml > try/ops/gw-manifests/fs.yaml
+cat > try/ops/gateway.yaml <<'EOF2'
+mode: enforce
+upstreams:
+  - name: fs
+    command: node
+    args: ["packages/connectors/dist/main.js", "serve", "fs", "--root", "try/ops/sandbox"]
+    namespace: false
+listen: { host: 127.0.0.1, port: 7806 }
+auth: { keys: try/ops/keys.json }
+EOF2
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node packages/gateway/dist/main.js --config try/ops/gateway.yaml --manifests try/ops/gw-manifests --data try/ops/gw-data
+```
+
+```bash
+sleep 2
+curl -s -w " [%{http_code}]\n" localhost:7806/console/runs
+```
+
+Expect:
+
+```text
+{"error":"not found"} [404]
+```
+
+```bash
+# Terminal C: press Ctrl-C
+```
+
+Restart it with `--console open` and with `--console login`:
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node packages/gateway/dist/main.js --config try/ops/gateway.yaml --manifests try/ops/gw-manifests --data try/ops/gw-data --console open
+```
+
+```bash
+sleep 2
+curl -s localhost:7806/console/runs | grep -o 'local-console[^<]*'
+curl -s -o /dev/null -w "foreign Host header: %{http_code}\n" -H 'Host: evil.example.com' http://127.0.0.1:7806/console/runs
+curl -s -o /dev/null -w "the MCP endpoint still needs a key: %{http_code}\n" -X POST localhost:7806/mcp
+```
+
+Expect:
+
+```text
+local-console (operator) - open console, no login
+foreign Host header: 403
+the MCP endpoint still needs a key: 401
+```
+
+```bash
+# Terminal C: press Ctrl-C
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node packages/gateway/dist/main.js --config try/ops/gateway.yaml --manifests try/ops/gw-manifests --data try/ops/gw-data --console login
+```
+
+```bash
+sleep 2
+curl -s -o /dev/null -w "no session: %{http_code} -> %{redirect_url}\n" localhost:7806/console/runs
+login gw $AUD 7806
+curl -s -b try/ops/jar-gw localhost:7806/console/runs | grep -o 'audrey ([a-z]*)'
+```
+
+Expect:
+
+```text
+no session: 302 -> http://localhost:7806/console/login
+gw: login 303
+audrey (auditor)
+```
+
+```bash
+# Terminal C: press Ctrl-C
+```
+
+The gateway also refuses an unsafe open console at start:
+
+```bash
+sed 's/host: 127.0.0.1/host: 0.0.0.0/' try/ops/gateway.yaml > try/ops/gateway-lan.yaml
+node packages/gateway/dist/main.js --config try/ops/gateway-lan.yaml --manifests try/ops/gw-manifests --data try/ops/gw-data --console open 2>&1 | grep error
+node packages/gateway/dist/main.js --config try/ops/gateway.yaml --manifests try/ops/gw-manifests --data try/ops/gw-data --console open --console-role admin 2>&1 | grep error
+```
+
+Expect:
+
+```text
+error: the open console has no login, so the gateway must listen on loopback, not 0.0.0.0. Use --console login.
+error: the open console never runs as admin
+```
+
+## 2. API keys: file format, console, API, rotation, expiry
+
+A key file is a JSON list. Each entry has a `name` (it becomes the actor in the ledger), `role` or `roles`, and `key_sha256` (the hex
+SHA-256 of the key; the key itself is never stored). Optional: `max_permissions` (agents), `groups`, `tenant`, `not_before`,
+`expires_at`, `disabled`, `allow_observe`. The server re-reads the file on `SIGHUP` or when it changes (checked every two seconds).
+Terminal A from section 1.3 is still running.
+
+```bash
+j $ROOT $B/v1/keys | python3 -c 'import sys,json;[print(k["index"],k["name"],k["roles"],k["fingerprint"]) for k in json.load(sys.stdin)["keys"]]'
+j $AUD $B/v1/keys -w "[%{http_code}]\n"
+```
+
+Expect:
+
+```text
+0 order-agent ['agent'] edba5bee3cb7
+1 audrey ['auditor'] 5e36ca533901
+2 alice ['approver'] 52513b4ee156
+3 dana ['operator'] 568a2f681422
+4 root ['admin'] 9a8e43fe03e4
+{"error":"admin role required"}[403]
+```
+
+### 2.1 Create, use, expire and remove a key over the API
+
+`POST /v1/keys` is admin only. The new key is shown **once**:
+
+```bash
+j $ROOT -X POST $B/v1/keys -d '{"name":"temp-auditor","role":"auditor","expires_in_days":1}' > try/ops/newkey.json
+sed 's/"key":"[^"]*"/"key":"rv_…"/' try/ops/newkey.json
+TEMP=$(python3 -c 'import json;print(json.load(open("try/ops/newkey.json"))["key"])')
+curl -s -o /dev/null -w "the new key: %{http_code}\n" -H "Authorization: Bearer $TEMP" $B/v1/status
+j $ROOT $B/v1/keys | python3 -c 'import sys,json;[print(k["index"],k["name"],k.get("expires_at")) for k in json.load(sys.stdin)["keys"] if k["name"]=="temp-auditor"]'
+j $ROOT -X PATCH $B/v1/keys/$(kix temp-auditor) -d '{"expires_at":"2000-01-01T00:00:00Z"}'
+curl -s -w " [%{http_code}] expired\n" -H "Authorization: Bearer $TEMP" $B/v1/status
+j $ROOT -X PATCH $B/v1/keys/$(kix temp-auditor) -d '{"expires_at":null}'
+curl -s -o /dev/null -w "expiry cleared: %{http_code}\n" -H "Authorization: Bearer $TEMP" $B/v1/status
+j $ROOT -X DELETE $B/v1/keys/$(kix temp-auditor)
+curl -s -w " [%{http_code}] removed\n" -H "Authorization: Bearer $TEMP" $B/v1/status
+```
+
+Expect:
+
+```text
+{"name":"temp-auditor","roles":["auditor"],"key":"rv_…","note":"this is the only time the key is shown"}
+the new key: 200
+5 temp-auditor 2026-10-17T18:12:26.944Z
+{"ok":true}
+{"error":"missing or invalid API key"} [401] expired
+{"ok":true}
+expiry cleared: 200
+{"ok":true}
+{"error":"missing or invalid API key"} [401] removed
+```
+
+### 2.2 The same in the console Settings page
+
+Sign in as the admin and create, disable and remove a key from **Settings**. The new key is shown once, on the page after the form:
+
+```bash
+login root $ROOT
+CS=$(csrf root)
+curl -s -b try/ops/jar-root -d "csrf=$CS&name=console-auditor&role=auditor&days=7" $B/console/settings/keys > try/ops/ck.html
+msg < try/ops/ck.html | cut -c1-70
+CONSOLEKEY=$(grep -o '<pre>[^<]*</pre>' try/ops/ck.html | sed 's/<[^>]*>//g')
+curl -s -o /dev/null -w "the new key: %{http_code}\n" -H "Authorization: Bearer $CONSOLEKEY" $B/v1/status
+curl -s -b try/ops/jar-root $B/console/settings | grep -o 'console-auditor</td>.\{0,110\}' | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c1-62
+post -b try/ops/jar-root -d "csrf=$CS" $B/console/settings/keys/$(kix console-auditor)/disable
+curl -s -w " [%{http_code}] disabled\n" -H "Authorization: Bearer $CONSOLEKEY" $B/v1/status
+post -b try/ops/jar-root -d "csrf=$CS" $B/console/settings/keys/$(kix console-auditor)/remove
+python3 -c 'import json;print([k["name"] for k in json.load(open("try/ops/keys.json"))])'
+```
+
+Expect:
+
+```text
+root: login 303
+Key created Copy this key now. It is not stored and cannot be shown ag
+the new key: 200
+console-auditor auditor 2026-10-23T18:12:27.225Z e58a04603d90
+303
+{"error":"missing or invalid API key"} [401] disabled
+303
+['order-agent', 'audrey', 'alice', 'dana', 'root']
+```
+
+### 2.3 Rotation and expiry by editing the file
+
+Rotate "carol" without downtime: add her new key beside the old one, give the old entry an `expires_at`, and the server follows the file.
+A file that does not parse is ignored and the old keys stay in force.
+
+```bash
+CAROL_OLD=carol-$(openssl rand -hex 8); CAROL_NEW=carol-$(openssl rand -hex 8)
+cat > try/ops/keyedit.py <<'EOF2'
+import json, sys, hashlib
+f = "try/ops/keys.json"
+ks = json.load(open(f))
+mode, key = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ""
+if mode == "add":
+    ks.append({"name": "carol", "role": "operator", "key_sha256": hashlib.sha256(key.encode()).hexdigest()})
+elif mode == "expire-old":
+    for k in ks:
+        if k["name"] == "carol":
+            k["expires_at"] = "2000-01-01T00:00:00Z"
+elif mode == "drop":
+    ks = [k for k in ks if k["name"] != "carol"]
+json.dump(ks, open(f, "w"), indent=2)
+EOF2
+python3 try/ops/keyedit.py add $CAROL_OLD; sleep 3
+curl -s -o /dev/null -w "old key: %{http_code}\n" -H "Authorization: Bearer $CAROL_OLD" $B/v1/status
+python3 try/ops/keyedit.py expire-old; python3 try/ops/keyedit.py add $CAROL_NEW; sleep 3
+curl -s -o /dev/null -w "old key after rotation: %{http_code}\n" -H "Authorization: Bearer $CAROL_OLD" $B/v1/status
+curl -s -o /dev/null -w "new key: %{http_code}\n" -H "Authorization: Bearer $CAROL_NEW" $B/v1/status
+cp try/ops/keys.json try/ops/keys.good; echo '{ broken' > try/ops/keys.json; sleep 3
+curl -s -o /dev/null -w "new key while the file is broken: %{http_code}\n" -H "Authorization: Bearer $CAROL_NEW" $B/v1/status
+cp try/ops/keys.good try/ops/keys.json; python3 try/ops/keyedit.py drop; sleep 3
+curl -s -w " [%{http_code}] after dropping carol\n" -H "Authorization: Bearer $CAROL_NEW" $B/v1/status
+grep -a "API keys\|key reload" try/ops/a.log | sed 's/: Expected.*//' | tail -6
+```
+
+Expect:
+
+```text
+old key: 200
+old key after rotation: 401
+new key: 200
+new key while the file is broken: 200
+{"error":"missing or invalid API key"} [401] after dropping carol
+reversi-server: reloaded 5 API keys
+reversi-server: reloaded 6 API keys
+reversi-server: reloaded 7 API keys
+reversi-server: key reload failed, keeping the old keys
+reversi-server: reloaded 5 API keys
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** keys can be created, expired, disabled and removed from the API, the console or the file; only admins can;
+expired and disabled keys stop working without a restart; a broken key file never locks everyone out or in.
+
+## 3. OIDC with the mock identity provider
+
+`examples/oidc/mock-idp.mjs` is a throwaway OpenID provider that mints signed tokens. It is for trying this out, never for production.
+It listens on `PORT` (default 9000; here 7810).
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+PORT=7810 node examples/oidc/mock-idp.mjs
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 \
+REVERSI_OIDC_ISSUER=http://127.0.0.1:7810 REVERSI_OIDC_AUDIENCE=reversi \
+REVERSI_OIDC_ROLE_MAP='{"reversi-ops":"operator","reversi-agents":"agent"}' node packages/server/dist/main.js
+```
+
+The bearer token works on the API. The audience, expiry and role map are checked; a token with no mapped role is refused:
+
+```bash
+sleep 1
+I=http://127.0.0.1:7810
+OPSTOK=$(curl -s "$I/token?sub=dana&roles=reversi-ops"); AGTOK=$(curl -s "$I/token?sub=bot-1&roles=reversi-agents")
+curl -s -H "Authorization: Bearer $OPSTOK" $B/v1/status; echo
+curl -s -H "Authorization: Bearer $AGTOK" $B/v1/status; echo
+curl -s -w " [%{http_code}] wrong audience\n" -H "Authorization: Bearer $(curl -s "$I/token?sub=x&roles=reversi-ops&aud=other")" $B/v1/status
+curl -s -w " [%{http_code}] expired\n" -H "Authorization: Bearer $(curl -s "$I/token?sub=x&roles=reversi-ops&ttl=-100")" $B/v1/status
+curl -s -w " [%{http_code}] no mapped role\n" -H "Authorization: Bearer $(curl -s "$I/token?sub=x&roles=something-else")" $B/v1/status
+curl -s -H "Authorization: Bearer $AGTOK" -H 'content-type: application/json' -X POST $B/v1/runs -d '{"run_id":"oidc-1","permissions":["customers:read"]}' | cut -c1-40; echo
+rv runs list | grep oidc
+j $AUD $B/v1/status
+```
+
+Expect:
+
+```text
+{"halted":null,"environment":"default","runs":2,"pending_approvals":1}
+{"error":"auditor role required"}
+{"error":"missing or invalid API key"} [401] wrong audience
+{"error":"missing or invalid API key"} [401] expired
+{"error":"missing or invalid API key"} [401] no mapped role
+{"run_id":"oidc-1","mode":"enforce","sco
+
+oidc-1  actor=bot-1  mode=enforce  steps=0  empty
+{"halted":null,"environment":"default","runs":3,"pending_approvals":1}
+```
+
+API keys keep working next to OIDC (the last line is the auditor's key). Now paste a token into the console login. The session never outlives the token:
+
+```bash
+curl -s -c try/ops/jar-oidc -o /dev/null -w "console login with a token: %{http_code}\n" --data-urlencode "key=$OPSTOK" $B/console/login
+curl -s -b try/ops/jar-oidc $B/console/runs | grep -o 'dana ([a-z]*)'
+curl -s -c try/ops/jar-short -o /dev/null --data-urlencode "key=$(curl -s "$I/token?sub=dana&roles=reversi-ops&ttl=5")" $B/console/login
+curl -s -b try/ops/jar-short -o /dev/null -w "short token, at once: %{http_code}\n" $B/console/runs
+sleep 6
+curl -s -b try/ops/jar-short -o /dev/null -w "after the token expired: %{http_code} -> %{redirect_url}\n" $B/console/runs
+curl -s -o /dev/null -w "an agent token in the console: %{http_code}\n" --data-urlencode "key=$AGTOK" $B/console/login
+```
+
+Expect:
+
+```text
+console login with a token: 303
+dana (operator)
+short token, at once: 200
+after the token expired: 302 -> http://localhost:7800/console/login
+an agent token in the console: 401
+```
+
+```bash
+# Terminals A and C: press Ctrl-C
+```
+
+**What this proves:** OIDC bearer tokens authenticate the API and the console login, roles come from the claim map, the principal in the
+ledger is the token's `sub` (`bot-1`), and a console session ends when its token does. Redirect (browser SSO) login is not built.
+
+## 4. Notifications
+
+Notifications are configured under `notifications:` in `reversi.config.yaml` (see [Notifications](/operations/notifications)). Three fakes
+stand in for the services, all on localhost. First the scripts. The fake HTTP endpoint prints one line per POST and checks the webhook
+signature; the fake SMTP server accepts a message and prints it decoded:
+
+```bash
+cat > try/ops/fake.mjs <<'EOF2'
+// Prints every POST it receives as one JSON line. Usage: node fake.mjs <port> [signing-secret]
+import { createServer } from "node:http";
+import { createHmac } from "node:crypto";
+import { appendFileSync, writeFileSync } from "node:fs";
+const [port, secret] = [Number(process.argv[2]), process.argv[3]];
+createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const want = secret && "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
+    const sig = req.headers["x-reversi-signature"];
+    if (sig) { writeFileSync("try/ops/last-webhook.body", body); writeFileSync("try/ops/last-webhook.sig", sig); }
+    let spans; if (req.url.endsWith("/v1/traces")) { appendFileSync("try/ops/traces.ndjson", body + "\n"); spans = JSON.parse(body).resourceSpans.flatMap((r) => r.scopeSpans.flatMap((s) => s.spans)).map((s) => `${s.name} status=${s.status.code}`); }
+    console.log(JSON.stringify({ path: req.url, spans, event: req.headers["x-reversi-event"], signature: sig ? (sig === want ? "valid" : "INVALID") : undefined, body: spans ? undefined : body.slice(0, 700) }));
+    res.writeHead(200).end("{}");
+  });
+}).listen(port, "127.0.0.1", () => console.error("fake endpoint on " + port));
+EOF2
+cat > try/ops/smtp-sink.mjs <<'EOF2'
+// A fake SMTP server: accepts messages and prints them. Usage: node smtp-sink.mjs <port>
+import { createServer } from "node:net";
+createServer((sock) => {
+  let inData = false, buf = "", text = "";
+  const say = (s) => sock.write(s + "\r\n");
+  say("220 fake-smtp ready");
+  sock.on("data", (d) => {
+    buf += d.toString();
+    let i;
+    while ((i = buf.indexOf("\r\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (inData) {
+        if (line === ".") { inData = false; const [head, body] = text.split("\n\n"); console.log(head.split("\n").filter((l) => /^(To|Subject):/.test(l)).join(" | ") + "\n" + Buffer.from((body ?? "").replace(/\s/g, ""), "base64").toString()); say("250 queued"); } else text += line + "\n";
+      } else if (/^EHLO/i.test(line)) say("250 fake-smtp");
+      else if (/^DATA/i.test(line)) { inData = true; text = ""; say("354 go ahead"); }
+      else if (/^QUIT/i.test(line)) { say("221 bye"); sock.end(); }
+      else say("250 ok");
+    }
+  });
+}).listen(Number(process.argv[2]), "127.0.0.1", () => console.error("fake smtp on " + process.argv[2]));
+EOF2
+cat > try/ops/notify.yaml <<'EOF2'
+manifests: ./manifests
+policy: ./policy.yaml
+data: { dir: ./data }
+approval: { console_url: "http://127.0.0.1:7800" }
+log: { format: json, level: info }
+notifications:
+  channels:
+    - { type: webhook, name: hook, url: "http://127.0.0.1:7811/webhook", secret: "${HOOK_SECRET}" }
+    - { type: slack, name: slack, url: "http://127.0.0.1:7811/slack" }
+    - { type: teams, name: teams, url: "http://127.0.0.1:7811/teams" }
+    - { type: pagerduty, name: pd, routing_key: fake-routing-key, url: "http://127.0.0.1:7811/pagerduty" }
+    - { type: opsgenie, name: og, api_key: fake-api-key, url: "http://127.0.0.1:7811/opsgenie" }
+    - { type: email, name: mail, host: 127.0.0.1, port: 7813, starttls: false, from: reversi@example.test, to: [ops@example.test] }
+  routes:
+    - { events: ["*"], channels: [hook, slack, teams, pd, og, mail] }
+EOF2
+```
+
+Start the fakes and the server. The example webhook sink (`examples/webhook-sink.mjs`) takes the older single approval webhook, `REVERSI_APPROVAL_WEBHOOK`,
+which works beside the channels:
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node try/ops/fake.mjs 7811 $HOOK_SECRET 2>&1 | tee try/ops/fake.log
+```
+
+```bash
+# Terminal D
+. try/ops/.env.sh
+node try/ops/smtp-sink.mjs 7813 2>&1 | tee try/ops/smtp.log
+```
+
+```bash
+# Terminal E
+. try/ops/.env.sh
+PORT=7814 node examples/webhook-sink.mjs 2>&1 | tee try/ops/sink.log
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONFIG=try/ops/notify.yaml REVERSI_APPROVAL_WEBHOOK=http://127.0.0.1:7814/hook \
+REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js 2>&1 | tee try/ops/a.log
+```
+
+### 4.1 A test message from the CLI and from the console
+
+`reversi doctor --send-test` sends one message through every channel in the config, and checks each URL against the egress rules.
+
+```bash
+rv --config try/ops/notify.yaml doctor --send-test | grep "test message"
+sleep 1
+tail -n 5 try/ops/fake.log | cut -c1-150
+tail -n 3 try/ops/smtp.log
+```
+
+Expect:
+
+```text
+ok    test message: sent to hook, slack, teams, pd, og, mail
+{"path":"/webhook","event":"doctor_test","signature":"valid","body":"{\"event\":\"doctor_test\",\"ts\":\"2026-10-16T18:13:04.622Z\",\"severity\":\"inf
+{"path":"/slack","body":"{\"text\":\"Reversi test notification\\nIf you can read this, the channel works.\",\"blocks\":[{\"type\":\"header\",\"text\":
+{"path":"/teams","body":"{\"@type\":\"MessageCard\",\"@context\":\"https://schema.org/extensions\",\"summary\":\"Reversi test notification\",\"themeCo
+{"path":"/pagerduty","body":"{\"routing_key\":\"fake-routing-key\",\"event_action\":\"trigger\",\"dedup_key\":\"doctor_test:Reversi test notification\
+{"path":"/opsgenie/v2/alerts","body":"{\"message\":\"Reversi test notification\",\"alias\":\"doctor_test:Reversi test notification\",\"description\":\
+To: ops@example.test | Subject: [Reversi info] Reversi test notification
+Reversi test notification
+If you can read this, the channel works.
+```
+
+In the console, **Settings** lists the channels and, for an admin, has a **Send a test notification** button:
+
+```bash
+login root $ROOT
+curl -s -b try/ops/jar-root $B/console/settings | grep -o 'Notification channels</h2>.\{0,120\}' | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c1-80
+post -b try/ops/jar-root -d "csrf=$(csrf root)" $B/console/settings/notify-test
+sleep 1
+tail -n 5 try/ops/fake.log | cut -c1-110
+tail -n 3 try/ops/smtp.log
+```
+
+Expect:
+
+```text
+root: login 303
+Notification channels hook , slack , teams , pd , og , mail <fo
+200 Test notification Sent to: hook, slack, teams, pd, og, mail. Failed: none. Back
+{"path":"/webhook","event":"test","signature":"valid","body":"{\"event\":\"test\",\"ts\":\"2026-10-16T18:13:06
+{"path":"/slack","body":"{\"text\":\"Reversi test notification\\nSent from the console by root.\",\"blocks\":[
+{"path":"/teams","body":"{\"@type\":\"MessageCard\",\"@context\":\"https://schema.org/extensions\",\"summary\"
+{"path":"/pagerduty","body":"{\"routing_key\":\"fake-routing-key\",\"event_action\":\"trigger\",\"dedup_key\":
+{"path":"/opsgenie/v2/alerts","body":"{\"message\":\"Reversi test notification\",\"alias\":\"test:Reversi test
+To: ops@example.test | Subject: [Reversi info] Reversi test notification
+Reversi test notification
+Sent from the console by root.
+```
+
+### 4.2 An approval request
+
+```bash
+N=$(wc -l < try/ops/fake.log)
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"n-1","permissions":["payments:write"]}' | cut -c1-40
+j $AGENT -X POST $B/v1/runs/n-1/intents -d '{"tool":"charge_card","args":{"amount":750},"reason":"pay"}' | cut -c1-70
+sleep 1
+tail -n +$((N+1)) try/ops/fake.log | cut -c1-170
+tail -n 3 try/ops/smtp.log | cut -c1-200
+sed -n 1,10p try/ops/sink.log | cut -c1-200
+```
+
+Expect:
+
+```text
+{"run_id":"n-1","mode":"enforce","scope_
+{"decision":"block","reasons":["approval required: request apr_5f60592
+{"path":"/webhook","event":"approval_requested","signature":"valid","body":"{\"event\":\"approval_requested\",\"ts\":\"2026-10-16T18:13:07.889Z\",\"severity\":\"warning\"
+{"path":"/slack","body":"{\"text\":\"Approval needed: charge_card\\nReversi approval needed: call `charge_card` in run n-1 (arguments: amount). Why: policy `big-charges`:
+{"path":"/teams","body":"{\"@type\":\"MessageCard\",\"@context\":\"https://schema.org/extensions\",\"summary\":\"Approval needed: charge_card\",\"themeColor\":\"FFA500\",
+{"path":"/pagerduty","body":"{\"routing_key\":\"fake-routing-key\",\"event_action\":\"trigger\",\"dedup_key\":\"approval:apr_…\",\"payl
+{"path":"/opsgenie/v2/alerts","body":"{\"message\":\"Approval needed: charge_card\",\"alias\":\"approval:apr_…\",\"description\":\"Reve
+Approval needed: charge_card
+Reversi approval needed: call `charge_card` in run n-1 (arguments: amount). Why: policy `big-charges`: charges over 100 need a human. Decide: http://127.0.0.1:7800/console/approvals
+http://127.0.0.1:7800/console/approvals
+webhook sink on http://127.0.0.1:7814
+
+[2026-10-16T18:13:07.901Z] POST /hook
+{
+  "text": "Reversi approval needed: call `charge_card` in run n-1 (arguments: amount). Why: policy `big-charges`: charges over 100 need a human. Decide: http://127.0.0.1:7800/console/appr...
+  "approval": {
+    "id": "apr_…",
+    "run_id": "n-1",
+    "step": null,
+    "kind": "call",
+```
+
+The notification names the tool, the run, the argument **names** (here `amount`) and a console link, never argument values.
+
+### 4.3 Verify the webhook signature
+
+The `webhook` channel signs the body with HMAC-SHA-256 and sends `x-reversi-signature: sha256=<hex>`. The fake endpoint saved the last
+signed delivery. The fake already printed `signature: valid`; check it yourself with the Python helper in the SDK:
+
+```bash
+cat try/ops/last-webhook.sig | cut -c1-30
+PYTHONPATH=packages/sdk-py python3 - <<'EOF2'
+import os
+from reversi_sdk import verify_webhook_signature
+body = open("try/ops/last-webhook.body", "rb").read()
+sig = open("try/ops/last-webhook.sig").read()
+secret = os.environ["HOOK_SECRET"]
+print("genuine delivery:", verify_webhook_signature(secret, body, sig))
+print("body changed:    ", verify_webhook_signature(secret, body.replace(b"approval_requested", b"approval_decided"), sig))
+print("wrong secret:    ", verify_webhook_signature("not-the-secret", body, sig))
+print("no header:       ", verify_webhook_signature(secret, body, None))
+EOF2
+```
+
+Expect:
+
+```text
+sha256=a16e5174b5118aca43e32ee
+genuine delivery: True
+body changed:     False
+wrong secret:     False
+no header:        False
+```
+
+### 4.4 A dead channel never changes a decision
+
+Stop the three fakes (Ctrl-C in terminals C, D and E), then ask for another approval. Because `notify.yaml` has `log: { format: json }`, the
+server writes its warnings as JSON lines on stderr (the logger redacts credential-looking fields and values; section 5.5 shows it):
+
+```bash
+# Terminals C, D and E: press Ctrl-C
+```
+
+```bash
+j $AGENT -X POST $B/v1/runs/n-1/intents -d '{"tool":"charge_card","args":{"amount":752},"reason":"pay"}' | cut -c1-70
+sleep 4
+grep -a '"level":"warn"' try/ops/a.log | cut -c1-190
+```
+
+Expect:
+
+```text
+{"decision":"block","reasons":["approval required: request apr_3d52766
+{"level":"warn","time":"2026-10-16T18:13:10.072Z","msg":"approval webhook failed: fetch failed"}
+{"level":"warn","time":"2026-10-16T18:13:10.688Z","msg":"notification to mail failed: email mail: connect ECONNREFUSED 127.0.0.1:7813"}
+{"level":"warn","time":"2026-10-16T18:13:10.688Z","msg":"notification to hook failed: webhook hook: fetch failed"}
+{"level":"warn","time":"2026-10-16T18:13:10.688Z","msg":"notification to slack failed: slack slack: fetch failed"}
+{"level":"warn","time":"2026-10-16T18:13:10.689Z","msg":"notification to teams failed: teams teams: fetch failed"}
+{"level":"warn","time":"2026-10-16T18:13:10.689Z","msg":"notification to pd failed: pagerduty pd: fetch failed"}
+{"level":"warn","time":"2026-10-16T18:13:10.689Z","msg":"notification to og failed: opsgenie og: fetch failed"}
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** the six channel types send the documented payloads (Slack blocks, a Teams card, a PagerDuty event, an Opsgenie
+alert, an SMTP message, a signed webhook); the signature verifies and breaks if the body or secret changes; messages carry names, never values; and
+a channel that is down is a logged warning, not a failed or allowed call.
+
+<Warning>
+Slack, Teams, SMTP, PagerDuty and Opsgenie were tested only against these local fakes, which check that a request arrives and what it says. They
+were not tested against the real services, so real-world details (rate limits, TLS and AUTH on a real mail relay, Slack's response format,
+PagerDuty routing keys) are untested.
+</Warning>
+
+## 5. Alerts, tracing, logs and metrics
+
+One config turns on alerts every two seconds with a denial threshold of 3, sends only `alert` events to the webhook, and exports
+traces to an OTLP endpoint. It uses its own data directory so the numbers are easy to read.
+
+```bash
+cat > try/ops/alerts.yaml <<'EOF2'
+manifests: ./manifests
+policy: ./policy.yaml
+data: { dir: ./data-alerts }
+approval: { console_url: "http://127.0.0.1:7800" }
+notifications:
+  channels:
+    - { type: webhook, name: hook, url: "http://127.0.0.1:7811/webhook", secret: "${HOOK_SECRET}" }
+  routes:
+    - { events: ["alert"], channels: [hook] }
+otel: { endpoint: "http://127.0.0.1:7812", service_name: reversi-try }
+alerts: { interval: 2s, denial_spike: 3 }
+EOF2
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node try/ops/fake.mjs 7811 $HOOK_SECRET 2>&1 | tee try/ops/fake.log
+```
+
+```bash
+# Terminal D
+. try/ops/.env.sh
+node try/ops/fake.mjs 7812 2>&1 | tee try/ops/otlp.log
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_LOG=json REVERSI_CONFIG=try/ops/alerts.yaml REVERSI_DATA=try/ops/data-alerts \
+REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js 2>&1 | tee try/ops/a.log
+```
+
+### 5.1 A denial spike and an unclassified tool
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"al-1","permissions":["customers:read","orders:write","payments:write"]}' | cut -c1-40
+j $AGENT -X POST $B/v1/runs/al-1/intents -d '{"tool":"create_order","args":{"sku":"B"},"reason":"order"}'
+j $AGENT -X POST $B/v1/runs/al-1/steps/0/outcome -d '{"status":"succeeded","result":{"order_id":"o1"}}'
+for i in 1 2 3; do j $AGENT -X POST $B/v1/runs/al-1/intents -d '{"tool":"delete_customer","args":{"id":"c1"},"reason":"probing"}' | cut -c1-100; done
+j $AGENT -X POST $B/v1/runs/al-1/intents -d '{"tool":"mystery_tool","args":{},"reason":"x"}' | cut -c1-100
+sleep 4
+tail -n 2 try/ops/fake.log | tr -d '\000' | cut -c1-250
+```
+
+Expect:
+
+```text
+{"run_id":"al-1","mode":"enforce","scope
+{"decision":"allow","step":0}
+{"step":0,"status":"succeeded"}
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+{"decision":"block","reasons":["no manifest registered for tool `mystery_tool`"]}
+{"path":"/webhook","event":"alert","signature":"valid","body":"{\"event\":\"alert\",\"ts\":\"2026-10-16T18:13:24.288Z\",\"severity\":\"warning\",\"title\":\"4 calls blocked in the last 15...
+{"path":"/webhook","event":"alert","signature":"valid","body":"{\"event\":\"alert\",\"ts\":\"2026-10-16T18:13:24.318Z\",\"severity\":\"warning\",\"title\":\"Unclassified tool called: myst...
+```
+
+The threshold of 3 fired a notification ("4 calls blocked"). The live views, `GET /v1/alerts` and the console **Alerts** page, use the
+same `alerts.denial_spike`, so they list the spike too:
+
+```bash
+j $AUD $B/v1/alerts | python3 -c 'import sys,json;[print(a["severity"],a["title"]) for a in json.load(sys.stdin)["alerts"]]'
+login aud $AUD
+curl -s -b try/ops/jar-aud $B/console/alerts | msg | grep -o 'warning.*' | cut -c1-110
+```
+
+Expect:
+
+```text
+warning 4 calls blocked in the last 15 minutes
+warning Unclassified tool called: mystery_tool
+aud: login 303
+warning 4 calls blocked in the last 15 minutes An agent may be looping or probing. Check the blocked reasons i
+```
+
+### 5.2 An alert that resolves
+
+Alerts are sent once, repeated as reminders (`alerts.remind`, default one hour) and resolved when the condition clears. A kill switch is the simplest condition to clear:
+
+```bash
+j $ROOT -X POST $B/v1/halt -d '{"reason":"drill"}' | cut -c1-60
+sleep 3
+j $ROOT -X POST $B/v1/resume
+sleep 3
+tail -n 2 try/ops/fake.log | tr -d '\000' | python3 -c '
+import sys, json
+for l in sys.stdin:
+    d = json.loads(l); b = json.loads(d["body"])
+    print(d["signature"], b["severity"], b["title"], "resolve=" + str(b["resolve"]))'
+```
+
+Expect:
+
+```text
+{"halted":"drill (by root)","halt":{"id":"halt_7318705a-a165
+{"halted":null,"lifted":1}
+valid warning New calls are blocked resolve=False
+valid info Resolved: New calls are blocked resolve=True
+```
+
+### 5.3 An unresolved step
+
+An outcome that stays unknown for more than **one hour** raises "Outcome still unknown". The hour is fixed, so this guide cannot wait for
+it. Leave one behind and look again later:
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"al-3","permissions":["orders:write"]}' | cut -c1-40
+j $AGENT -X POST $B/v1/runs/al-3/intents -d '{"tool":"create_order","args":{"sku":"B"},"reason":"order"}'
+j $AGENT -X POST $B/v1/runs/al-3/steps/0/outcome -d '{"status":"uncertain","error":"timeout"}'
+j $AUD $B/v1/alerts | python3 -c 'import sys,json;print([a["title"] for a in json.load(sys.stdin)["alerts"] if "unknown" in a["title"]])'
+```
+
+Expect:
+
+```text
+{"run_id":"al-3","mode":"enforce","scope
+{"decision":"allow","step":0}
+{"step":0,"status":"uncertain"}
+[]
+```
+
+The empty list is right for now (the step is a minute old). An hour later the same query lists `Outcome still unknown: create_order in al-3`.
+This part is **not verified** here.
+
+### 5.4 OpenTelemetry traces
+
+Spans are posted as OTLP JSON to `<endpoint>/v1/traces` every five seconds. Terminal D received them:
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"al-2","permissions":["customers:read","orders:write","payments:write"]}' > /dev/null
+j $AGENT -X POST $B/v1/runs/al-2/intents -d '{"tool":"create_order","args":{"sku":"B"},"reason":"order"}' > /dev/null
+j $AGENT -X POST $B/v1/runs/al-2/steps/0/outcome -d '{"status":"succeeded","result":{"order_id":"o1"}}' > /dev/null
+j $AGENT -X POST $B/v1/runs/al-2/intents -d '{"tool":"delete_customer","args":{"id":"c1"},"reason":"x"}' > /dev/null
+sleep 6
+tr -d '\000' < try/ops/otlp.log | tail -n 2 | cut -c1-200
+python3 - <<'EOF2'
+import json
+batches = [json.loads(l) for l in open("try/ops/traces.ndjson")]
+vals = lambda attrs: {a["key"]: list(a["value"].values())[0] for a in attrs}
+print(vals(batches[0]["resourceSpans"][0]["resource"]["attributes"]))
+spans = [s for b in batches for r in b["resourceSpans"] for sc in r["scopeSpans"] for s in sc["spans"]]
+s = next(x for x in spans if x["name"] == "reversi.call create_order" and vals(x["attributes"])["reversi.run_id"] == "al-2")
+print(s["name"], "| status", s["status"], "| kind", s["kind"], "| traceId", s["traceId"][:12] + "…")
+print(vals(s["attributes"]))
+EOF2
+grep -c '"stringValue":"\(o1\|c1\|B\)"' try/ops/traces.ndjson
+```
+
+Expect:
+
+```text
+{"path":"/v1/traces","spans":["reversi.call.blocked delete_customer status=2","reversi.call.blocked delete_customer status=2","reversi.call.blocked delete_customer status=2","reversi.call...
+{"path":"/v1/traces","spans":["reversi.call create_order status=2","reversi.call create_order status=1","reversi.call.blocked delete_customer status=2"]}
+{'service.name': 'reversi-try', 'deployment.environment': 'default'}
+reversi.call create_order | status {'code': 1} | kind 1 | traceId 0ff933828a98…
+{'reversi.run_id': 'al-2', 'reversi.step': '0', 'reversi.tool': 'create_order', 'reversi.actor': 'order-agent', 'reversi.effect': 'reversible', 'reversi.event': 'succeeded', 'reversi.reas...
+0
+```
+
+The last number is 0: none of the argument or result values (`o1`, `c1`, `B`) appear in any span. Spans carry names and ids only.
+
+### 5.5 Structured logs and Prometheus metrics
+
+`REVERSI_LOG=json` writes one JSON line per request. Bodies and credentials are never logged:
+
+```bash
+tail -n 2 try/ops/a.log | cut -c1-200
+echo "agent key in the log: $(grep -ac "$AGENT" try/ops/a.log); request bodies in the log: $(grep -ac probing try/ops/a.log)"
+curl -s -H "Authorization: Bearer $AUD" $B/metrics | grep -E '^reversi_(ledger_events_total|ledger_records|runs|approvals\{status="pending"\}|halted)'
+curl -s -o /dev/null -w "metrics without a credential: %{http_code}\n" $B/metrics
+```
+
+Expect:
+
+```text
+{"ts":"2026-10-16T18:13:33.419Z","method":"POST","path":"/v1/runs/al-2/steps/0/outcome","status":200,"ms":10.5,"principal":"order-agent"}
+{"ts":"2026-10-16T18:13:33.439Z","method":"POST","path":"/v1/runs/al-2/intents","status":200,"ms":5.6,"principal":"order-agent"}
+agent key in the log: 0; request bodies in the log: 0
+reversi_ledger_events_total{event="blocked"} 12
+reversi_ledger_events_total{event="intended"} 3
+reversi_ledger_events_total{event="run_started"} 3
+reversi_ledger_events_total{event="succeeded"} 2
+reversi_ledger_events_total{event="uncertain"} 1
+reversi_ledger_records 21
+reversi_runs 3
+reversi_approvals{status="pending"} 0
+reversi_halted 0
+metrics without a credential: 401
+```
+
+The library logger (`createLogger`, used by embedders) redacts credentials by field name and by pattern. Try it directly:
+
+```bash
+node -e 'import("@multimindlab/reversi").then(({createLogger})=>{const l=createLogger({base:{service:"demo"}});l.info("charge failed",{api_key:"sk_live_abcdefghijklmnop123456",authorization:"Bearer abc",note:"saw AKIAABCDEFGHIJKLMNOP in output",amount:5})})'
+```
+
+Expect:
+
+```text
+{"level":"info","time":"2026-10-16T18:13:39.604Z","msg":"charge failed","service":"demo","api_key":"[REDACTED]","authorization":"[REDACTED]","note":"saw [REDACTED:aws_access_key] in outpu...
+```
+
+<Note>
+Two logs exist. `REVERSI_LOG=json` writes the per-request line above (server only). Warnings from the engine itself (a failed notification, anchor or trace
+export) go through the `log:` section of `reversi.config.yaml`: `format: json` makes them redacted JSON lines on stderr, as section 4.4 showed, and
+`format: pretty` writes `reversi [warn] message`, and `level` is `debug`, `info`, `warn` or `error`. The code above is the same logger, for embedders.
+</Note>
+
+```bash
+# Terminals A, C and D: press Ctrl-C
+```
+
+**What this proves:** alerts are computed live and also pushed once, with a resolve when they clear; traces leave as OTLP/HTTP JSON
+without argument values; logs and metrics carry no credentials; `/metrics` needs an auditor key.
+
+## 6. Evidence: ledger, bundles, reports, anchors
+
+This section runs on the main data directory. The config adds one anchor sink, a file, and a data `region` label (section 8). A server start writes one anchor.
+
+```bash
+cat > try/ops/evidence.yaml <<'EOF2'
+manifests: ./manifests
+policy: ./policy.yaml
+data: { dir: ./data }
+egress: { region: eu-west }
+anchor:
+  sinks:
+    - { type: file, path: ./anchors.jsonl }
+  interval: 1h
+EOF2
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONFIG=try/ops/evidence.yaml REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js
+```
+
+A run with a success, an approval and a charge:
+
+```bash
+j $AGENT -X POST $B/v1/runs -d '{"run_id":"ev-1","permissions":["customers:read","orders:write","payments:write"]}' | cut -c1-40
+j $AGENT -X POST $B/v1/runs/ev-1/intents -d '{"tool":"create_order","args":{"sku":"BOOK-1"},"reason":"customer asked"}'
+j $AGENT -X POST $B/v1/runs/ev-1/steps/0/outcome -d '{"status":"succeeded","result":{"order_id":"ord_1"}}'
+j $AGENT -X POST $B/v1/runs/ev-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}' | cut -c1-70
+j $APPR -X POST $B/v1/approvals/$(pending ev-1)/approve -d '{"note":"checked ticket 123"}' | cut -c1-70
+j $AGENT -X POST $B/v1/runs/ev-1/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'
+j $AGENT -X POST $B/v1/runs/ev-1/steps/1/outcome -d '{"status":"succeeded","result":{"charge_id":"ch_1"}}'
+```
+
+Expect:
+
+```text
+{"run_id":"ev-1","mode":"enforce","scope
+{"decision":"allow","step":0}
+{"step":0,"status":"succeeded"}
+{"decision":"block","reasons":["approval required: request apr_730d46f
+{"id":"apr_…","run_id":"ev-1","step
+{"decision":"allow","step":1}
+{"step":1,"status":"succeeded"}
+```
+
+### 6.1 Verify the ledger and make signed bundles
+
+```bash
+rv verify
+j $AUD $B/v1/ledger/verify
+rv bundle --key try/ops/signing.key --out try/ops/ledger-bundle.json
+rv verify-bundle try/ops/ledger-bundle.json --pub try/ops/signing.pub
+sed 's/charge_card/delete_all/' try/ops/ledger-bundle.json > try/ops/tampered.json
+rv verify-bundle try/ops/tampered.json --pub try/ops/signing.pub; echo "exit $?"
+rv keygen try/ops/other > /dev/null
+rv verify-bundle try/ops/ledger-bundle.json --pub try/ops/other.pub; echo "exit $?"
+rv bundle --key try/ops/signing.key --out try/ops/run-bundle.json --run ev-1
+rv verify-bundle try/ops/run-bundle.json
+curl -s -H "Authorization: Bearer $AUD" $B/v1/runs/ev-1/bundle -o try/ops/served-bundle.json
+rv verify-bundle try/ops/served-bundle.json --pub try/ops/signing.pub
+```
+
+Expect:
+
+```text
+ok: 17 records, head 0678eb13f71f…
+{"ok":true,"records":17,"head":"0678eb13f71f…"}
+wrote try/ops/ledger-bundle.json: 17 records, key d67bfe0ef2ea4b10
+ok: 17 records, hash chain verified, key d67bfe0ef2ea4b10 (trusted)
+INVALID: records were modified after signing
+exit 1
+INVALID: signature does not match the trusted key
+exit 1
+wrote try/ops/run-bundle.json: 8 records, key d67bfe0ef2ea4b10
+ok: 8 records, record hashes verified (single run), key d67bfe0ef2ea4b10 (NOT checked against a trusted key)
+ok: 8 records, record hashes verified (single run), key d67bfe0ef2ea4b10 (trusted)
+```
+
+### 6.2 HTML and PDF run reports
+
+```bash
+rv report ev-1 --out try/ops/report.html
+rv --config try/ops/evidence.yaml report ev-1 --out try/ops/report.pdf
+head -c 5 try/ops/report.pdf; echo
+file try/ops/report.pdf | cut -d, -f1-3
+grep -o '<title>[^<]*</title>' try/ops/report.html
+echo "data region in the PDF: $(grep -a -c 'Data region: eu-west' try/ops/report.pdf)"
+echo "approver's note in the report: $(grep -c 'checked ticket 123' try/ops/report.html); argument values in the report: $(grep -c 'BOOK-1' try/ops/report.html)"
+```
+
+Expect:
+
+```text
+wrote try/ops/report.html
+wrote try/ops/report.pdf
+%PDF-
+try/ops/report.pdf: PDF document, version 1.4, 1 pages
+<title>Reversi report: ev-1</title>
+data region in the PDF: 1
+approver's note in the report: 1; argument values in the report: 0
+```
+
+Open `try/ops/report.html` in a browser, and the PDF in a viewer; the PDF is a one-page summary. The console links the same files on the run page:
+
+```bash
+login root $ROOT
+curl -s -b try/ops/jar-root $B/console/runs/ev-1 | grep -o 'href="[^"]*\(report\|bundle\)[^"]*"' | sed 's/href=//; s/"//g'
+curl -s -b try/ops/jar-root -o try/ops/console-report.pdf -w "console PDF: %{http_code} %{content_type}\n" $B/console/runs/ev-1/report.pdf
+head -c 5 try/ops/console-report.pdf; echo
+curl -s -b try/ops/jar-root -o /dev/null -w "console HTML report: %{http_code} %{content_type}\n" $B/console/runs/ev-1/report
+curl -s -b try/ops/jar-root -o try/ops/console-bundle.json -w "console bundle: %{http_code}\n" $B/console/bundle
+rv verify-bundle try/ops/console-bundle.json --pub try/ops/signing.pub
+curl -s -b try/ops/jar-root $B/console/evidence | tr '\n' ' ' | msg | cut -c1-120
+```
+
+Expect:
+
+```text
+root: login 303
+/console/runs/ev-1/report
+/console/runs/ev-1/report.pdf
+/console/runs/ev-1/bundle
+console PDF: 200 application/pdf
+%PDF-
+console HTML report: 200 text/html; charset=UTF-8
+console bundle: 200
+ok: 17 records, hash chain verified, key d67bfe0ef2ea4b10 (trusted)
+Evidence Ledger: chain verified 17 records, head 0678eb13f71f… Downlo
+```
+
+### 6.3 The period report
+
+With no run id, `reversi report` summarises a period for an auditor: what agents did, what was blocked, approvals, rollbacks. Formats are `md`, `html` or `json`.
+
+```bash
+rv report --since 1d | head -24
+rv report --since 1d --format html --out try/ops/period.html
+j $AUD "$B/v1/report?since=1d" | cut -c1-120
+```
+
+Expect:
+
+```text
+# Reversi report
+
+Period: 2026-10-15 18:13Z to 2026-10-16 18:13Z
+
+**2** tool calls in **5** runs. 2 succeeded, 0 failed, 0 with an unknown outcome.
+
+## What the agents did
+Calls by tool:
+- charge_card: 1
+- create_order: 1
+
+By reversibility class:
+- compensable: 1
+- reversible: 1
+
+By actor:
+- order-agent: 2
+
+## Blocked: 0
+- none
+
+## Would have been blocked (observe and advise modes): 0
+These calls ran. Enforcing would have stopped them:
+- none
+wrote try/ops/period.html
+{"from_ms":1792088025907,"to_ms":1792174425907,"runs":5,"calls":2,"actors":[{"key":"order-agent","count":2}],"tools":[{"
+```
+
+### 6.4 Anchoring
+
+An anchor is a signed note of the ledger's length and head hash, written somewhere you control. It lets you prove later that history was
+not cut back or rewritten: the check compares the anchored hash with the ledger's record at that position, so a tail that was cut off or a chain that was rebuilt differently both fail. The server already wrote one when it started;
+write another through the API and the CLI, then verify:
+
+```bash
+cat try/ops/anchors.jsonl | python3 -c 'import sys,json;[print({k:(v[:16] if isinstance(v,str) else v) for k,v in json.loads(l).items()}) for l in sys.stdin]' | cut -c1-230
+j $ROOT -X POST $B/v1/anchor | cut -c1-110
+rv anchor publish --file try/ops/anchors.jsonl --key try/ops/signing.key
+rv anchor verify try/ops/anchors.jsonl --pub try/ops/signing.pub
+```
+
+Expect:
+
+```text
+{'format': 'reversi-anchor', 'version': 1, 'ts_ms': 1792174420750, 'head': '0949ae344fa949f6', 'records': 9, 'region': 'eu-west', 'key_id': 'd67bfe0ef2ea4b10', 'signature': 'e1wRFiMtSdUIY...
+{"anchor":{"format":"reversi-anchor","version":1,"ts_ms":1792174425961,"head":"0678eb13f71fc95b9e3de85d59a380f
+anchored 17 records, head 0678eb13f71fc95b… (signed)
+  delivered to file:try/ops/anchors.jsonl
+2026-10-16T18:13:40Z  9 records  ok (signature trusted)
+2026-10-16T18:13:45Z  17 records  ok (signature trusted)
+2026-10-16T18:13:46Z  17 records  ok (signature trusted)
+```
+
+A truncated copy of the data directory still passes `reversi verify` (the chain is intact up to where it stops) but fails the anchors:
+
+```bash
+rm -rf try/ops/data-copy; cp -R try/ops/data try/ops/data-copy
+head -n 14 try/ops/data/ledger.jsonl > try/ops/data-copy/ledger.jsonl
+rv verify -d try/ops/data-copy; echo "exit $?"
+rv anchor verify try/ops/anchors.jsonl --pub try/ops/signing.pub -d try/ops/data-copy; echo "exit $?"
+rv anchor verify try/ops/anchors.jsonl --pub try/ops/other.pub; echo "exit $?"
+```
+
+Expect:
+
+```text
+ok: 14 records, head ba1f26e7ed9b…
+exit 0
+2026-10-16T18:13:40Z  9 records  ok (signature trusted)
+2026-10-16T18:13:45Z  17 records  FAIL: the ledger has 14 records but was anchored at 17: it has been truncated
+2026-10-16T18:13:46Z  17 records  FAIL: the ledger has 14 records but was anchored at 17: it has been truncated
+exit 1
+2026-10-16T18:13:40Z  9 records  FAIL: the anchor's signature does not match the trusted key
+2026-10-16T18:13:45Z  17 records  FAIL: the anchor's signature does not match the trusted key
+2026-10-16T18:13:46Z  17 records  FAIL: the anchor's signature does not match the trusted key
+exit 1
+```
+
+A rewritten history, here a different but internally valid ledger (the one from section 5) put in the copy's place, also passes `reversi verify` and fails the anchors:
+
+```bash
+cp try/ops/data-alerts/ledger.jsonl try/ops/data-copy/ledger.jsonl
+rv verify -d try/ops/data-copy | cut -c1-40
+rv anchor verify try/ops/anchors.jsonl --pub try/ops/signing.pub -d try/ops/data-copy; echo "exit $?"
+```
+
+Expect:
+
+```text
+ok: 21 records, head a357813bdf7caa0bdbe
+2026-10-16T18:13:40Z  9 records  FAIL: record 8 no longer has the anchored hash: history was rewritten
+2026-10-16T18:13:45Z  17 records  FAIL: record 16 no longer has the anchored hash: history was rewritten
+2026-10-16T18:13:46Z  17 records  FAIL: record 16 no longer has the anchored hash: history was rewritten
+exit 1
+```
+
+With no `--file`, `anchor publish` uses the `anchor:` sinks of the config (the CLI reads `anchor:`, `notifications:` and `alerts:` from the project file). Sign it with `--key`:
+
+```bash
+rv --config try/ops/evidence.yaml anchor publish --key try/ops/signing.key; echo "exit $?"
+tail -n 1 try/ops/anchors.jsonl | jq -c '{records,key_id,signed:(.signature != null)}'
+```
+
+Expect (the record count and head depend on your run):
+
+```text
+anchored 21 records, head a357813bdf7cxxxx… (signed)
+  delivered to file:<repo>/try/ops/anchors.jsonl
+exit 0
+{"records":21,"key_id":"...","signed":true}
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** the ledger verifies end to end; a signed bundle verifies against a key you trust and fails if one character
+changes or the wrong key is used; reports exist as HTML and PDF (a real `%PDF` file) and are linked in the console; reports show names and
+notes, never argument values; anchors catch a truncated or rewritten history that a chain check alone accepts.
+
+## 7. Retention and legal holds
+
+Retention deletes the working data around a run (run state, approval requests and captured arguments). The **ledger is never
+deleted**; a `purged` record is appended instead. The policy's `retention:` section sets `default_days` (at least 1) and optional rules by tool,
+tenant, environment or data class. A manifest can raise a run's retention with `audit.retention_days` and can require an evidence bundle first with
+`audit.evidence_export: required` (our `charge_card` does). We work on a copy so the main data survives.
+
+```bash
+rm -rf try/ops/data-ret try/ops/archive; cp -R try/ops/data try/ops/data-ret
+export REVERSI_DATA=try/ops/data-ret
+```
+
+```bash
+rv runs list
+rv retention plan
+```
+
+Expect:
+
+```text
+c-1  actor=order-agent  mode=enforce  steps=0  blocked_only
+ev-1  actor=order-agent  mode=enforce  steps=2  complete
+l-1  actor=order-agent  mode=enforce  steps=0  blocked_only
+n-1  actor=order-agent  mode=enforce  steps=0  blocked_only
+oidc-1  actor=bot-1  mode=enforce  steps=0  empty
+c-1  0d old  keep 30d  keep
+ev-1  0d old  keep 30d  keep
+l-1  0d old  keep 30d  keep
+n-1  0d old  keep 30d  keep
+oidc-1  0d old  keep 30d  keep
+```
+
+Everything is new, so nothing is due. To test without waiting a month, override the policy with `--days 0`, which makes every run due:
+
+```bash
+rv retention plan --days 0
+```
+
+Expect:
+
+```text
+c-1  0d old  keep 0d  due
+ev-1  0d old  keep 0d  due; needs an evidence bundle first
+l-1  0d old  keep 0d  due
+n-1  0d old  keep 0d  due
+oidc-1  0d old  keep 0d  due
+```
+
+A legal hold blocks deletion. Hold `c-1`, then do a dry run, a real run without an archive, and a real run with one:
+
+```bash
+rv hold add --run c-1 --reason "case 4411 litigation hold" --by legal
+rv hold list
+rv retention apply --days 0 --dry-run
+rv retention apply --days 0 --archive-dir try/ops/archive --key try/ops/signing.key
+ls try/ops/archive
+rv verify-bundle try/ops/archive/ev-1.json --pub try/ops/signing.pub
+rv runs list
+rv verify
+rv export | grep '"purged"' | head -1 | cut -c1-230
+```
+
+Expect:
+
+```text
+hold_…  holding run_id=c-1
+hold_…  run_id=c-1  case 4411 litigation hold  by legal
+would delete: l-1, n-1, oidc-1
+kept c-1: legal hold hold_…: case 4411 litigation hold
+kept ev-1: a manifest requires an evidence bundle before deletion; give an archive directory and a signing key
+deleted: ev-1, l-1, n-1, oidc-1
+archived ev-1 -> try/ops/archive/ev-1.json
+archived l-1 -> try/ops/archive/l-1.json
+archived n-1 -> try/ops/archive/n-1.json
+archived oidc-1 -> try/ops/archive/oidc-1.json
+kept c-1: legal hold hold_…: case 4411 litigation hold
+ev-1.json
+l-1.json
+n-1.json
+oidc-1.json
+ok: 8 records, record hashes verified (single run), key d67bfe0ef2ea4b10 (trusted)
+c-1  actor=order-agent  mode=enforce  steps=0  blocked_only
+ok: 21 records, head 9935752ef21a…
+{"seq":17,"ts_ms":1792174429560,"run_id":"ev-1","step":null,"actor":"cli","tool":"-","payload_hash":"74234e98afe7…","reason":"retention: older than 0 days","event":"purged","detai
+```
+
+`ev-1` uses `charge_card`, whose manifest requires an evidence bundle, so it was kept in the dry run (no archive directory given) and deleted only once a directory and key were. With them, every deleted run gets a signed bundle, not only the ones that require it.
+The held run `c-1` survived and says why. Release the hold and apply again:
+
+```bash
+rv hold release $(rv hold list | awk '{print $1}')
+rv hold list --all | cut -c1-110
+rv retention apply --days 0 --archive-dir try/ops/archive --key try/ops/signing.key
+rv runs list; rv verify
+export REVERSI_DATA=try/ops/data
+```
+
+Expect:
+
+```text
+released hold_…
+hold_…  run_id=c-1  case 4411 litigation hold  by legal  RELEASED
+deleted: c-1
+archived c-1 -> try/ops/archive/c-1.json
+ok: 22 records, head 4b0b6597193b…
+```
+
+The same is available on the server: `GET /v1/retention/plan`, `POST /v1/holds`, `POST /v1/retention/apply` (admin), and the console **Settings** page with Dry run and Apply buttons.
+Against the main data (nothing is due under the 30 day policy):
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js
+```
+
+```bash
+sleep 1
+j $AUD $B/v1/retention/plan | cut -c1-150
+j $ROOT -X POST $B/v1/holds -d '{"run_id":"ev-1","reason":"case 7 under review"}' | cut -c1-110
+login root $ROOT
+curl -s -b try/ops/jar-root $B/console/settings | grep -o 'Retention</h2>.\{0,120\}' | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c1-110
+post -b try/ops/jar-root -d "csrf=$(csrf root)&dry=1" $B/console/settings/retention
+j $ROOT -X DELETE $B/v1/holds/$(j $AUD $B/v1/holds | python3 -c 'import sys,json;print(json.load(sys.stdin)["holds"][0]["id"])')
+```
+
+Expect:
+
+```text
+{"config":{"default_days":30,"rules":[]},"runs":[{"run_id":"c-1","age_days":0,"retention_days":30,"due":false,"needs_export":false},{"run_id":"ev-1","
+{"id":"hold_…","scope":{"run_id":"ev-1"},"reason":"case 7 under review","by
+root: login 303
+Retention Default 30 days. 5 runs tracked, 0 due for deletion now (holds respected). <form class="inline" meth
+200 Retention Dry run: nothing deleted. Would delete 0 runs; skipped 0. Back
+{"ok":true}
+```
+
+```bash
+# Terminal A: press Ctrl-C
+```
+
+**What this proves:** retention follows the policy and manifests; a hold wins over retention and names the reason; required evidence is exported
+and signed before deletion (and deletion is refused without it); deleted runs leave a `purged` ledger record and the chain still verifies.
+
+## 8. Egress and data residency
+
+Every outbound call Reversi makes (notifications, anchor webhooks, trace export, remote manifests, upstreams) passes the egress rules in
+`reversi.config.yaml`. `allow` lists host patterns; unset means any host. `block_private: true` refuses loopback, private and link-local
+addresses (off by default so local development works). Cloud metadata addresses such as 169.254.169.254 are always refused.
+`region` is only a label: it appears in refusal messages, in signed anchors (section 6.4) and in the PDF report (section 6.2).
+
+```bash
+cat > try/ops/egress.yaml <<'EOF2'
+manifests: ./manifests
+policy: ./policy.yaml
+data: { dir: ./data }
+egress:
+  allow: ["127.0.0.1", "169.254.169.254"]
+  region: eu-west
+notifications:
+  channels:
+    - { type: webhook, name: listed, url: "http://127.0.0.1:7811/webhook" }
+    - { type: webhook, name: not-listed, url: "http://localhost:7811/webhook" }
+    - { type: webhook, name: metadata, url: "http://169.254.169.254/latest/meta-data" }
+EOF2
+cat > try/ops/egress-private.yaml <<'EOF2'
+manifests: ./manifests
+policy: ./policy.yaml
+data: { dir: ./data }
+egress:
+  block_private: true
+notifications:
+  channels:
+    - { type: webhook, name: loopback, url: "http://127.0.0.1:7811/webhook" }
+    - { type: webhook, name: lan, url: "http://10.1.2.3/hook" }
+EOF2
+```
+
+`reversi doctor` checks every configured destination without sending anything:
+
+```bash
+rv --config try/ops/egress.yaml doctor | grep " egress"
+rv --config try/ops/egress-private.yaml doctor | grep " egress"
+```
+
+Expect:
+
+```text
+ok    egress allows 127.0.0.1:7811
+FAIL  egress: localhost is not in the egress allowlist (region eu-west)
+FAIL  egress: 169.254.169.254 resolves to a cloud metadata address (169.254.169.254), which is never allowed
+FAIL  egress: 127.0.0.1 resolves to a private or loopback address (127.0.0.1) and egress.block_private is on
+FAIL  egress: 10.1.2.3 resolves to a private or loopback address (10.1.2.3) and egress.block_private is on
+```
+
+Now for real, from a running server. The fake endpoint is on 127.0.0.1 (listed); the same fake reached as `localhost` is not in `allow`, and the metadata address is refused even though it is listed:
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+node try/ops/fake.mjs 7811 2>&1 | tee try/ops/fake.log
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_CONFIG=try/ops/egress.yaml REVERSI_CONSOLE=login REVERSI_SESSION_SECRET=$(openssl rand -hex 16) PORT=7800 node packages/server/dist/main.js 2>&1 | tee try/ops/a.log
+```
+
+```bash
+login root $ROOT
+post -b try/ops/jar-root -d "csrf=$(csrf root)" $B/console/settings/notify-test
+sleep 1
+grep -a "warn" try/ops/a.log | cut -c1-170
+tr -d '\000' < try/ops/fake.log | grep -a path | cut -c1-90
+curl -s -b try/ops/jar-root $B/console/settings | grep -o 'Data residency.\{0,120\}' | sed 's/<[^>]*>//g' | cut -c1-90
+```
+
+Expect:
+
+```text
+root: login 303
+200 Test notification Sent to: listed. Failed: not-listed, metadata. Back
+reversi [warn] notification to not-listed failed: webhook not-listed: localhost is not in the egress allowlist (region eu-west)
+reversi [warn] notification to metadata failed: webhook metadata: 169.254.169.254 resolves to a cloud metadata address (169.254.169.254), which is never allowed
+{"path":"/webhook","event":"test","body":"{\"event\":\"test\",\"ts\":\"2026-10-16T18:14:01
+Data residency: outbound addresses are checked against the egress rules
+```
+
+```bash
+# Terminals A and C: press Ctrl-C
+```
+
+**What this proves:** an allow list stops data going to hosts you did not name, `block_private` stops it going to internal addresses, metadata
+endpoints are never reachable, and the refusal is a warning that does not affect any decision. The same guard covers anchor webhooks, OTLP export,
+remote manifest URLs and gateway upstream URLs; only notifications are exercised here.
+
+## 9. The three stores, with the same scenario
+
+The same four calls against each store: open a run, create an order, ask for a charge over 100 (blocked for approval), and try a tool out of scope.
+Then a **second server on the same store** approves the charge and the first server lets it through, which shows that the ledger and approvals are shared.
+
+```bash
+scenario() { local B=localhost:$1 R=$2
+  j $AGENT -X POST $B/v1/runs -d "{\"run_id\":\"$R\",\"permissions\":[\"orders:write\",\"payments:write\"]}" > /dev/null
+  j $AGENT -X POST $B/v1/runs/$R/intents -d '{"tool":"create_order","args":{"sku":"B"},"reason":"order"}'
+  j $AGENT -X POST $B/v1/runs/$R/steps/0/outcome -d '{"status":"succeeded","result":{"order_id":"o1"}}'
+  j $AGENT -X POST $B/v1/runs/$R/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}' | cut -c1-90
+  j $AGENT -X POST $B/v1/runs/$R/intents -d '{"tool":"delete_customer","args":{"id":"c1"},"reason":"x"}' | cut -c1-110
+}
+shared() { local R=$1 P1=$2 P2=$3
+  ID=$(curl -s -H "Authorization: Bearer $APPR" "localhost:$P2/v1/approvals?status=pending" | python3 -c "import sys,json;print([a['id'] for a in json.load(sys.stdin)['approvals'] if a['run_id']=='$R'][0])")
+  curl -s -X POST -H "Authorization: Bearer $APPR" -H 'content-type: application/json' localhost:$P2/v1/approvals/$ID/approve -d '{"note":"ok"}' | python3 -c 'import sys,json;a=json.load(sys.stdin);print("approved on the second server:",a["status"],a["decided_by"])'
+  j $AGENT -X POST localhost:$P1/v1/runs/$R/intents -d '{"tool":"charge_card","args":{"amount":500},"reason":"pay"}'
+  j $AGENT -X POST localhost:$P1/v1/runs/$R/steps/1/outcome -d '{"status":"succeeded","result":{"charge_id":"ch_1"}}'
+}
+ledgers() { for p in "$@"; do curl -s -H "Authorization: Bearer $AUD" localhost:$p/v1/ledger/verify | python3 -c "import sys,json;d=json.load(sys.stdin);print('port $p:',d['ok'],d['records'],'records, head',d['head'][:16])"; done; }
+TAG=$(date +%s)
+```
+
+### 9.1 Files (the default)
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_STORE=files REVERSI_DATA=try/ops/st-files PORT=7800 node packages/server/dist/main.js
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+REVERSI_STORE=files REVERSI_DATA=try/ops/st-files PORT=7803 node packages/server/dist/main.js
+```
+
+```bash
+sleep 1
+scenario 7800 files-$TAG
+shared files-$TAG 7800 7803
+rv runs list -d try/ops/st-files --store files
+rv verify -d try/ops/st-files --store files | cut -c1-40
+ledgers 7800 7803
+```
+
+Expect:
+
+```text
+{"decision":"allow","step":0}
+{"step":0,"status":"succeeded"}
+{"decision":"block","reasons":["approval required: request apr_6220eef2-2144-4b14-8094-1e6
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+approved on the second server: approved alice
+{"decision":"allow","step":1}
+{"step":1,"status":"succeeded"}
+files-<time>  actor=order-agent  mode=enforce  steps=2  complete
+ok: 9 records, head 0c17c8e2a0b413975a7c
+port 7800: True 9 records, head 0c17c8e2a0b41397
+port 7803: True 9 records, head 0c17c8e2a0b41397
+```
+
+```bash
+# Terminals A and C: press Ctrl-C
+```
+
+### 9.2 SQLite
+
+SQLite needs Node 22.13 or newer and prints an experimental-feature warning.
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_STORE=sqlite REVERSI_DATA=try/ops/st-sqlite PORT=7800 node packages/server/dist/main.js
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+REVERSI_STORE=sqlite REVERSI_DATA=try/ops/st-sqlite PORT=7803 node packages/server/dist/main.js
+```
+
+```bash
+sleep 1
+scenario 7800 sqlite-$TAG
+shared sqlite-$TAG 7800 7803
+rv runs list -d try/ops/st-sqlite --store sqlite 2>/dev/null
+rv verify -d try/ops/st-sqlite --store sqlite 2>/dev/null | cut -c1-40
+ls try/ops/st-sqlite
+ledgers 7800 7803
+```
+
+Expect:
+
+```text
+{"decision":"allow","step":0}
+{"step":0,"status":"succeeded"}
+{"decision":"block","reasons":["approval required: request apr_41a9b1d1-d6d8-45b9-ac70-073
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+approved on the second server: approved alice
+{"decision":"allow","step":1}
+{"step":1,"status":"succeeded"}
+sqlite-<time>  actor=order-agent  mode=enforce  steps=2  complete
+ok: 9 records, head 6e250b25890d5cc21a37
+reversi.db
+reversi.db-shm
+reversi.db-wal
+port 7800: True 9 records, head 6e250b25890d5cc2
+port 7803: True 9 records, head 6e250b25890d5cc2
+```
+
+```bash
+# Terminals A and C: press Ctrl-C
+```
+
+### 9.3 PostgreSQL
+
+Use a **throwaway** database. The server creates its own tables (`ledger`, `runs`, `approvals`, `kv`, `reversi_migrations`) in the default schema on first
+start. This guide used a local PostgreSQL 15 instance at a unix socket (the project's test database); any URL works.
+
+```bash
+export PGURL='postgres://reversi@localhost/reversi_test?host=/tmp/rvpg'
+```
+
+```bash
+# Terminal A
+. try/ops/.env.sh
+REVERSI_STORE=postgres REVERSI_DATABASE_URL='postgres://reversi@localhost/reversi_test?host=/tmp/rvpg' PORT=7800 node packages/server/dist/main.js
+```
+
+```bash
+# Terminal C
+. try/ops/.env.sh
+REVERSI_STORE=postgres REVERSI_DATABASE_URL='postgres://reversi@localhost/reversi_test?host=/tmp/rvpg' PORT=7803 node packages/server/dist/main.js
+```
+
+```bash
+sleep 1
+scenario 7800 pg-$TAG
+shared pg-$TAG 7800 7803
+rv runs list --store postgres --database-url "$PGURL" | grep "pg-$TAG"
+rv verify --store postgres --database-url "$PGURL" | cut -c1-30
+ledgers 7800 7803
+```
+
+Expect:
+
+```text
+{"decision":"allow","step":0}
+{"step":0,"status":"succeeded"}
+{"decision":"block","reasons":["approval required: request apr_57196037-c8a5-4b54-adf9-cbe
+{"decision":"block","reasons":["permission `customers:admin` is not in the run's scope"]}
+approved on the second server: approved alice
+{"decision":"allow","step":1}
+{"step":1,"status":"succeeded"}
+pg-<time>  actor=order-agent  mode=enforce  steps=2  complete
+ok: 59 records, head 2a9c26ca9
+port 7800: True 59 records, head 2a9c26ca9f0d8916
+port 7803: True 59 records, head 2a9c26ca9f0d8916
+```
+
+With `psql` you can read the tables (reading only):
+
+```bash
+psql "$PGURL" -c "select seq, record->>'event' as event, record->>'run_id' as run from ledger where record->>'run_id' = 'pg-$TAG' order by seq limit 4"
+```
+
+Expect:
+
+```text
+ seq |    event    |      run
+-----+-------------+---------------
+  50 | run_started | pg-<time>
+  51 | intended    | pg-<time>
+  52 | succeeded   | pg-<time>
+  53 | blocked     | pg-<time>
+(4 rows)
+```
+
+```bash
+# Terminals A and C: press Ctrl-C
+```
+
+**What this proves:** the same behaviour on all three stores: policy, approvals and rollback state do not depend on the store; the ledger head
+is identical from two processes; a second process can decide an approval the first one asked for. The append-only triggers on SQLite and PostgreSQL
+(UPDATE and DELETE on the ledger are rejected) are described in [Storage](/operations/storage); this guide does not try to delete ledger rows.
+
+## 10. Deployment artifacts
+
+Docker, Compose and Helm were **not run**. What can be checked without a Docker daemon or a cluster:
+
+```bash
+docker --version
+docker info 2>&1 | grep -iE "^server|cannot connect" | cut -c1-90
+command -v helm || echo "helm: not installed"
+```
+
+Expect:
+
+```text
+Docker version 29.7.2, build a7dcaa6
+Server:
+Cannot connect to the Docker daemon at unix:///Users/darshankumar/.docker/run/docker.sock.
+helm: not installed
+```
+
+On the machine this guide was written on, the Docker daemon was not running, so the image was not built or run. A build would also download a base image and
+npm packages from the internet, which this guide does not do. Parse the YAML files at least (this is not a render, a lint or a dry run):
+
+```bash
+node -e '
+const {parse}=require("yaml"),fs=require("fs");
+for (const f of ["deploy/docker-compose.yml","deploy/helm/reversi/values.yaml","deploy/helm/reversi/Chart.yaml",".github/workflows/ci.yml",".github/workflows/release.yml"]) {
+  try { const d=parse(fs.readFileSync(f,"utf8")); console.log("ok  ",f,"-",Object.keys(d).slice(0,5).join(", "), d.jobs?"| jobs: "+Object.keys(d.jobs).join(", "):d.services?"| services: "+Object.keys(d.services).join(", "):""); }
+  catch(e){ console.log("FAIL",f,"-",e.message.split("\n")[0]); } }'
+```
+
+Expect:
+
+```text
+ok   deploy/docker-compose.yml - services, volumes | services: postgres, reversi
+ok   deploy/helm/reversi/values.yaml - image, replicaCount, server, manifests, registry
+ok   deploy/helm/reversi/Chart.yaml - apiVersion, name, description, type, version
+ok   .github/workflows/ci.yml - name, on, permissions, jobs | jobs: test, supply-chain, docker
+ok   .github/workflows/release.yml - name, on, permissions, jobs | jobs: publish
+```
+
+<Warning>
+All five files parse as plain YAML. That is all this checks: the Helm templates (`{{ }}`) cannot be parsed as plain YAML and were not rendered, and `helm` was not available. Treat the chart as unverified until you have run `helm lint` and `helm template`.
+</Warning>
+
+The compose file requires `POSTGRES_PASSWORD` (`${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}`), publishes only on `127.0.0.1` and turns on the login console.
+To try the stack yourself, follow the comments at the top of `deploy/docker-compose.yml` and the [Deployment](/operations/deployment) page.
+The workflows in `.github/workflows/` run on GitHub and were not executed here.
+
+## Not covered here
+
+- **Real third-party services.** Slack (including interactive Approve and Deny buttons), Teams, PagerDuty, Opsgenie, a real SMTP relay (STARTTLS, AUTH,
+  implicit TLS), and a real OpenTelemetry collector. Only localhost fakes were used. The anchor webhook sink, remote manifest URLs and gateway
+  upstream URLs through the egress guard were not run either.
+- **Alerts that need time or a failure:** an unresolved step (needs more than an hour), approval timeout and escalation, a failed compensation, an unhealthy
+  gateway upstream.
+- **Browser sign-in with SSO redirects** (not built: the console takes a pasted key or token). The console was exercised with `curl`; nothing was clicked in a browser.
+- **TLS and `REVERSI_SECURE_COOKIES=1`**, which need HTTPS in front.
+- **Docker image build and run, Docker Compose, Helm (lint, template, install), the GitHub workflows.**
+- **PostgreSQL over the network, with TLS, or with a restricted role;** append-only triggers were not provoked.
+- **A Terraform provider and a Kubernetes operator.** They are not built; use `reversi apply` and the Helm chart.
+
+## Cleanup
+
+```bash
+pkill -f packages/server/dist/main.js; pkill -f packages/gateway/dist/main.js; pkill -f mock-idp.mjs
+pkill -f try/ops/fake.mjs; pkill -f try/ops/smtp-sink.mjs; pkill -f webhook-sink.mjs
+rm -rf try/ops
+```
+
+PostgreSQL tables from section 9 stay in your throwaway database; drop that database yourself when you are done.

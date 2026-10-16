@@ -3,18 +3,37 @@
   "version": "0.1.0",
   "description": "Reversi command line: validate manifests, verify ledgers, plan and run rollbacks, export evidence",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/multimindlab/reversi.git", "directory": "packages/cli" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/multimindlab/reversi.git",
+    "directory": "packages/cli"
+  },
   "homepage": "https://reversi.multimind.dev",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "bin": { "reversi": "dist/main.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "reversi": "dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@multimindlab/reversi": "0.1.0",
     "commander": "^14.0.0",
-    "yaml": "^2.8.0"
+    "yaml": "^2.8.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@multimindlab/reversi-gateway": "0.1.0",
+    "@multimindlab/reversi-server": "0.1.0",
+    "@hono/node-server": "^1.19.0"
   }
 }

@@ -20,6 +20,7 @@ import {
   parseJsonl,
   parsePolicy,
   renderReport,
+  renderReportPdf,
   runPolicyTests,
   storeKindFrom,
   toJsonl,
@@ -29,18 +30,22 @@ import {
   type EngineHandle,
   type RollbackPlan,
 } from "@multimindlab/reversi";
+import { Fail, makeContext, type EngineFlags, type IO } from "./context.js";
+import { registerInspectCommands, periodReportCommand } from "./commands/inspect.js";
+import { registerGovernanceCommands } from "./commands/governance.js";
+import { registerManifestCommands } from "./commands/manifests.js";
+import { registerSimulationCommands } from "./commands/simulate.js";
+import { registerProjectCommands } from "./commands/project.js";
+import { registerApplyCommand } from "./commands/apply.js";
+import { registerServeCommands } from "./commands/serve.js";
 
-export interface IO {
-  out: (s: string) => void;
-  err: (s: string) => void;
-}
+export type { IO } from "./context.js";
+export { Fail };
 
 const DEFAULT_IO: IO = {
   out: (s) => process.stdout.write(s + "\n"),
   err: (s) => process.stderr.write(s + "\n"),
 };
-
-class Fail extends Error {}
 
 /** Run a shell command with the compensation call as JSON on stdin. Exit 0 means the undo succeeded. */
 function runCompensator(cmd: string, call: CompensationCall, timeoutMs: number): Promise<void> {
@@ -57,6 +62,32 @@ function runCompensator(cmd: string, call: CompensationCall, timeoutMs: number):
     });
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(call));
+  });
+}
+
+/** Run a read-back: the command gets {"tool","arguments"} on stdin and prints the tool's JSON result. */
+function runReader(cmd: string, tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, { shell: true, stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs });
+    let out = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      if (out.length < 1_000_000) out += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      if (stderr.length < 500) stderr += String(d);
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (code !== 0) return reject(new Error(`reader ${signal ? `killed by ${signal}` : `exited ${code}`}${stderr ? `: ${stderr.trim()}` : ""}`));
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        reject(new Error("reader did not print JSON"));
+      }
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ tool, arguments: args }));
   });
 }
 
@@ -78,54 +109,15 @@ function formatPlan(p: RollbackPlan): string[] {
 
 export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number> {
   const program = new Command();
-  let code = 0;
   program
     .name("reversi")
     .description("Reversibility, approvals and tamper-evident evidence for AI agent tool calls")
     .exitOverride()
     .configureOutput({ writeOut: (s) => io.out(s.replace(/\n$/, "")), writeErr: (s) => io.err(s.replace(/\n$/, "")) });
 
-  const storeOpts = (c: Command) =>
-    c
-      .option("-d, --data <dir>", "data directory", "./reversi-data")
-      .option("--store <kind>", "files | sqlite | postgres (default: REVERSI_STORE or files)")
-      .option("--database-url <url>", "PostgreSQL URL (default: REVERSI_DATABASE_URL)");
-  const dataOpts = (c: Command) => storeOpts(c.requiredOption("-m, --manifests <path>", "manifest file or directory (.json, .yaml)"));
-
-  interface StoreFlags {
-    data: string;
-    store?: string;
-    databaseUrl?: string;
-  }
-  const dataOptionsOf = (o: StoreFlags) => {
-    const env = dataOptionsFromEnv();
-    return {
-      dir: o.data,
-      store: o.store ? storeKindFrom(o.store) : env.store,
-      postgres_url: o.databaseUrl ?? env.postgres_url,
-    };
-  };
-  const dataExists = (o: StoreFlags) => {
-    const d = dataOptionsOf(o);
-    if (d.store === "files" && !existsSync(o.data)) throw new Fail(`data directory not found: ${o.data}`);
-  };
-  /** Open the engine; the caller closes the store. Policy only matters for new calls, which the CLI never makes. */
-  const engine = async (o: StoreFlags & { manifests: string }): Promise<EngineHandle> => {
-    dataExists(o);
-    return openEngine({ manifests: o.manifests, data: dataOptionsOf(o) });
-  };
-  const withEngine = async <T>(o: Parameters<typeof engine>[0], fn: (e: EngineHandle) => Promise<T> | T): Promise<T> => {
-    const e = await engine(o);
-    try {
-      return await fn(e);
-    } finally {
-      e.data.close();
-    }
-  };
-  const readDoc = (path: string): unknown => {
-    const text = readFileSync(path, "utf8");
-    return extname(path).toLowerCase() === ".json" ? JSON.parse(text) : parseYaml(text);
-  };
+  program.option("--config <file>", "project configuration file (default: reversi.config.yaml in this or a parent folder)");
+  const ctx = makeContext(program, io);
+  const { storeOpts, dataOpts, dataOptionsOf, dataExists, withEngine, readDoc } = ctx;
 
   program
     .command("validate <path>")
@@ -157,20 +149,9 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
     if (v.ok) io.out(`ok: ${v.records} records, head ${v.head}`);
     else {
       io.err(`TAMPERED or corrupt at record ${v.seq}: ${v.error}`);
-      code = 1;
+      ctx.code = 1;
     }
   });
-
-  dataOpts(program.command("runs").description("list runs and their step counts")).action((o) =>
-    withEngine(o, (rv) => {
-      for (const id of rv.reversi.runIds()) {
-        const run = rv.reversi.openRun(id);
-        const s = run.state();
-        const un = run.unresolved();
-        io.out(`${id}  actor=${s.actor}  mode=${s.mode}  steps=${s.steps.length}${un.length ? `  UNRESOLVED=${un.join(",")}` : ""}`);
-      }
-    }),
-  );
 
   dataOpts(program.command("plan <run_id>").description("show what a rollback would do; executes nothing"))
     .option("--json", "machine-readable output")
@@ -179,13 +160,14 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
         const p = rv.reversi.openRun(run_id).plan();
         if (o.json) io.out(JSON.stringify(p, null, 2));
         else for (const l of formatPlan(p)) io.out(l);
-        if (!p.fully_reversible) code = 2;
+        if (!p.fully_reversible) ctx.code = 2;
       }),
     );
 
   dataOpts(program.command("rollback <run_id>").description("undo a run with an operator-supplied compensator command"))
     .requiredOption("--compensator-cmd <cmd>", "shell command; receives the compensation call as JSON on stdin; exit 0 = undone")
     .option("--verify-cmd <cmd>", "shell command run after each compensation with the same JSON; exit 0 = the undo is confirmed")
+    .option("--reader-cmd <cmd>", "shell command that runs a manifest's declared read-back: gets {tool, arguments} as JSON on stdin, prints the result as JSON. Without it, steps that declare a verification end up unverified")
     .option("--approve-compensations", "approve compensations that require approval (operator decision)")
     .option("--retries <n>", "attempts per compensation, with exponential backoff and the same idempotency key", "1")
     .option("--timeout-ms <n>", "per-compensation timeout", "30000")
@@ -206,6 +188,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
           actor: "cli",
           retry: { attempts },
           compensate: (c) => runCompensator(o.compensatorCmd, c, timeout),
+          verifier: o.readerCmd ? (tool, args) => runReader(o.readerCmd, tool, args, timeout) : undefined,
           verify: o.verifyCmd ? (c) => runCompensator(o.verifyCmd, c, timeout).then(() => true, () => false) : undefined,
         });
         if (o.json) io.out(JSON.stringify(report, null, 2));
@@ -214,13 +197,14 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
           io.out(`skipped (no undo needed): ${report.skipped.join(", ") || "-"}`);
           for (const f of report.failed) io.out(`FAILED step ${f.step}: ${f.error}`);
           if (report.unrecoverable.length) io.out(`cannot be undone: ${report.unrecoverable.join(", ")}`);
+          if (report.unverified.length) io.out(`undone but not verified (declared read-back not run; pass --reader-cmd): ${report.unverified.join(", ")}`);
           if (report.unresolved.length) io.out(`outcome unknown, reconcile manually (reversi resolve): ${report.unresolved.join(", ")}`);
           if (report.unmanifested.length) io.out(`no manifest: ${report.unmanifested.join(", ")}`);
           for (const d of report.deferred) io.out(`deferred step ${d.step}: waits for ${d.blocked_by.join(", ")}`);
           if (report.awaiting_approval.length) io.out(`awaiting approval: ${report.awaiting_approval.join(", ")}`);
           io.out(report.complete ? "rollback complete" : "rollback INCOMPLETE");
         }
-        if (!report.complete) code = 2;
+        if (!report.complete) ctx.code = 2;
       });
     });
 
@@ -262,16 +246,21 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
     }
   });
   for (const decision of ["approve", "deny"] as const) {
-    storeOpts(approvals.command(`${decision} <id>`).description(`${decision} a pending request`).option("--note <text>", "recorded with the decision").option("--as <name>", "who is deciding", "cli")).action(async (id: string, o) => {
+    storeOpts(approvals.command(`${decision} <id>`).description(`${decision} a pending request`).option("--note <text>", "recorded with the decision").option("--as <name>", "who is deciding", "cli").option("--groups <list>", "groups you decide as, comma separated (for approvals routed to groups)").option("--roles <list>", "roles you decide as (default operator)")).action(async (id: string, o) => {
       dataExists(o);
-      const d = await openData(dataOptionsOf(o));
-      try {
-          const a = new Approvals(d.approvals);
-        const r = decision === "approve" ? a.approve(id, o.as, o.note) : a.deny(id, o.as, o.note);
+      // Through the engine, so the decision is journaled, delegations apply, and notifications go out like any other decision.
+      const m = (() => {
+        try {
+          return ctx.manifestsPath(o);
+        } catch {
+          return undefined;
+        }
+      })();
+      await ctx.withEngine({ ...o, manifests: m ?? "-" }, (e) => {
+        const who = { roles: o.roles ? String(o.roles).split(",") : ["operator"], groups: o.groups ? String(o.groups).split(",").map((x: string) => x.trim()).filter(Boolean) : [] };
+        const r = decision === "approve" ? e.approvals.approve(id, o.as, o.note, who) : e.approvals.deny(id, o.as, o.note, who);
         io.out(`${r.id} ${r.status} by ${r.decided_by}`);
-      } finally {
-        d.close();
-      }
+      }, { manifests: m ?? "", allow_empty_manifests: !m });
     });
   }
 
@@ -301,7 +290,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
       for (const r of results) io.out(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `: expected ${r.expected}, got ${r.got}${r.message ? ` (${r.message})` : ""}`}`);
       const bad = results.filter((r) => !r.ok).length;
       io.out(bad ? `${bad} of ${results.length} failed` : `${results.length} passed`);
-      if (bad) code = 1;
+      if (bad) ctx.code = 1;
     });
   policy
     .command("check <policy>")
@@ -370,23 +359,42 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
       const r = verifyBundle(JSON.parse(readFileSync(file, "utf8")), { trusted_public_pem: o.pub ? readFileSync(o.pub, "utf8") : undefined });
       if (!r.ok) {
         io.err(`INVALID: ${r.error}`);
-        code = 1;
+        ctx.code = 1;
         return;
       }
       io.out(`ok: ${r.records} records, ${r.chain === "full" ? "hash chain verified" : "record hashes verified (single run)"}, key ${r.key_id}${r.trusted_key ? " (trusted)" : " (NOT checked against a trusted key)"}`);
     });
 
-  dataOpts(program.command("report <run_id>").description("write a self-contained HTML report for auditors").requiredOption("--out <file>", "output file")).action((run_id: string, o) =>
-    withEngine(o, (rv) => {
+  dataOpts(
+    program
+      .command("report [run_id]")
+      .description("an auditor report for one run (HTML or PDF by file extension), or with no run id the report for a period: what agents did, what was blocked or would have been, approvals, rollbacks")
+      .option("--out <file>", "output file (.html, .pdf, .md, .json)")
+      .option("--since <when>", "for the period report: 7d, 2026-10-01, ... (default 7d)")
+      .option("--format <fmt>", "for the period report: md | html | json"),
+  ).action(async (run_id: string | undefined, o: EngineFlags & { out?: string; since?: string; format?: string }) => {
+    if (!run_id) return periodReportCommand(ctx, o);
+    if (!o.out) throw new Fail("--out <file> is required for a run report");
+    await withEngine(o, (rv) => {
       const run = rv.reversi.openRun(run_id);
-      writeFileSync(o.out, renderReport({ run: run.state(), records: rv.reversi.ledger.forRun(run_id), plan: run.plan(), ledger_head: rv.reversi.ledger.head() }));
+      const args = { run: run.state(), records: rv.reversi.ledger.forRun(run_id), plan: run.plan(), ledger_head: rv.reversi.ledger.head() };
+      if (o.out?.toLowerCase().endsWith(".pdf")) writeFileSync(o.out, renderReportPdf({ ...args, region: rv.egress.region }));
+      else writeFileSync(o.out as string, renderReport(args));
       io.out(`wrote ${o.out}`);
-    }),
-  );
+    });
+  });
+
+  registerProjectCommands(program, ctx);
+  registerManifestCommands(program, ctx);
+  registerInspectCommands(program, ctx);
+  registerSimulationCommands(program, ctx);
+  registerGovernanceCommands(program, ctx);
+  registerApplyCommand(program, ctx);
+  registerServeCommands(program, ctx);
 
   try {
     await program.parseAsync(argv, { from: "user" });
-    return code;
+    return ctx.code;
   } catch (e) {
     if (e instanceof CommanderError) return e.exitCode === 0 ? 0 : 64;
     if (e instanceof ManifestError || e instanceof PolicyError) {

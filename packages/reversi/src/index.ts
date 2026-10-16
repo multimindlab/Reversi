@@ -1,12 +1,18 @@
 export { canonicalize, hashPayload, sha256Hex } from "./canonical.js";
 export {
+  BLAST_RADII,
   EFFECTS,
+  parseDuration,
   ManifestError,
   Registry,
   REF_PATTERN,
   resolveRef,
+  authorForm,
   validateManifest,
+  type BlastRadius,
   type Compensation,
+  type ManifestStatus,
+  type Verification,
   type Effect,
   type ToolManifest,
   type ValidateResult,
@@ -44,8 +50,13 @@ export {
   Reversi,
   ReversiError,
   Run,
+  expectMismatch,
+  mergeRequirements,
   idempotencyKey,
+  renderIdempotencyKey,
   type ApprovalDecision,
+  type Halt,
+  type HaltScope,
   type ApprovalRequest,
   type Approver,
   type BeginInput,
@@ -72,6 +83,8 @@ export {
   mergePolicyDocs,
   parsePolicy,
   runPolicyTests,
+  type ApprovalRequirement,
+  type Budget,
   type Condition,
   type Limit,
   type Match,
@@ -90,6 +103,7 @@ export {
   FileApprovalStore,
   MemoryApprovalStore,
   type ApprovalRecord,
+  type ApproverIdentity,
   type ApprovalStatus,
   type ApprovalStore,
   type ApprovalsOptions,
@@ -104,8 +118,10 @@ export {
   type EvidenceBundle,
   type SigningKey,
 } from "./evidence.js";
+export { FileKvStore, KvConflictError, MemoryKvStore, kvUpdate, type KvEntry, type KvStore } from "./kv.js";
 export { dataOptionsFromEnv, openData, storeKindFrom, type Data, type DataOptions, type StoreKind } from "./data.js";
-export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle } from "./config.js";
+export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle, type ReloadResult } from "./config.js";
+export { CONFIG_NAMES, ProjectConfigError, findProjectConfig, loadProjectConfig, starterConfig, type ProjectConfig } from "./projectconfig.js";
 export {
   KeyRing,
   OidcVerifier,
@@ -119,3 +135,48 @@ export {
   type Role,
 } from "./auth.js";
 export { approvalMessage, webhookNotifier, type WebhookOptions } from "./notify.js";
+export { Delegations, type Delegation } from "./delegations.js";
+export { WindowCounters } from "./counters.js";
+export { DEFAULT_WEIGHTS, parseRisk, scoreRisk, type RiskConfig, type RiskInput, type RiskResult } from "./risk.js";
+export { frozenAt, inWindow, type Day, type Freeze, type Window } from "./schedule.js";
+export { LegalHolds, applyRetention, parseRetention, planRetention, retentionDays, type Hold, type HoldScope, type RetentionConfig, type RetentionItem, type RetentionReport } from "./retention.js";
+export { searchRecords, searchRuns, summarizeRun, type RecordFilter, type RunFilter, type RunStatus, type RunSummary } from "./query.js";
+export { CaptureStore, DEFAULT_CAPTURE, redactForCapture, type CaptureConfig, type CaptureRecord } from "./capture.js";
+export { detectPii, maskPii, type PiiKind } from "./pii.js";
+export {
+  Sandbox,
+  previewImpact,
+  replayRun,
+  simulatePolicy,
+  speculate,
+  synthesizeResult,
+  type ArgChange,
+  type Change,
+  type ImpactPreview,
+  type PlanInput,
+  type PlanReport,
+  type ReplayReport,
+  type SandboxCall,
+  type SandboxContext,
+  type SandboxStep,
+  type SimulationReport,
+  type SpeculationReport,
+  type Verdict,
+} from "./simulate.js";
+export { EgressError, checkUrl, egressFromEnv, guardedFetch, isMetadataAddress, isPrivateAddress, type EgressConfig } from "./egress.js";
+export { anchorLedger, readAnchors, verifyAnchor, type AnchorCheck, type AnchorRecord, type AnchorSink } from "./anchor.js";
+export { renderPdf, renderReportPdf } from "./pdf.js";
+export { Notifier, createChannel, parseChannels, parseRoutes, type Channel, type ChannelConfig, type ChannelDeps, type NotifyMessage, type Route, type Severity } from "./channels.js";
+export { sendMail, type MailMessage, type SmtpConfig } from "./smtp.js";
+export { approvalNotification, attachNotifications, describeRecord } from "./hub.js";
+export { AlertManager, evaluateAlerts, type Alert, type AlertManagerOptions, type AlertOptions } from "./alerts.js";
+export { OtelExporter, type OtelOptions } from "./otel.js";
+export { createLogger, redactFields, type Level, type Logger } from "./logger.js";
+export { diffLines, renderDiff, type DiffLine } from "./diff.js";
+export { ManifestRegistry, RegistryError, loadRemoteRegistry, type RegistryOptions, type RegistryVersion } from "./registry.js";
+export { PolicyVersionError, PolicyVersions, type PolicyVersion } from "./policyversions.js";
+export { hasErrors, lintManifests, type KnownTool, type LintFinding } from "./lint.js";
+export { compensateMetaOf, hintsOf, schemaHash, suggestManifests, type CompensateMeta, type Hints, type McpToolInfo, type SuggestOptions, type Suggestion } from "./suggest.js";
+export { banner, classifyTools, type ClassifiedTool, type ToolClass } from "./classify.js";
+export { runManifestTests, type ManifestTestCase, type ManifestTestResult } from "./manifesttest.js";
+export { buildPeriodReport, renderPeriodHtml, renderPeriodMarkdown, type PeriodReport, type TopEntry } from "./weekly.js";

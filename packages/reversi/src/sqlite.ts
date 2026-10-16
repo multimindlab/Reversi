@@ -9,6 +9,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ApprovalRecord, ApprovalStatus, ApprovalStore } from "./approvals.js";
+import type { KvEntry, KvStore } from "./kv.js";
 import { LedgerConflictError, type LedgerRecord, type LedgerStore } from "./ledger.js";
 import { RUN_ID_PATTERN, type RunState, type RunStore } from "./store.js";
 
@@ -30,6 +31,13 @@ export function openDatabase(path: string): DatabaseSync {
     CREATE TABLE IF NOT EXISTS runs (
       run_id TEXT PRIMARY KEY,
       state TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS kv (
+      ns TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      PRIMARY KEY (ns, key)
     );
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
@@ -82,6 +90,9 @@ export class SqliteRunStore implements RunStore {
       .prepare("INSERT INTO runs (run_id, state) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET state = excluded.state")
       .run(this.check(state.run_id), JSON.stringify(state));
   }
+  delete(run_id: string): boolean {
+    return Number(this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(this.check(run_id)).changes) === 1;
+  }
   list(): string[] {
     return (this.db.prepare("SELECT run_id FROM runs ORDER BY run_id").all() as Array<{ run_id: string }>).map(
       (r) => r.run_id,
@@ -103,11 +114,44 @@ export class SqliteApprovalStore implements ApprovalStore {
   list(): ApprovalRecord[] {
     return (this.db.prepare("SELECT record FROM approvals").all() as Array<{ record: string }>).map((r) => JSON.parse(r.record) as ApprovalRecord);
   }
-  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean {
+  delete(id: string): boolean {
+    return Number(this.db.prepare("DELETE FROM approvals WHERE id = ?").run(id).changes) === 1;
+  }
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean {
     const res = this.db
-      .prepare("UPDATE approvals SET record = json_patch(record, ?) WHERE id = ? AND json_extract(record, '$.status') = ?")
-      .run(JSON.stringify(patch), id, from);
+      .prepare(
+        `UPDATE approvals SET record = json_patch(record, ?) WHERE id = ? AND json_extract(record, '$.status') = ?${expectCount === undefined ? "" : " AND COALESCE(json_extract(record, '$.decision_count'), 0) = ?"}`,
+      )
+      .run(...([JSON.stringify(patch), id, from, ...(expectCount === undefined ? [] : [expectCount])] as [string, string, string]));
     return Number(res.changes) === 1;
+  }
+}
+
+export class SqliteKvStore implements KvStore {
+  constructor(private readonly db: DatabaseSync) {}
+  get<T>(ns: string, key: string): KvEntry<T> | undefined {
+    const r = this.db.prepare("SELECT value, version FROM kv WHERE ns = ? AND key = ?").get(ns, key) as { value: string; version: number } | undefined;
+    return r ? { key, value: JSON.parse(r.value) as T, version: Number(r.version) } : undefined;
+  }
+  put(ns: string, key: string, value: unknown): void {
+    this.db
+      .prepare("INSERT INTO kv (ns, key, value, version) VALUES (?, ?, ?, 1) ON CONFLICT(ns, key) DO UPDATE SET value = excluded.value, version = version + 1")
+      .run(ns, key, JSON.stringify(value));
+  }
+  cas(ns: string, key: string, value: unknown, expected: number): boolean {
+    if (expected === 0) {
+      const r = this.db.prepare("INSERT INTO kv (ns, key, value, version) VALUES (?, ?, ?, 1) ON CONFLICT(ns, key) DO NOTHING").run(ns, key, JSON.stringify(value));
+      return Number(r.changes) === 1;
+    }
+    const r = this.db.prepare("UPDATE kv SET value = ?, version = version + 1 WHERE ns = ? AND key = ? AND version = ?").run(JSON.stringify(value), ns, key, expected);
+    return Number(r.changes) === 1;
+  }
+  delete(ns: string, key: string): boolean {
+    return Number(this.db.prepare("DELETE FROM kv WHERE ns = ? AND key = ?").run(ns, key).changes) === 1;
+  }
+  list<T>(ns: string, prefix = ""): KvEntry<T>[] {
+    const rows = this.db.prepare("SELECT key, value, version FROM kv WHERE ns = ? AND substr(key, 1, ?) = ? ORDER BY key").all(ns, prefix.length, prefix) as Array<{ key: string; value: string; version: number }>;
+    return rows.map((r) => ({ key: r.key, value: JSON.parse(r.value) as T, version: Number(r.version) }));
   }
 }
 
@@ -117,7 +161,8 @@ export function openSqliteStores(path: string): {
   ledger: SqliteLedgerStore;
   runs: SqliteRunStore;
   approvals: SqliteApprovalStore;
+  kv: SqliteKvStore;
 } {
   const db = openDatabase(path);
-  return { db, ledger: new SqliteLedgerStore(db), runs: new SqliteRunStore(db), approvals: new SqliteApprovalStore(db) };
+  return { db, ledger: new SqliteLedgerStore(db), runs: new SqliteRunStore(db), approvals: new SqliteApprovalStore(db), kv: new SqliteKvStore(db) };
 }

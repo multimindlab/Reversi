@@ -1,13 +1,15 @@
 """HTTP client for the Reversi server (standard library only)."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import random
 import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 
 class ReversiError(Exception):
@@ -40,6 +42,15 @@ class Blocked(Exception):
         return m.group(1) if m else None
 
 
+def verify_webhook_signature(secret: Union[str, bytes], body: Union[str, bytes], signature_header: Optional[str]) -> bool:
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    key = secret.encode("utf-8") if isinstance(secret, str) else secret
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    expected = hmac.new(key, data, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected.encode("ascii"), signature_header[len("sha256="):].strip().lower().encode("utf-8", "replace"))
+
+
 class ReversiClient:
     def __init__(self, base_url: str, api_key: str, timeout: float = 10.0):
         self.base_url = base_url.rstrip("/")
@@ -63,6 +74,14 @@ class ReversiClient:
                 msg = text
             raise ReversiError(e.code, msg) from None
         return text if raw else json.loads(text)
+
+    @staticmethod
+    def verify_webhook_signature(secret: Union[str, bytes], body: Union[str, bytes], signature_header: Optional[str]) -> bool:
+        """True if `signature_header` (`sha256=<hex>`) is the HMAC-SHA256 of the raw request body under `secret`.
+
+        Pass the body exactly as received (bytes), before any JSON parsing.
+        """
+        return verify_webhook_signature(secret, body, signature_header)
 
     # --- agent plane ---
     def start_run(self, permissions: List[str], run_id: Optional[str] = None, mode: str = "enforce",

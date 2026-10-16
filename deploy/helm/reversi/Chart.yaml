@@ -1,0 +1,6 @@
+apiVersion: v2
+name: reversi
+description: "Reversi server (and optionally the MCP gateway): journals, polices, approves and rolls back AI-agent tool calls"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

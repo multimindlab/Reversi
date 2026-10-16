@@ -1,59 +1,213 @@
 ---
 title: CLI
-description: Validate manifests, inspect and roll back runs, decide approvals, test policy, sign evidence.
+description: Set up a project, lint and test manifests, publish and apply them, inspect and roll back runs, decide approvals, simulate policy, sign evidence.
 ---
 
 ```bash
 npm install -g @multimindlab/reversi-cli
+reversi --help
 ```
 
-**Storage options** (every command that reads runs or the ledger): `-d, --data <dir>` (default `./reversi-data`),
-`--store files|sqlite|postgres` (default `REVERSI_STORE` or `files`), `--database-url <url>` (default
-`REVERSI_DATABASE_URL`). See [storage](/operations/storage). Commands marked **m** also need `-m, --manifests <path>`.
+Every command and option below comes from `reversi <command> --help`; that output is the authority if a later version differs.
 
-## Inspect and undo
+## Shared options
+
+| Option | Meaning |
+|---|---|
+| `--config <file>` (global) | Project file. Default: `reversi.config.yaml` in this or a parent folder, or `REVERSI_CONFIG`. See [GitOps](/operations/gitops) |
+| `-d, --data <dir>` | Data directory. Default: the config file, `REVERSI_DATA`, or `./reversi-data` |
+| `--store files\|sqlite\|postgres` | Default: the config file, `REVERSI_STORE`, or `files` |
+| `--database-url <url>` | PostgreSQL URL. Default: `REVERSI_DATABASE_URL` |
+| `-m, --manifests <path>` | A file, a folder, a registry folder or an https URL. Default: the config file or `REVERSI_MANIFESTS` |
+
+These four are accepted by every command that reads runs, approvals or the ledger (`-m` by most of them, not by `verify`,
+`export`, `bundle` or `approvals`). See [storage](/operations/storage). `--json` gives machine-readable output where listed.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Error, or a failed check (`verify`, `lint`, `test`, `doctor`, `manifests verify`, `verify-bundle`, `anchor verify`, a failed `anchor publish`) |
+| `2` | Not fully done: `plan` says not fully reversible, `rollback` incomplete, `simulate` found newly blocked calls, or `apply --dry-run --detailed-exitcode` found changes |
+| `64` | Usage error (unknown option or command) |
+
+## Set up and check
 
 | Command | Does |
 |---|---|
+| `reversi init [dir] [--store files\|sqlite] [--force]` | Create `reversi.config.yaml`, `manifests/example.yaml`, `policy.yaml`, `tests/manifests.test.yaml`, a `.gitignore` entry and a data store (default `sqlite`). Never overwrites without `--force` |
+| `reversi show-config` | Print the project configuration found, with paths resolved |
+| `reversi doctor [--policy <file>] [--send-test] [--gateway-config <file>] [--upstream-cmd <cmd> [--upstream-arg <a>]... \| --upstream-url <url>]` | Check Node version, config, manifests, lint, data store, ledger chain, signing key, policy and its tests, notification channels (the `notifications:` of the project file), writable data directory, and optionally an upstream. `--send-test` sends a test message through every channel. Exit 1 on failures |
 | `reversi validate <path>` | Check manifests, including that every compensation and required tool exists |
-| `reversi verify [ledger]` | Verify the hash chain of a file, or of the ledger in the store. Exit 1 if broken |
-| `reversi runs` **m** | List runs; flags unresolved steps |
-| `reversi plan <run> [--json]` **m** | Dry run of the rollback. Exit 2 if not fully reversible |
-| `reversi rollback <run>` **m** | Undo. `--compensator-cmd <cmd>` (JSON call on stdin, exit 0 = undone), `--verify-cmd <cmd>`, `--retries <n>`, `--approve-compensations`, `--timeout-ms`, `--json`. Exit 2 if incomplete |
-| `reversi resolve <run> <step>` **m** | Settle a step whose outcome was unknown: `--status succeeded\|failed`, `--note <text>` (required), `--result <json>`, `--actor` |
-| `reversi export [--run <id>]` | Print ledger records as JSON Lines |
+| `reversi lint [path] [--strict] [--json]` plus the upstream options of `doctor` | Find unsafe, incomplete or contradictory manifests (missing owner, missing data class, no timeout, ...). With an upstream, also compare them with its real tools. `--strict` exits 1 on warnings too |
+| `reversi test [fixtures...] [--policy <file>]` | Run manifest contract tests and the policy's own tests, touching no system. Reports tools no test covers |
+| `reversi suggest-manifest [-m <path>] [-o <dir>] [--server <name>]` plus the upstream options | Connect to an MCP server and draft a manifest for every tool that has none. Prints the drafts, or writes one YAML file each to `-o`. Drafts need a person's approval |
 
-## Approvals
+<Note>
+`validate`, `lint`, `test`, `doctor`, `plan` and `suggest-manifest` accept a manifest file, a folder of files or a versioned registry folder (`index.json` plus `tools/`); for a registry they check the current non-draft version of each tool.
+</Note>
+
+```text
+$ reversi init proj && cd proj && reversi test
+ok   writing a note can be undone, and the undo is read back
+ok   a failed write leaves nothing to undo
+ok   policy: ordinary tools are allowed
+ok   policy: drop needs approval
+not covered by any test: notes.restore
+4 passed
+```
+
+```text
+$ reversi lint --strict; echo $?
+warning L011  notes.restore: mutating tool has no owner: nobody is named to ask when it misbehaves
+warning L012  notes.restore: no risk.data_class: policy and retention cannot treat sensitive data differently
+info    L022  notes.restore: no timeout_ms: a hung call is only bounded by the gateway default
+0 errors, 2 warnings, 1 notes
+1
+```
+
+## Manifest registry and policy versions
+
+A registry keeps every version of every manifest, with author, approver, checksum and an optional signature. The same idea
+applies to the policy. See [GitOps](/operations/gitops) for the whole workflow.
 
 | Command | Does |
 |---|---|
-| `reversi approvals list [--status pending]` | Show requests (shared with the gateway and server through the store) |
-| `reversi approvals approve <id> [--note] [--as <name>]` | Approve a pending request |
-| `reversi approvals deny <id> [--note] [--as <name>]` | Deny it |
+| `reversi manifests publish <path> [--status draft\|approved] [--registry <dir>] [--by <name>] [--key <file>] [--note <text>]` | Add a file or folder of manifests as new versions. Default status `draft`: someone else approves |
+| `reversi manifests approve <tool> [--version <n>] [--four-eyes] ...` | Promote a draft to approved as a new, signed version. `--four-eyes`: the author may not approve their own draft |
+| `reversi manifests deprecate <tool> [--replaced-by <tool>] ...` | Keep the tool working and rolling back, but flag new calls |
+| `reversi manifests rollback <tool> <version> ...` | Publish an old version again as the newest |
+| `reversi manifests list \| history <tool> \| diff <tool> <from> <to> \| check <path>` | Inspect versions. `check` equals `validate` |
+| `reversi manifests verify [--trust <pem>]` | Recompute every version's checksum, and with `--trust` check each is signed by that key. Exit 1 on failure |
+| `reversi policy check <file>` / `reversi policy test <file> [cases]` | Validate a policy file; run its inline `tests:` and an optional extra file of cases. Exit 1 on failure |
+| `reversi policy publish <file> [--dir <folder>] [--by <name>] [--note <text>] [--no-activate]` | Validate, test, store as a new version and (by default) activate it |
+| `reversi policy history \| diff <from> <to> \| activate <version> [--dir <folder>]` | Inspect versions; `activate` an older one to roll back |
+| `reversi apply <dir> ...` | Make a registry (and policy) match a directory kept in git. Only differences are published; **nothing is deleted**. See below |
+
+`--registry` and `--dir` default to the `manifests:` and `policy:` settings of the project file. Policy versions are not signed;
+manifest versions are when you pass `--key`.
+
+### `reversi apply <dir>`
+
+```text
+$ reversi apply state --dry-run --detailed-exitcode; echo "exit $?"
++ manifest notes.read
++ manifest notes.write
++ manifest notes.restore
++ policy   policy
+4 changes (dry run: nothing applied)
+exit 2
+```
+
+| Option | Meaning |
+|---|---|
+| `--registry <dir>`, `--policy-dir <dir>` | Local target. Default `manifests:` and `policy:` from the config. The policy folder must already exist |
+| `--server <url>` and `--token <key>` (or `REVERSI_TOKEN`) | Apply to a running server instead. The token must be an admin key to change anything; an operator key can read and dry-run |
+| `--status approved\|draft` | Status of new versions. Default `approved`: the reviewed directory is the source of truth |
+| `--prune` | **Deprecate** tools that are in the target but not in the directory. Never deletes |
+| `--dry-run` | Show what would change, change nothing |
+| `--detailed-exitcode` | Exit 2 when there are changes. It acts with `--dry-run` only, for CI drift checks |
+| `--by`, `--key`, `--note` | Who is applying (default your user name), signing key for new versions, note on each version |
+
+Layout, local versus server mode and a CI example are in [GitOps](/operations/gitops).
+
+## Run the gateway and console
+
+| Command | Does |
+|---|---|
+| `reversi gateway [args...]` | Run the [MCP gateway](/gateway) with the same options as `reversi-gateway`. Arguments are passed through; `reversi gateway --help` prints the gateway's usage |
+| `reversi console [-m] [-d] [--policy <file>] [--port <n>] [--role auditor\|approver\|operator]` | Open the [console](/console) on `http://localhost:<port>/console` (default 7421) in open mode: no login, loopback only, never admin. Stop with Ctrl-C. Manifest and policy editing and rollback execution are not wired in this mode |
+
+## Inspect
+
+| Command | Does |
+|---|---|
+| `reversi runs list [--actor] [--tenant] [--tool] [--status needs_attention\|rolled_back\|complete\|blocked_only\|empty] [--mode enforce\|observe\|advise] [--since] [--until] [--text] [--limit <n>] [--json]` | List runs, newest last. `--since` takes `7d`, `12h`, `30m` or a date |
+| `reversi runs show <run_id> [--json]` | Steps, rollback outlook, approvals and the event trail |
+| `reversi actions list [--run] [--tool] [--actor] [--status] [--since] [--limit] [--json]` | Individual calls across runs |
+| `reversi actions show <run_id> <step> [--json]` | One call: state, ledger records, and with capture on its redacted arguments |
+| `reversi search [--run] [--actor] [--tool] [--event a,b] [--text] [--since] [--until] [--limit] [--json]` | Search ledger records |
+| `reversi plan <run_id> [--json]` | Dry run of the rollback. Exit 2 if not fully reversible |
+| `reversi export [--run <id>]` | Print ledger records as JSON Lines |
+| `reversi verify [ledger]` | Verify the hash chain of a JSON Lines file, or of the ledger in the store. Exit 1 if broken |
+
+```text
+$ reversi runs list -d data -m registry
+demo-1  actor=agent1  mode=enforce  steps=1  rolled_back
+```
+
+## Undo
+
+| Command | Does |
+|---|---|
+| `reversi rollback <run_id> [--compensator-cmd <cmd>] [--verify-cmd <cmd>] [--reader-cmd <cmd>] [--approve-compensations] [--retries <n>] [--timeout-ms <n>] [--json]` | Undo a run. The compensator gets the call as JSON on stdin; exit 0 means undone. `--verify-cmd` gets the same JSON afterwards; exit 0 confirms the undo. `--reader-cmd` runs a manifest's declared read-back: it gets `{"tool","arguments"}` as JSON on stdin and prints the result as JSON. Without it those steps are listed as "undone but not verified". Defaults: 1 attempt, 30000 ms. Exit 2 if incomplete |
+| `reversi resolve <run_id> <step> --status succeeded\|failed --note <text> [--result <json>] [--actor <name>]` | Settle a step whose outcome was unknown, after checking the downstream system. The note is required and recorded. Pass `--result` so a `succeeded` step can be rolled back |
+
+## Approvals, delegation, break-glass
+
+| Command | Does |
+|---|---|
+| `reversi approvals list [--status pending\|approved\|denied\|consumed\|expired]` | Show requests (shared with the gateway and server through the store) |
+| `reversi approvals approve <id>` / `deny <id>` `[--note] [--as <name>] [--groups a,b] [--roles r,...]` | Decide. `--groups` and `--roles` say what you decide as, for requests routed to groups or roles (default role `operator`). The decision goes through the engine: it is journaled in the ledger, delegations apply and notification channels from the project file are told |
+| `reversi delegate add --from <name> --to <name> --hours <n> --reason <text> [--group <name>]...` | Hand approval authority to someone for a while |
+| `reversi delegate list` / `reversi delegate revoke <id>` | Inspect and end delegations |
+| `reversi break-glass <approval_id> --reason <text> --evidence <ref> [--by <name>]` | Emergency override of a pending approval. Reason of at least 10 characters and a ticket or incident reference; recorded as break-glass |
 
 Over `files` storage the CLI and a running server share `approvals.json`; for several machines use SQLite on a shared
-volume or PostgreSQL.
+volume or PostgreSQL. See [approvals](/concepts/approvals).
 
-## Policy and kill switch
+## Kill switches
 
 | Command | Does |
 |---|---|
-| `reversi policy check <file>` | Validate a policy file |
-| `reversi policy test <file> [cases]` | Run inline `tests:` and an optional extra file of cases. Exit 1 on failure |
-| `reversi kill-switch on\|off <file>` | Create or remove the file named by `REVERSI_KILL_FILE`. While it exists, new calls are blocked |
+| `reversi halt add <reason> [--tool <glob>] [--actor <glob>] [--tenant <glob>] [--environment <glob>] [--by <name>]` | Block new calls everywhere, or only those matching the scope. Shared by every process on the same store |
+| `reversi halt list` / `reversi halt lift [id]` | List halts; lift one, or all |
+| `reversi kill-switch on\|off <file>` | Create or remove the file named by `REVERSI_KILL_FILE` (or `kill_switch_file:`). While it exists, every gateway and server using it blocks new calls |
+
+## What-if and simulation
+
+`capture`, `simulate` and `replay` need [capture](/concepts/simulation) turned on (`capture: { enabled: true }` in the project file, or `REVERSI_CAPTURE=1` with optional `REVERSI_CAPTURE_TTL_DAYS`). `speculate` and `impact` do not.
+
+| Command | Does |
+|---|---|
+| `reversi capture list [--run] [--tool] [--since] [--json]` | Captured, redacted calls |
+| `reversi capture purge [--run <id>]` | Delete expired captures, or all for a run |
+| `reversi simulate --policy <file> [--since 7d] [--run <id>] [--json]` | Replay captured calls through a candidate policy; report newly blocked, newly needing approval, newly allowed. Exit 2 if any call is newly blocked |
+| `reversi replay <run_id> --set <change>... [--policy <file>] [--json]` | Replay one captured run once as recorded and once with changes, e.g. `--set 1.amount=9000`, `--set tool:pay.charge/amount=9000`, `--set amount=9000` |
+| `reversi speculate <plans> [--policy <file>] [--actor <name>] [--json]` | Compare alternative plans without running them: decisions, approvals, risk, residue, rollback |
+| `reversi impact <tool> [--args <json>] [--policy <file>] [--actor <name>] [--json]` | What approving a call would do and what could be undone |
+
+```text
+$ reversi impact notes.write --args '{"name":"a"}'
+notes.write: reversible
+decision now: allow
+data class internal, blast radius low, owner you@example.com
+rollback: undo by calling notes.restore
+rollback: the undo is read back and verified
+```
+
+## Data lifecycle
+
+| Command | Does |
+|---|---|
+| `reversi retention plan [--days <n>]` | Which runs are due for deletion, and which are held |
+| `reversi retention apply [--days <n>] [--dry-run] [--archive-dir <dir>] [--key <file>]` | Delete run state, approvals and captures past retention. The ledger itself is never deleted. `--archive-dir` writes a signed bundle per run first |
+| `reversi hold add [--run] [--tenant] [--actor] [--tool] --reason <text> [--by <name>]` | Legal hold: stop retention deleting matching runs |
+| `reversi hold list [--all]` / `reversi hold release <id>` | List holds (`--all` includes released); release one |
+
+See [retention](/operations/retention).
 
 ## Evidence
 
 | Command | Does |
 |---|---|
 | `reversi keygen <prefix>` | Write `<prefix>.key` (private, mode 600) and `<prefix>.pub`. Never overwrites |
-| `reversi bundle --key <key> --out <file> [--run <id>]` | Signed evidence bundle |
-| `reversi verify-bundle <file> [--pub <key>]` | Verify a bundle; `--pub` checks against a key you trust |
-| `reversi report <run> --out <file>` **m** | Self-contained HTML report |
-
-## Exit codes
-
-`0` ok, `1` error or failed check, `2` rollback or plan incomplete / not fully reversible, `64` usage error.
+| `reversi bundle --key <key> --out <file> [--run <id>]` | Signed evidence bundle of the ledger or one run |
+| `reversi verify-bundle <file> [--pub <key>]` | Verify a bundle. Without `--pub` the signature only proves the bundle is self-consistent |
+| `reversi report [run_id] --out <file>` | With a run id: a self-contained report, HTML or PDF by extension (`--out` required). Without: the period report, `--since 7d`, `--format md\|html\|json` (or inferred from `--out`); printed to the terminal when `--out` is omitted |
+| `reversi anchor publish [--file <path>] [--webhook <url>] [--secret <s>] [--key <file>]` | Write the current ledger head to the `anchor:` sinks in the project file, or to a file or webhook if you pass one. Exit 1 if a sink failed |
+| `reversi anchor verify <file> [--pub <pem>]` | Check every anchor in a file against the ledger |
 
 ## The compensation call
 

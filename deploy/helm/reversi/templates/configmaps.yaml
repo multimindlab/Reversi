@@ -1,0 +1,23 @@
+{{- if and .Values.manifests.inline (not .Values.manifests.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "reversi.name" . }}-manifests
+  labels: {{- include "reversi.labels" . | nindent 4 }}
+data:
+{{- range $name, $text := .Values.manifests.inline }}
+  {{ $name }}: |
+{{ $text | indent 4 }}
+{{- end }}
+---
+{{- end }}
+{{- if and .Values.policy.inline (not .Values.policy.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "reversi.name" . }}-policy
+  labels: {{- include "reversi.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+{{ .Values.policy.inline | indent 4 }}
+{{- end }}
