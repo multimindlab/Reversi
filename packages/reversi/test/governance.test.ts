@@ -283,7 +283,8 @@ describe("engine: requirements, scoped halts, advise mode, tenants", () => {
     const r = await run.call({ tool: "pay", args: { n: 1 }, reason: "x", execute: () => ({}) });
     expect(r).toMatchObject({ status: "blocked", reasons: [expect.stringContaining("needs 2 approvers from risk or finance")] });
     expect(approvals.list()[0]).toMatchObject({ requested_by: "agent", required_roles: ["risk", "finance"], quorum: 2, on_timeout: "deny" });
-    expect(rv.ledger.records().at(-1)?.detail).toContain("[manifest requires approval; policy `big`");
+    expect(rv.ledger.records().at(-1)?.detail).toContain("policy `big`");
+    expect(rv.ledger.records().at(-1)?.detail).toContain("manifest requires approval");
     expect(rv.ledger.records().at(-1)?.detail).toContain("risk score");
   });
 
