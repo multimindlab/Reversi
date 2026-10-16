@@ -164,3 +164,9 @@ export {
 export { EgressError, checkUrl, egressFromEnv, guardedFetch, isMetadataAddress, isPrivateAddress, type EgressConfig } from "./egress.js";
 export { anchorLedger, readAnchors, verifyAnchor, type AnchorCheck, type AnchorRecord, type AnchorSink } from "./anchor.js";
 export { renderPdf, renderReportPdf } from "./pdf.js";
+export { Notifier, createChannel, parseChannels, parseRoutes, type Channel, type ChannelConfig, type ChannelDeps, type NotifyMessage, type Route, type Severity } from "./channels.js";
+export { sendMail, type MailMessage, type SmtpConfig } from "./smtp.js";
+export { approvalNotification, attachNotifications, describeRecord } from "./hub.js";
+export { AlertManager, evaluateAlerts, type Alert, type AlertOptions } from "./alerts.js";
+export { OtelExporter, type OtelOptions } from "./otel.js";
+export { createLogger, redactFields, type Level, type Logger } from "./logger.js";
