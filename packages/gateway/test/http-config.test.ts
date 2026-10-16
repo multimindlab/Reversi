@@ -131,9 +131,15 @@ describe("HTTP gateway with API keys", () => {
   });
 
   it("rejects oversized bodies", async () => {
-    const { url } = await serve({ keys: KEYS });
-    const r = await post(`${url}/mcp`, { authorization: "Bearer k-agent" }, { pad: "x".repeat(5_000_000) });
-    expect(r.status).toBe(413);
+    const { url, reversi } = await serve({ keys: KEYS });
+    // The server answers 413 as soon as the limit is crossed. A client still sending its megabytes may see that answer or,
+    // if the connection closes under it first, a failed fetch: what must never happen is the request being processed.
+    const r = await post(`${url}/mcp`, { authorization: "Bearer k-agent" }, { pad: "x".repeat(5_000_000) }).then(
+      (res) => res.status,
+      () => "reset",
+    );
+    expect([413, "reset"]).toContain(r);
+    expect(reversi.runIds()).toEqual([]);
   });
 });
 
