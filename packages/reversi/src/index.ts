@@ -170,3 +170,10 @@ export { approvalNotification, attachNotifications, describeRecord } from "./hub
 export { AlertManager, evaluateAlerts, type Alert, type AlertOptions } from "./alerts.js";
 export { OtelExporter, type OtelOptions } from "./otel.js";
 export { createLogger, redactFields, type Level, type Logger } from "./logger.js";
+export { diffLines, renderDiff, type DiffLine } from "./diff.js";
+export { ManifestRegistry, RegistryError, loadRemoteRegistry, type RegistryOptions, type RegistryVersion } from "./registry.js";
+export { PolicyVersionError, PolicyVersions, type PolicyVersion } from "./policyversions.js";
+export { hasErrors, lintManifests, type KnownTool, type LintFinding } from "./lint.js";
+export { compensateMetaOf, hintsOf, schemaHash, suggestManifests, type CompensateMeta, type Hints, type McpToolInfo, type SuggestOptions, type Suggestion } from "./suggest.js";
+export { banner, classifyTools, type ClassifiedTool, type ToolClass } from "./classify.js";
+export { runManifestTests, type ManifestTestCase, type ManifestTestResult } from "./manifesttest.js";
