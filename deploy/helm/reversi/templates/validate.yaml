@@ -1,0 +1,4 @@
+{{- if eq .Values.server.console "open" }}{{ fail "server.console=open has no login and is refused on a cluster: use off or login" }}{{- end }}
+{{- if and (gt (int .Values.replicaCount) 1) (ne .Values.store.kind "postgres") }}{{ fail "more than one replica needs store.kind=postgres" }}{{- end }}
+{{- if and (eq .Values.server.console "login") (not .Values.keys.existingSecret) (not .Values.oidc.enabled) }}{{ fail "server.console=login needs keys.existingSecret or oidc.enabled to log in with" }}{{- end }}
+{{- if and .Values.registry.persistence.enabled (gt (int .Values.replicaCount) 1) }}{{ fail "registry.persistence needs replicaCount 1 (the volume is ReadWriteOnce)" }}{{- end }}

@@ -205,7 +205,7 @@ describe("config", () => {
     } catch (e) {
       expect(e).toBeInstanceOf(ConfigError);
       const m = (e as ConfigError).errors.join("\n");
-      expect(m).toContain("`mode` must be observe or enforce");
+      expect(m).toContain("`mode` must be observe, advise or enforce");
       expect(m).toContain("name must be letters");
       expect(m).toContain("exactly one of");
       expect(m).toContain("duplicate name");

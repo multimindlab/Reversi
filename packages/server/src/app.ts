@@ -9,6 +9,7 @@ import {
   type ApiKey,
   type Capability,
   type Principal,
+  type Role,
   ApprovalError,
   LedgerError,
   RUN_ID_PATTERN,
@@ -25,7 +26,8 @@ import {
   type Outcome,
   type SigningKey,
 } from "@multimindlab/reversi";
-import { mountConsole } from "./console.js";
+import { mountConsole, type ConsoleMode } from "./console.js";
+import { ApiError, mountExtras, type ExtraOptions } from "./extras.js";
 import { Metrics } from "./metrics.js";
 
 export interface LogEntry {
@@ -37,7 +39,9 @@ export interface LogEntry {
   principal: string | null;
 }
 
-export interface AppOptions {
+export type { ConnectorInfo, RollbackState } from "./extras.js";
+
+export interface AppOptions extends ExtraOptions {
   /** The engine's approver should be `approvals.asApprover()`. */
   reversi: Reversi;
   approvals: Approvals;
@@ -55,6 +59,12 @@ export interface AppOptions {
   /** Signs console session cookies. Random per process by default, so sessions end on restart. */
   session_secret?: string;
   secure_cookies?: boolean;
+  /**
+   * The operator console. `off` (default) serves nothing. `open` has no login, answers only requests addressed to the
+   * loopback interface from the same origin, and acts with a fixed role (default operator, never admin). `login` asks
+   * for an API key or OIDC token.
+   */
+  console?: { mode: ConsoleMode; role?: Role };
   now?: () => number;
 }
 
@@ -455,6 +465,10 @@ export function createApp(opts: AppOptions): Hono {
     return c.json({ halted: reversi.halted(), lifted });
   });
 
+  const extras = mountExtras(app, { opts, ring, now, need, body, str, identityOf });
+
+  const openRole = opts.console?.role ?? "operator";
+  if (opts.console?.mode === "open" && openRole === "admin") throw new Error("the open console never runs as admin: use operator, or log in");
   mountConsole(app as unknown as Hono, {
     reversi,
     approvals,
@@ -467,11 +481,16 @@ export function createApp(opts: AppOptions): Hono {
     report: runReport,
     bundle: evidenceBundle,
     now,
+    mode: opts.console?.mode ?? "off",
+    open_role: openRole,
+    opts,
+    extras,
+    ring,
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
   app.onError((e, c) => {
-    if (e instanceof HttpError) return c.json({ error: e.message }, e.status);
+    if (e instanceof HttpError || e instanceof ApiError) return c.json({ error: e.message }, e.status);
     if (e instanceof LedgerError) return c.json({ error: "ledger unavailable; request refused" }, 503);
     if (e instanceof ReversiError) return c.json({ error: e.message }, 409);
     if (e instanceof Error && /^invalid run id/.test(e.message)) return c.json({ error: e.message }, 400);

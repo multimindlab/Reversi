@@ -1,6 +1,6 @@
 ---
 title: Monitoring
-description: Health, readiness, Prometheus metrics and structured logs.
+description: Health, Prometheus metrics, structured logs, alerts and OpenTelemetry traces.
 ---
 
 ## Health
@@ -29,14 +29,93 @@ config), unless `REVERSI_METRICS_PUBLIC=1` (only on a private network).
 | `reversi_uptime_seconds` | gauge | |
 
 Useful alerts: `reversi_halted == 1`, a rising rate of `reversi_ledger_events_total{event="compensation_failed"}`,
-`reversi_approvals{status="pending"}` above zero for longer than your approval SLA, and `readyz` failing.
+`reversi_approvals{status="pending"}` above zero for longer than your approval SLA, and `readyz` failing. Most of these are
+also available as built-in alerts below, delivered to the places you already watch.
 
 ## Logs
 
-`REVERSI_LOG=json` writes one line per request: `{"ts","method","path","status","ms","principal"}`. Bodies, headers and
-credentials are never logged. The ledger itself is the audit log.
+`REVERSI_LOG=json` makes the server write one line per request:
+
+```json
+{"ts":"2026-10-16T17:21:10.820Z","method":"POST","path":"/v1/approvals/apr_…/approve","status":200,"ms":21.1,"principal":"fred"}
+```
+
+Bodies, headers and credentials are never logged. The ledger itself is the audit log.
+
+For your own code, `createLogger` from `@multimindlab/reversi` writes one JSON object per line
+(`{"level","time","msg",…fields}`) at `debug`, `info`, `warn` or `error`, with `child` loggers for fixed fields. It redacts
+before writing: credential patterns inside any string, and the whole value of any field whose name looks like a secret
+(`password`, `secret`, `token`, `authorization`, `api_key`, `cookie`, `credential`, `private_key`, `signature`). The `log:`
+section of `reversi.config.yaml` configures the engine's own logger, which writes reloads, failed notifications, anchors and
+trace export errors to stderr:
+
+```yaml reversi.config.yaml
+log: { level: info, format: json }     # level: debug | info | warn | error; format: json | pretty
+```
+
+`json` writes redacted JSON lines (`{"level":"warn","time":"…","msg":"…"}`); `pretty` writes `reversi [warn] message`.
+`REVERSI_LOG=json` is separate: it only controls the per-request line of the server.
+
+## Alerts
+
+Alerts are conditions worth a human, computed from the ledger, run state, approvals and (on the gateway) upstream health.
+They are always visible: the console **Alerts** page and `GET /v1/alerts` (auditor and up) evaluate them live. When
+[notification channels](/operations/notifications) are configured, an alert manager also sends them.
+
+| Kind | Severity | Fires when |
+|---|---|---|
+| `compensation_failed` | critical | A step's compensation failed and the run is not rolled back |
+| `verification_failed` | critical | An undo ran but reading back its effect failed |
+| `break_glass` | critical | A [break-glass](/concepts/approvals) approval was recorded |
+| `upstream_unhealthy` | critical | A gateway upstream does not answer its ping |
+| `budget_threshold` | warning, critical at 100% | A budget crossed a threshold |
+| `rollback_unverified` | warning | An undo ran but could not be verified |
+| `irreversible_executed` | warning | An irreversible tool succeeded |
+| `unclassified_mutation` | warning | A tool with no manifest was called |
+| `policy_denial_spike` | warning | Blocked calls reach the threshold (default 10) in the window |
+| `unresolved_outcome` | warning | A step has been `intended` or `uncertain` for over an hour |
+| `approval_timeout` | warning | An approval expired unanswered or escalated |
+| `halted` | warning | A scoped halt is active |
+
+Event-based kinds look at the last **15 minutes** of the ledger, so they clear on their own. `compensation_failed`,
+`unresolved_outcome` and `halted` are state-based and stay until fixed or lifted.
+
+```yaml reversi.config.yaml
+alerts:
+  interval: 1m          # how often to evaluate (default 1m)
+  remind: 1h            # repeat a still-active alert (default 1h)
+  denial_spike: 10      # blocked calls in the window (default 10)
+```
+
+The manager sends an alert **once** when it appears, again every `remind` while it persists, and a `Resolved:` message
+(which closes the PagerDuty or Opsgenie incident) when the condition clears. State is kept in the data store, so several
+processes sharing it do not repeat each other. `denial_spike` is honoured by the manager, `GET /v1/alerts` and the console Alerts page alike. The window and the one-hour unresolved limit are not configurable in the
+project file. The manager only runs when at least one channel is configured; with none, use the console or `GET /v1/alerts`.
 
 ## Tracing
 
-OpenTelemetry export is not built. The ledger and metrics cover audit and operations; the structured request log carries
-the principal and timings for correlation.
+Reversi exports OpenTelemetry traces over OTLP/HTTP with JSON. There is no SDK to install.
+
+```yaml reversi.config.yaml
+otel:
+  endpoint: http://collector:4318       # spans go to <endpoint>/v1/traces
+  service_name: reversi
+  headers: { x-api-key: "${OTEL_KEY}" }
+```
+
+`REVERSI_OTLP_ENDPOINT` sets the endpoint without a file. The server and gateway export while running.
+
+| Span | From | To | Status |
+|---|---|---|---|
+| `reversi.call <tool>` | `intended` | `succeeded`, `failed` or `uncertain` | OK only if `succeeded` |
+| `reversi.compensate <tool>` | `compensating` | `compensated` or `compensation_failed` | OK only if `compensated` |
+| `reversi.call.blocked <tool>` | the block | the block | error for `blocked`, OK for `would_block` |
+
+All spans of a run share one trace id (derived from the run id), so a run is one trace. Attributes:
+`reversi.run_id`, `reversi.step`, `reversi.tool`, `reversi.actor`, `reversi.effect` (from the manifest),
+`reversi.event`, `reversi.reason`, `reversi.detail`, `reversi.seq.start` and `reversi.seq.end` (the ledger positions, so a
+span links back to the evidence). The resource carries `service.name` (default `reversi`) and `deployment.environment`
+(from `environment:`). Spans carry names and ids, never arguments or results.
+
+Spans are sent in batches of 50 or every five seconds, with a 10 s timeout, through the
+[egress guard](/operations/retention). A failing collector is logged to stderr and never affects calls.

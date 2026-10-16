@@ -15,7 +15,7 @@ import { canonicalize, sha256Hex } from "./canonical.js";
 import { renderDiff } from "./diff.js";
 import { guardedFetch, type EgressConfig } from "./egress.js";
 import { keyId, type SigningKey } from "./evidence.js";
-import { Registry, validateManifest, type ManifestStatus, type ToolManifest } from "./manifest.js";
+import { Registry, authorForm, validateManifest, type ManifestStatus, type ToolManifest } from "./manifest.js";
 
 export interface RegistryVersion {
   version: number;
@@ -152,7 +152,7 @@ export class ManifestRegistry {
     if (target.status !== "draft") throw new RegistryError(`\`${tool}\` v${target.version} is ${target.status}, not a draft`);
     if (o.require_other && target.by === o.by) throw new RegistryError("the author of a draft cannot approve it: ask someone else");
     const m = this.get(tool, target.version);
-    const out = this.publish({ ...m }, { by: target.by, note: o.note ?? `approved from v${target.version}`, status: "approved", key: o.key });
+    const out = this.publish(authorForm(m), { by: target.by, note: o.note ?? `approved from v${target.version}`, status: "approved", key: o.key });
     const ix = this.readIndex();
     const rec = (ix.tools[tool]?.versions ?? []).find((v) => v.version === out.version);
     if (rec) {
@@ -166,14 +166,14 @@ export class ManifestRegistry {
   deprecate(tool: string, o: { by: string; replaced_by?: string; note?: string; key?: SigningKey }): { tool: string; version: number } {
     const cur = this.current(tool);
     if (!cur) throw new RegistryError(`\`${tool}\` has no approved version to deprecate`);
-    const out = this.publish({ ...cur, status: "deprecated", ...(o.replaced_by ? { replaced_by: o.replaced_by } : {}) }, { by: o.by, note: o.note ?? "deprecated", status: "deprecated", key: o.key });
+    const out = this.publish({ ...authorForm(cur), status: "deprecated", ...(o.replaced_by ? { replaced_by: o.replaced_by } : {}) }, { by: o.by, note: o.note ?? "deprecated", status: "deprecated", key: o.key });
     return { tool, version: out.version };
   }
 
   /** Publish an old version again as the newest one (a rollback of the manifest, with history intact). */
   rollbackTo(tool: string, version: number, o: { by: string; key?: SigningKey; note?: string }): { tool: string; version: number } {
     const m = this.get(tool, version);
-    const out = this.publish({ ...m }, { by: o.by, note: o.note ?? `restored v${version}`, status: m.status === "draft" ? "draft" : "approved", key: o.key });
+    const out = this.publish(authorForm(m), { by: o.by, note: o.note ?? `restored v${version}`, status: m.status === "draft" ? "draft" : "approved", key: o.key });
     return { tool, version: out.version };
   }
 

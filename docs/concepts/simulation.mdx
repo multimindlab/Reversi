@@ -1,0 +1,216 @@
+---
+title: Simulation and capture
+description: Try a policy on last week's calls, replay a run with one argument changed, preview what approving a call does, and compare plans before running any of them.
+---
+
+Four tools answer "what would happen" without touching a real system. They run calls through a throwaway engine: an
+in-memory ledger and run state, your real manifests and policy, and nothing executed anywhere. The real ledger and runs are
+not changed.
+
+| Question | Tool | Needs capture |
+|---|---|---|
+| What would this new policy have done to last week's calls? | [Policy simulation](#policy-simulation) | Yes |
+| What if this one argument had been different? | [Replay](#replay-a-run-with-a-change) | Yes |
+| What happens if I approve this call, and can it be undone? | [Impact preview](#impact-preview) | No |
+| Which of these plans is safest? | [Speculative execution](#speculative-execution) | No |
+
+## Capture
+
+The ledger never stores arguments, only hashes. Replay and simulation need the arguments, so keeping them is a separate,
+explicit choice. **Capture is off by default.** Turn it on in `reversi.config.yaml`:
+
+```yaml
+capture:
+  enabled: true
+  ttl: 7d             # how long a record lives (default 7 days)
+  redact_pii: true    # default true
+```
+
+or with `REVERSI_CAPTURE=1` (and `REVERSI_CAPTURE_TTL_DAYS=14`) in the environment of the gateway or server. `reversi doctor`
+reports whether it is on. The gateway and the server both record when it is on.
+
+**What is stored**, per call: run id and step (no step for a call that was blocked before it became one), tool, actor, tenant,
+environment, the arguments, the result once the call finishes, the decision (`allow`, `would_block`, `block`) with its
+reasons, the outcome (`succeeded`, `failed`, `uncertain`), the manifest version, the risk score, and when it was captured and
+when it expires.
+
+**Redaction happens before anything is written:**
+
+- credentials in any string (tokens, keys) become `[REDACTED:github_token]` and the like;
+- personal data (emails, phone numbers, card numbers, SSNs, IBANs, with checksum validation) becomes `[PII:email]` and the
+  like, unless `redact_pii: false`;
+- every path in the manifest's [`audit.redaction`](/concepts/manifests#fields) (`$args.card_token`, `$result.secret`) becomes `[REDACTED]`;
+- strings over 20,000 characters are cut, lists are cut to 200 items and nesting to 12 levels.
+
+**Expiry.** A record past its `expires` time is no longer listed or used, and `reversi capture purge` deletes expired records
+(or everything for one run with `--run`). A [retention](/operations/retention) run purges captures along with the run state.
+
+```bash
+reversi capture list
+#   2026-10-16T17:22:38Z  run_demo#0  stripe.create_charge  allow    succeeded  args={"order_id":"o1","amount":2500,"card_token":"[REDACTED]","email":"[PII:email]"}
+#   2026-10-16T17:22:38Z  run_demo    stripe.create_charge  block               args={"order_id":"o2","amount":80000,"card_token":"[REDACTED]","email":"[PII:email]"}
+reversi capture list --run run_demo --tool stripe.create_charge --since 1d --json
+reversi capture purge --run run_demo
+#   removed 1 captured calls
+```
+
+Because values are redacted, a rule that reads inside a redacted value can decide differently in a simulation than it did
+live. The report says so with a note.
+
+## Policy simulation
+
+Replay captured calls through a candidate policy and see what changes.
+
+```bash
+reversi simulate --policy strict.yaml --since 7d        # default period is 7d; --run <id> for one run; --json
+#   3 captured calls in 1 runs: 0 unchanged
+#
+#   newly blocked (3)
+#     run_demo#0  stripe.create_charge  allow -> block  policy `no-big`: charges over 10.00 are paused
+#     run_demo  stripe.create_charge  needs_approval -> block  policy `no-big`: charges over 10.00 are paused
+#     run_demo  stripe.create_charge  needs_approval -> block  policy `no-big`: charges over 10.00 are paused
+#   note: some captured arguments were redacted, so rules that look inside those values may behave differently than they did live
+```
+
+Each call is compared with what was decided at the time: `allow`, `needs_approval` or `block`. Calls that now differ are
+listed under `newly_blocked`, `newly_needs_approval` and `newly_allowed`. The command exits 2 when something would be newly
+blocked, so it fits in CI before a policy change. A run that was `needs_approval` and is now `block` counts as newly blocked.
+
+<Warning>
+The sandbox sees the manifests and the candidate policy, not the live state around the original call. A call the history
+blocked for another reason (a halt, a missing prerequisite, a content check) can show up as `newly allowed`. Read those rows
+against the reason that was recorded.
+</Warning>
+
+Where it is available:
+
+| Where | How |
+|---|---|
+| CLI | `reversi simulate --policy <file or versions folder>` |
+| HTTP | `POST /v1/simulate` with `{ "policy": "<yaml text>", "run_id": "...", "since": "7d" }`. Operator role. Without `policy` it uses the active one. 404 if capture is off, 400 for an invalid policy |
+| Console | The **Policy** page: **Simulate against captured history** (last 7 days) beside **Validate and run its tests** |
+
+## Replay a run with a change
+
+Replay one captured run twice in the sandbox, as recorded and with your changes, and compare each decision and the rollback
+plan.
+
+```bash
+reversi replay run_demo --set 0.amount=90000
+#   run run_demo: 3 captured calls
+#     0  stripe.create_charge   as recorded: allow   with your changes: needs_approval  (approval required: simulated)
+#     1  stripe.create_charge   as recorded: needs_approval   with your changes: needs_approval  (approval required: simulated)
+#     2  stripe.create_charge   as recorded: needs_approval   with your changes: needs_approval  (approval required: simulated)
+#   1 decision would change
+#   rollback as recorded: fully reversible; with changes: fully reversible
+```
+
+`--set` is repeatable and takes `path=value`, with the value as JSON (a plain word is a string):
+
+| Form | Applies to |
+|---|---|
+| `amount=9000` | Every call |
+| `1.amount=9000` | Step 1 only |
+| `tool:stripe.create_charge/amount=100` | Every call to that tool |
+
+`--policy <file>` also tries a different policy in the same replay. The JSON report has `baseline`, `variant`, `differences`,
+`baseline_plan` and `variant_plan`.
+
+| Where | How |
+|---|---|
+| CLI | `reversi replay <run_id> --set ... [--policy ...] [--json]` |
+| HTTP | `POST /v1/runs/{id}/replay` with `{ "policy": "<yaml>", "changes": [{ "step": 1, "tool": "...", "path": "$args.qty", "value": 50 }] }`. Operator role. 404 for a run with no captures |
+| Console | **Replay with a change** on a run's page (when capture is on): step, tool, argument path, new value. One change per submit |
+
+## Impact preview
+
+What would approving this call do, and what could be undone afterwards? It reads manifests and policy only, so it works with
+capture off.
+
+```bash
+reversi impact stripe.create_charge --args '{"order_id":"o9","amount":90000}'
+#   stripe.create_charge: compensable
+#   decision now: needs_approval  (approval required: simulated)
+#   risk 80: effect compensable +30, blast radius high +20, data class financial +20, environment prod +10
+#   data class financial, blast radius high, owner payments-team@example.com
+#   rollback: undo by calling stripe.refund
+#   rollback: but the charge still appears on the customer's statement
+#   rollback: the undo is read back and verified
+reversi impact nope.tool
+#   nope.tool: no manifest
+#   decision now: block  (no manifest is registered for this tool)
+#   rollback: unknown: without a manifest Reversi cannot say whether this can be undone
+#   warning: unclassified tool
+```
+
+The preview gives the decision now (`allow`, `needs_approval`, `block`) with the reasons, the risk score and its factors, owner
+and risk labels, the tools that must run first, who must approve and how many, and the rollback outlook: the undo tool, its
+residue, whether it is verified, whether it needs approval. Warnings cover irreversible effects, draft or deprecated manifests
+and an unverified undo. Prerequisites in `requires` are assumed satisfied, so the answer is about this call.
+
+| Where | How |
+|---|---|
+| CLI | `reversi impact <tool> [--args <json>] [--actor <name>] [--policy <file>] [--json]` |
+| HTTP | `GET /v1/impact?tool=...&args=<json>&actor=...`. Auditor role |
+| Console | **Impact preview** page (`/console/impact`), linked from pending approvals and manifest pages |
+| Gateway | `reversi.preview_impact` with `{ tool, arguments }`, on the agent endpoint too, so an agent can ask before it acts |
+
+## Speculative execution
+
+Compare alternative plans before running any of them. Each plan is a list of calls; each is run in the sandbox and scored.
+
+```yaml plans.yaml
+plans:
+  - name: charge 900.00
+    calls:
+      - { tool: stripe.create_charge, args: { order_id: o7, amount: 90000 }, result: { id: ch_7 } }
+  - name: charge 9.00
+    calls:
+      - { tool: stripe.create_charge, args: { order_id: o8, amount: 900 }, result: { id: ch_8 } }
+  - name: just look
+    calls:
+      - { tool: stripe.get_charge, args: { charge_id: ch_1 } }
+```
+
+```bash
+reversi speculate plans.yaml --policy policy.yaml [--actor billing-agent] [--json]
+#   charge 9.00   <- recommended
+#     can run to the end; approvals needed: 0; highest risk: 0; fully reversible
+#     leaves behind: the charge still appears on the customer's statement
+#   just look
+#     can run to the end; approvals needed: 0; highest risk: 0; fully reversible
+#     note: some results were synthesized from the manifests, so the rollback outlook assumes compensation arguments are available
+#   charge 900.00
+#     can run to the end; approvals needed: 1; highest risk: 0; fully reversible
+#     leaves behind: the charge still appears on the customer's statement
+```
+
+For each plan you get: the first call that would be refused (`blocked_at`), how many approvals it needs, the highest and total
+risk score, the irreversible tools, the residue a rollback would leave, whether it is fully reversible, and the rollback plan.
+Plans are ranked, lower is safer: 10,000 if the plan is blocked, plus 10 per approval, plus the highest risk score, plus 50
+per irreversible call, plus 25 if it is not fully reversible. `recommended` is the best plan that can run to the end.
+A `result` you give is used to build compensation arguments; without one the result is synthesized from the manifest and the plan
+notes it. Risk scores appear when the policy has a [`risk`](/concepts/policy#risk-scoring) section (here it has none, so they are 0).
+
+| Where | How |
+|---|---|
+| CLI | `reversi speculate <plans file>` |
+| HTTP | `POST /v1/speculate` with `{ "plans": [{ "name": "...", "calls": [{ "tool": "...", "args": {}, "result": {} }] }], "policy": "<yaml>", "actor": "..." }`. Auditor role |
+| Console, gateway | No page and no `reversi.*` tool for it |
+
+## Availability at a glance
+
+| | CLI | `/v1` endpoint | Console | Gateway tool |
+|---|---|---|---|---|
+| Capture list and purge | `reversi capture list`, `purge` | none | none | none |
+| Policy simulation | `reversi simulate` | `POST /v1/simulate` | Policy page | none |
+| Replay | `reversi replay` | `POST /v1/runs/{id}/replay` | Run page | none |
+| Impact preview | `reversi impact` | `GET /v1/impact` | Impact preview | `reversi.preview_impact` |
+| Speculation | `reversi speculate` | `POST /v1/speculate` | none | none |
+
+## Limits
+
+- Simulations use the manifests and policy as loaded now, with the real clock for time windows and freezes.
+- A sandbox run has every permission in the manifests, so scope problems do not show.
+- Limit and budget counters start empty in the sandbox and count only the replayed calls, so a limit that fired live because of other traffic may not fire in a replay.
+- Only calls captured while capture was on, and not yet expired, can be simulated or replayed.

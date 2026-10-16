@@ -5,10 +5,19 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { expandEnv, type UpstreamConfig } from "./config.js";
 
+/**
+ * The SDK client would reject a result that breaks the tool's output schema and throw away the result, even though the call took
+ * effect. The gateway checks schemas itself and records a mismatch in the ledger, so the client's own check is turned off.
+ */
+export const PASS_THROUGH_VALIDATOR = {
+  getValidator: () => (input: unknown) => ({ valid: true as const, data: input, errorMessage: undefined }),
+};
+
 export interface UpstreamEntry {
   name: string;
   client: Client;
   namespace: boolean;
+  kind: "stdio" | "http";
 }
 
 /** The gateway has no upstream for this tool name, so nothing was sent anywhere. */
@@ -30,7 +39,7 @@ export class UpstreamPool {
     const entries: UpstreamEntry[] = [];
     try {
       for (const c of cfgs) {
-        const client = new Client({ name: "reversi-gateway", version: "0.1.0" });
+        const client = new Client({ name: "reversi-gateway", version: "0.1.0" }, { jsonSchemaValidator: PASS_THROUGH_VALIDATOR as never });
         const expandAll = (m: Record<string, string> | undefined) => Object.fromEntries(Object.entries(m ?? {}).map(([k, v]) => [k, expandEnv(v, env)]));
         const transport = c.url
           ? new StreamableHTTPClientTransport(new URL(c.url), { requestInit: { headers: expandAll(c.headers) } })
@@ -42,7 +51,7 @@ export class UpstreamPool {
               stderr: "inherit",
             });
         await client.connect(transport);
-        entries.push({ name: c.name, client, namespace: c.namespace ?? many });
+        entries.push({ name: c.name, client, namespace: c.namespace ?? many, kind: c.url ? "http" : "stdio" });
       }
     } catch (e) {
       await Promise.allSettled(entries.map((x) => x.client.close()));
@@ -71,6 +80,11 @@ export class UpstreamPool {
     }
     this.routes = routes;
     return out;
+  }
+
+  /** Which upstream each exposed tool name belongs to (as of the last listing). */
+  owners(): Map<string, string> {
+    return new Map([...this.routes].map(([exposed, r]) => [exposed, r.entry.name]));
   }
 
   async resolve(exposed: string): Promise<{ entry: UpstreamEntry; original: string } | undefined> {

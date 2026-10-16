@@ -1,11 +1,20 @@
 ---
 title: Deployment
-description: Run the server and gateway in Docker or directly, configure them, and put TLS in front.
+description: Run the server and gateway in Docker, Docker Compose or Kubernetes (Helm), configure them, and put TLS in front.
 ---
+
+<Warning>
+**What has and has not been run.** The Dockerfile, the Compose file and the Helm chart were written and reviewed, but not
+built, started or installed in the project's own test pass. In particular the Helm chart has **not been installed on a real
+cluster**, and `helm` was not available on the machine that wrote it, so the chart has not even been `helm lint`ed or
+rendered. Treat all three as a starting point, run `helm lint` and `helm template` yourself, and try them in a
+non-production environment first.
+</Warning>
 
 ## Docker
 
-The repository's `Dockerfile` builds one image with the server (default command), the gateway and the CLI.
+The repository's `Dockerfile` builds one image with the server (default command), the gateway and the CLI. It is a two-stage
+build on `node:22-slim` (`npm ci`, `tsc -b`, then dev dependencies are pruned).
 
 ```bash
 docker build -t reversi .
@@ -17,34 +26,123 @@ docker run --rm -p 127.0.0.1:7421:7421 -v reversi-data:/data \
 docker run --rm reversi node packages/gateway/dist/main.js --config /config/gateway.yaml --manifests /config/manifests
 ```
 
-It runs as the unprivileged `node` user, keeps data in the `/data` volume, and has a health check on `/readyz`.
+- Runs as the unprivileged `node` user, keeps data in the `/data` volume (`REVERSI_DATA=/data`), and has a health check on `/readyz`.
+- It sets `HOST=0.0.0.0` and `PORT=7421`. Because of that, `REVERSI_CONSOLE=open` is refused (open mode is loopback only); use `REVERSI_CONSOLE=login`.
+- A gateway that listens beyond loopback needs `auth` in its config, or it refuses to start.
 
-`deploy/docker-compose.yml` runs the server on PostgreSQL with a Postgres health check; follow the comments at its top
-(generate the example manifests, copy and fill `deploy/keys.json`, set `POSTGRES_PASSWORD`).
+## Docker Compose
 
-<Note>
-The Docker files and compose stack are provided but were not built or run in the project's own test pass. Build and run them
-in your environment before relying on them.
-</Note>
+`deploy/docker-compose.yml` runs the server on PostgreSQL 16 with a Postgres health check, JSON logs, and the **login console**
+at `http://127.0.0.1:7421/console` (paste an API key). Follow the comments at its top:
+
+```bash
+node packages/connectors/dist/main.js manifests fs --format yaml > examples/gateway/manifests/fs.yaml   # after npm run build
+cp deploy/keys.example.json deploy/keys.json      # replace the placeholder hashes: printf '%s' "$KEY" | shasum -a 256
+POSTGRES_PASSWORD=$(openssl rand -hex 16) docker compose -f deploy/docker-compose.yml up --build
+```
+
+The stack mounts `deploy/keys.json`, `examples/gateway/manifests` and `examples/gateway/policy.yaml` read-only, publishes only on
+`127.0.0.1`, and requires `POSTGRES_PASSWORD` (it fails without it). Replace the example manifests and policy with your own.
+
+## Kubernetes (Helm)
+
+The chart is at `deploy/helm/reversi`. It deploys the server, and optionally the gateway as a second container in the same pod.
+
+```bash
+helm lint deploy/helm/reversi                      # not run by the author: helm was unavailable
+helm template reversi deploy/helm/reversi -f my-values.yaml
+helm install reversi deploy/helm/reversi -f my-values.yaml
+```
+
+Build and push the image yourself and set `image.repository` and `image.tag`. Nothing is created for secrets: you create the
+Secrets and ConfigMaps and the chart refers to them by name, so no credential ever sits in `values.yaml`.
+
+```yaml my-values.yaml
+image: { repository: registry.example.com/reversi, tag: "0.1.0" }
+server: { console: login, environment: production }
+manifests: { existingConfigMap: reversi-manifests }
+policy: { existingConfigMap: reversi-policy }
+keys: { existingSecret: reversi-keys }                     # a Secret with key keys.json
+store:
+  kind: postgres
+  databaseUrlSecret: { name: reversi-db, key: DATABASE_URL }
+ingress: { enabled: true, className: nginx, host: reversi.example.com, tls: { enabled: true, secretName: reversi-tls } }
+```
+
+### Values
+
+| Group | Key | Default | Meaning |
+|---|---|---|---|
+| `image` | `repository`, `tag`, `pullPolicy` | `reversi`, `0.1.0`, `IfNotPresent` | The image built from the Dockerfile |
+| (top level) | `replicaCount` | `1` | More than one needs `store.kind: postgres` |
+| `server` | `port` | `7421` | Container and Service port |
+| | `console` | `off` | `off` or `login`. `open` is refused |
+| | `environment` | `production` | `REVERSI_ENV`, matched by policy rules |
+| | `logJson` | `true` | `REVERSI_LOG=json` |
+| | `secureCookies` | `true` | `REVERSI_SECURE_COOKIES=1`; keep on behind TLS |
+| `manifests` | `existingConfigMap` or `inline` | none | A ConfigMap of manifest files, or `{ "orders.yaml": "<yaml>" }` rendered into one. Mounted read-only at `/config/manifests`, sets `REVERSI_MANIFESTS` |
+| `policy` | `existingConfigMap` or `inline` | none | A ConfigMap holding `policy.yaml`, or the text inline. Mounted at `/config/policy`, sets `REVERSI_POLICY` |
+| `registry` | `persistence.enabled`, `.size`, `.storageClass` | `false`, `1Gi`, none | A writable PersistentVolumeClaim (`<release>-reversi-state`, ReadWriteOnce) mounted at `/state` in the server container. The server then reads manifests from `/state/manifests` and policy from `/state/policy` (`REVERSI_MANIFESTS`, `REVERSI_POLICY`) instead of the ConfigMap mounts. Needs `replicaCount: 1` |
+| `keys` | `existingSecret`, `key` | none, `keys.json` | A Secret with the API key file (hashes; see `deploy/keys.example.json`). Sets `REVERSI_KEYS` |
+| `store` | `kind` | `postgres` | `files`, `sqlite` or `postgres` |
+| | `databaseUrlSecret.name`, `.key` | none, `DATABASE_URL` | Secret holding the PostgreSQL URL (required for postgres) |
+| | `persistence.enabled`, `.size`, `.storageClass` | `false`, `5Gi` | A PersistentVolumeClaim for `files` and `sqlite`. Otherwise `/data` is an `emptyDir` and is lost with the pod |
+| `oidc` | `enabled`, `issuer`, `audience`, `roleMap` | off | Sets the `REVERSI_OIDC_*` variables |
+| `signing` | `existingSecret` | none | A Secret holding `signing.pem`, an Ed25519 key, for signed evidence |
+| (top level) | `extraEnv` | `[]` | More environment entries, e.g. `{ name: REVERSI_CAPTURE, value: "1" }` |
+| `gateway` | `enabled`, `port`, `existingConfigMap`, `console` | `false`, `7611`, none, `off` | Adds a gateway container. `existingConfigMap` must hold `gateway.yaml` (mounted at `/config/gateway`); the gateway console mode is passed as `--console` |
+| `ingress` | `enabled`, `className`, `host`, `tls.enabled`, `tls.secretName`, `annotations` | off, `reversi.example.com`, TLS on | One Ingress to the server's HTTP port |
+| (top level) | `serviceAccount.create`, `serviceAccount.annotations`, `resources`, `podAnnotations`, `nodeSelector`, `tolerations`, `affinity` | | As usual |
+
+### Fail-fast checks
+
+`templates/validate.yaml` stops the render with a message for:
+
+- `server.console=open`: "has no login and is refused on a cluster".
+- `replicaCount` above 1 with a store other than `postgres`.
+- `registry.persistence.enabled` with `replicaCount` above 1: "the volume is ReadWriteOnce".
+- `server.console=login` with neither `keys.existingSecret` nor `oidc.enabled`.
+
+The templates also require `store.databaseUrlSecret.name` when the store is `postgres` (the default), and
+`gateway.existingConfigMap` when the gateway is enabled.
+
+### What the chart does and does not do
+
+- Pod security: non-root user 1000, read-only root filesystem (writable `/data` and `/tmp`), all capabilities dropped, `RuntimeDefault` seccomp, no service account token mounted. Readiness probe `/readyz`, liveness `/healthz`.
+- The server refuses to start without a credential source. The chart does not check that you set `keys.existingSecret` or `oidc.enabled` unless the console is `login`.
+- The gateway container shares the pod's environment (store, manifests, policy, keys) and `/data`. Your `gateway.yaml` must listen on `0.0.0.0` and the port set in `gateway.port`, and use `auth.keys: /config/keys/keys.json` (or OIDC), since a gateway beyond loopback needs authentication. The Service exposes the `mcp` port inside the cluster; the Ingress routes only to the server.
+- **Read-only by default.** With the ConfigMap sources, manifests and policy are read-only mounts, so the console's editors and `reversi apply --server` have nothing writable to work on. Update the ConfigMaps (`helm upgrade`) and let [hot reload](/operations/gitops) pick them up. I did not verify how quickly Kubernetes propagates a ConfigMap change into the pod or that the file watch sees it, so run `kill -HUP` or restart if it does not.
+- **Writable registry (`registry.persistence.enabled: true`).** The console editors and `reversi apply --server` then work, because the server's manifests and policy are folders on the volume. Set `server.console: login` and use an admin key for `apply`. An init container creates `/state/manifests` and `/state/policy`, and the server and gateway treat an empty folder as an editable registry, so the first publish (for example `reversi apply <dir> --server <url> --token <admin key>`) creates it. The `/state` mount is in both the server and the gateway container. Checked locally with an empty folder and `apply --server`; the init container and mounts were read from the templates, not run on a cluster.
+- There is no Terraform module and no operator. See [GitOps](/operations/gitops).
 
 ## Server environment
 
+Everything can also be set in [`reversi.config.yaml`](/operations/gitops); the variable wins.
+
 | Variable | Meaning |
 |---|---|
-| `REVERSI_MANIFESTS` | Manifest file or directory (required) |
-| `REVERSI_KEYS` | API key file; reloaded on `SIGHUP` or change |
-| `REVERSI_OIDC_*` | OIDC: `ISSUER`, `AUDIENCE`, `ROLE_MAP`, `ROLE_CLAIM`, `ACTOR_CLAIM` ([authentication](/operations/authentication)) |
-| `REVERSI_DATA`, `REVERSI_STORE`, `REVERSI_DATABASE_URL` | [Storage](/operations/storage) |
-| `REVERSI_POLICY`, `REVERSI_ENV` | [Policy](/concepts/policy) file and environment name |
+| `REVERSI_MANIFESTS` | Manifest file, folder, registry folder or https URL (required unless `manifests:` is in the project file) |
+| `REVERSI_KEYS` | API key file; reloaded on `SIGHUP` or change. Also the file the console edits |
+| `REVERSI_OIDC_ISSUER`, `_AUDIENCE`, `_ROLE_MAP`, `_ROLE_CLAIM`, `_ACTOR_CLAIM` | OIDC ([authentication](/operations/authentication)). Role map is JSON such as `{"reversi-ops":"operator"}` |
+| `REVERSI_DATA`, `REVERSI_STORE`, `REVERSI_DATABASE_URL` | [Storage](/operations/storage). Defaults `./reversi-data`, `files` |
+| `REVERSI_POLICY`, `REVERSI_ENV` | [Policy](/concepts/policy) file or versions folder, and environment name (default `default`) |
 | `REVERSI_KILL_FILE` | While this file exists, new calls are blocked |
-| `REVERSI_SIGNING_KEY` | Ed25519 private key (PEM) for [signed bundles](/concepts/evidence) |
-| `REVERSI_APPROVAL_WEBHOOK`, `REVERSI_CONSOLE_URL` | [Approval notifications](/concepts/approvals) |
-| `REVERSI_SESSION_SECRET`, `REVERSI_SECURE_COOKIES` | [Console](/console) sessions |
+| `REVERSI_SIGNING_KEY`, `REVERSI_MANIFEST_PUBLIC_KEY` | Ed25519 private key (PEM file) for [signed bundles](/concepts/evidence); public key manifests must be signed with |
+| `REVERSI_APPROVAL_WEBHOOK`, `REVERSI_CONSOLE_URL` | [Approval notifications](/concepts/approvals) (sent through the egress guard) and the public URL linked from them |
+| `REVERSI_CONFIG` | Project file; otherwise searched upward from the working directory |
+| `REVERSI_CONSOLE`, `REVERSI_CONSOLE_ROLE` | [Console](/console) mode (`off`, `open`, `login`) and the role used in open mode |
+| `REVERSI_COMPENSATOR_CMD` | Shell command run for each undo, call as JSON on stdin, exit 0 = done. Needed for rollbacks from the console and `POST /v1/runs/{id}/rollback` |
+| `REVERSI_READER_CMD` | Shell command that runs a manifest's declared read-back after an undo: gets `{"tool","arguments"}` as JSON on stdin and prints the JSON result. Without it those steps are `unverified` |
+| `REVERSI_SLACK_SIGNING_SECRET`, `REVERSI_SLACK_USERS` | Approve from Slack buttons: the signing secret, and the path of a JSON file mapping Slack user ids to `{"name","roles","groups"}` ([authentication](/operations/authentication)). Both are needed |
+| `REVERSI_CAPTURE`, `REVERSI_CAPTURE_TTL_DAYS` | Keep redacted call arguments for replay and simulation |
+| `REVERSI_OTLP_ENDPOINT` | Export OpenTelemetry traces ([monitoring](/operations/monitoring)) |
+| `REVERSI_EGRESS_ALLOW`, `REVERSI_EGRESS_BLOCK_PRIVATE`, `REVERSI_REGION` | Where Reversi may send data; comma-separated host globs, `1`, a region label |
+| `REVERSI_SESSION_SECRET`, `REVERSI_SECURE_COOKIES` | Console session signing; `1` behind HTTPS |
 | `REVERSI_METRICS_PUBLIC=1` | Serve `/metrics` without credentials (private networks only) |
 | `REVERSI_LOG=json` | One JSON line per request on stdout |
 | `PORT`, `HOST` | Listen address (default `127.0.0.1:7421`) |
 
-At least one credential source (keys or OIDC) is required: the server will not start unauthenticated.
+At least one credential source (keys or OIDC) is required: the server will not start unauthenticated. `node packages/server/dist/main.js --help` prints the list.
 
 ## TLS and networking
 
@@ -56,21 +154,25 @@ agent endpoints. Set `allowed_hosts` on the gateway to your public hostname.
 
 One engine process per run is the supported model. With PostgreSQL you can run several server or gateway instances, each owning
 its own sessions and runs, behind a load balancer with session affinity for MCP sessions (the `Mcp-Session-Id` header). Ledger
-appends from all of them stay on one chain. Active/active drivers of the *same* run are not supported.
+appends from all of them stay on one chain. Active/active drivers of the *same* run are not supported, and there is no
+clustering with run hand-off.
 
 ## Upgrades
 
-Deploy the new version: PostgreSQL migrations run at start. Back up first ([storage](/operations/storage)). Manifests and
-policy files are read at start; restart to load changes. Key files reload live.
+Deploy the new version: PostgreSQL migrations run at start. Back up first ([storage](/operations/storage)). Manifests, the
+policy and the manifest public key reload while running (file watch, `SIGHUP`, `POST /v1/reload`); other settings and
+environment variables need a restart. Key files reload live.
 
 ## Incident runbook
 
 | Situation | Do |
 |---|---|
-| Agent is misbehaving | Kill switch: console, `POST /v1/halt`, `reversi.halt`, or `reversi kill-switch on <file>`. Rollbacks still work |
-| Need to know what it did | Console run page, `reversi export --run`, or a signed bundle |
-| Undo it | `reversi plan`, then `reversi rollback` / `reversi.execute_rollback`. Review `cannot be undone` and `unresolved` items by hand |
+| Agent is misbehaving | Kill switch: console Evidence page, `POST /v1/halt` (can be scoped to a tool, actor, tenant or environment), `reversi.halt`, `reversi halt add`, or `reversi kill-switch on <file>`. Rollbacks still work |
+| Need to know what it did | Console run page, `reversi runs show`, `reversi export --run`, or a signed bundle |
+| Undo it | `reversi plan`, then `reversi rollback`, the console Run the rollback button, or `reversi.execute_rollback`. Review `cannot be undone` and `unresolved` items by hand |
 | A step has an unknown outcome | Check the downstream system, then `reversi resolve` with a note |
-| Compensation keeps failing | Read the error in the ledger (`compensation_failed`), fix the cause, re-run the rollback: it retries with the same idempotency key |
-| Suspect ledger tampering | `reversi verify`, compare the head with your anchored copy |
-| Key leaked | Set `disabled: true` (reloads within seconds) or remove it; review that principal's runs in the ledger |
+| Compensation keeps failing | Read the error in the ledger (`compensation_failed`), fix the cause, re-run the rollback: it retries with the same idempotency key. Escalate to on-call from the run page |
+| An approval is stuck and the incident is live | An admin can use break-glass (reason and ticket recorded) |
+| Suspect ledger tampering | `reversi verify`, compare the head with your anchored copy (`reversi anchor verify`) |
+| Key leaked | Set `disabled: true` (reloads within seconds) or disable it in the console; review that principal's runs in the ledger |
+| A bad manifest or policy was published | `reversi manifests rollback <tool> <version>` or `reversi policy activate <version>`; both are new versions, nothing is lost |

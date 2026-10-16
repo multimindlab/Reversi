@@ -1,0 +1,74 @@
+# The image is built from the repository's Dockerfile; push it to your registry and set it here.
+image:
+  repository: reversi
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1   # more than one needs the sqlite-free stores: set store.kind to postgres
+
+server:
+  port: 7421
+  # off | login. The open console is for a laptop and is refused on a cluster (the pod listens on all addresses).
+  console: off
+  environment: production
+  logJson: true
+  secureCookies: true
+
+# Config files are mounted at /config. Give them inline, or point at existing ConfigMap/Secret objects.
+manifests:
+  # A registry folder is edited from the console and `reversi apply`; plain files are read-only.
+  existingConfigMap: ""      # a ConfigMap with manifest YAML/JSON files; if empty, `inline` below is used
+  inline: {}                 # { "orders.yaml": "<yaml text>" }
+# A writable, versioned registry on a PersistentVolume: lets the console editors and `reversi apply --server` publish manifests
+# and policy at runtime. Needs replicaCount 1 (ReadWriteOnce). When enabled it replaces the ConfigMap sources above.
+registry:
+  persistence:
+    enabled: false
+    size: 1Gi
+    storageClass: ""
+policy:
+  existingConfigMap: ""
+  inline: ""                 # policy.yaml text
+keys:
+  existingSecret: ""         # a Secret with key `keys.json` (API keys as hashes; see deploy/keys.example.json)
+  key: keys.json
+
+store:
+  kind: postgres             # files | sqlite | postgres
+  # postgres: the URL is read from this existing Secret (never put it in values)
+  databaseUrlSecret: { name: "", key: DATABASE_URL }
+  persistence:               # files / sqlite only
+    enabled: false
+    size: 5Gi
+    storageClass: ""
+
+oidc:
+  enabled: false
+  issuer: ""
+  audience: ""
+  roleMap: {}                # { "reversi-ops": "operator" }
+
+signing:
+  existingSecret: ""         # a Secret holding an Ed25519 key `signing.pem`, for signed evidence
+
+extraEnv: []                 # additional environment variables, e.g. REVERSI_CAPTURE: "1"
+
+gateway:
+  enabled: false
+  port: 7611
+  existingConfigMap: ""      # a ConfigMap with gateway.yaml (upstreams, mode, listen, auth)
+  console: off
+
+ingress:
+  enabled: false
+  className: ""
+  host: reversi.example.com
+  tls: { enabled: true, secretName: "" }
+  annotations: {}
+
+serviceAccount: { create: true, annotations: {} }
+resources: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

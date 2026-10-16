@@ -123,9 +123,11 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 export type ValidateResult = { ok: true; manifest: ToolManifest } | { ok: false; errors: string[] };
 
 /** Validate one manifest and fill in defaults. Does not check references to other tools. */
-export function validateManifest(raw: unknown): ValidateResult {
+export function validateManifest(input: unknown): ValidateResult {
   const errors: string[] = [];
-  if (!isRecord(raw)) return { ok: false, errors: ["manifest must be an object"] };
+  if (!isRecord(input)) return { ok: false, errors: ["manifest must be an object"] };
+  // A normalized manifest (as stored and returned by this library) carries `approval_rules`; read it back as the author's `approval` object.
+  const raw = isRecord(input.approval_rules) && typeof input.approval === "string" ? authorForm(input as unknown as ToolManifest) : input;
 
   const label = typeof raw.tool === "string" && raw.tool ? `\`${raw.tool}\`` : "manifest";
   const err = (m: string) => errors.push(`${label}: ${m}`);
@@ -446,4 +448,24 @@ export function resolveRef(ref: string, source: "args" | "result", obj: unknown)
     }
   }
   return cur;
+}
+
+/**
+ * A normalized manifest written back in the form an author writes (the `approval` object instead of the internal
+ * `approval_rules`), so it passes the validator again. Used wherever a stored manifest is republished or edited.
+ */
+export function authorForm(m: ToolManifest): Record<string, unknown> {
+  const { approval_rules: r, ...rest } = m as ToolManifest & Record<string, unknown>;
+  if (!r) return rest;
+  return {
+    ...rest,
+    approval: {
+      required: m.approval === "always",
+      roles: r.roles,
+      quorum: r.quorum,
+      ...(r.timeout_ms !== undefined ? { timeout: `${r.timeout_ms}ms` } : {}),
+      on_timeout: r.on_timeout,
+      ...(r.escalate_to ? { escalate_to: r.escalate_to } : {}),
+    },
+  };
 }

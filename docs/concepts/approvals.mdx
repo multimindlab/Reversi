@@ -1,6 +1,6 @@
 ---
 title: Approvals
-description: Human decisions bound to the exact call, used once, expiring, and visible to everyone who needs them.
+description: Human decisions bound to the exact call, used once, expiring, routed to the right people, and recorded.
 ---
 
 A call needs approval when the manifest says `approval: always` (always true for irreversible tools), when a
@@ -12,32 +12,170 @@ Compensations can also require approval (`compensation.requires_approval`).
 1. The agent makes the call. Reversi queues an **approval request** and blocks the call. The message names the
    request id: `approval required: request apr_… is pending an operator decision; retry after it is approved`.
 2. An approver decides it: in the [console](/console), with `reversi approvals approve <id>`, over the
-   [HTTP API](/api-reference/admin), or through the gateway's operator endpoint. A webhook can tell them first.
-3. The agent retries the **same call**. The approval is consumed, the call runs, and the ledger records `approved`.
+   [HTTP API](/api-reference/admin), through the gateway's operator endpoint, or from a Slack button. A
+   [notification](/operations/notifications) can tell them first.
+3. The agent retries the **same call** with the same arguments. The approval is consumed, the call runs, and the ledger
+   records `approved`.
+
+```bash
+reversi approvals list -d ./reversi-data
+# apr_4442c0ff-…  pending  run=r1  call  payments.refund  args=[amount,order]  why: policy `big-refund`: large refund; manifest requires approval
+reversi approvals approve apr_4442c0ff-… -d ./reversi-data --as fiona --groups finance --note ok
+```
 
 ## What an approval is bound to
 
 - **The arguments.** A call approval carries the hash of the arguments it was requested for. Approve a refund of 5 and
   a retry for 500 is a different call and needs its own approval.
-- **One use.** After the call runs the approval is `consumed`.
-- **A time limit.** Pending and approved requests expire (default one hour).
-- **A decision record.** Who decided, when, and the note, in the approval store **and in the ledger** (an `approved` record for approvals, a `blocked` record for denials, with the approver as actor).
-- **Claimed atomically.** Consuming or deciding a request is a compare-and-swap in the store, so two processes sharing a database cannot both use one approval.
-- **A denial sticks** for that call, with the reason shown to the agent.
+- **One use.** After the call runs the approval is `consumed`. Running the same call again queues a new request.
+- **A time limit.** Pending and approved requests expire (default one hour, `approval.ttl` in
+  [`reversi.config.yaml`](/cli), or the timeout set by the manifest or rule).
+- **A decision record.** Who decided, when, the basis (role, group or delegation) and the note, in the approval store.
+  The ledger also gets a record, whichever way the decision is made (CLI, server, gateway or console): `approved` for
+  approvals, `blocked` for denials, with the approver as actor.
+- **Claimed atomically.** Consuming or deciding a request is a compare-and-swap in the store, so two processes sharing a
+  database cannot both use one approval or both cast the last vote.
+- **A denial sticks** for that call (same arguments, same step), with the reason shown to the agent.
 
 A request stores the names of the arguments, never their values, so approvals do not become a second copy of
 sensitive data.
 
-## Pre-approval
+`reversi approvals approve|deny` goes through the engine, like the server and console do: the decision is journaled in the
+ledger (`approved`, or `blocked` for a denial, with the person given by `--as` as actor), delegations apply, and
+[notification channels](/operations/notifications) from the project file are told (`approval_decided`).
 
-An operator can grant standing approval for a tool in a run (`POST /v1/runs/{id}/approvals`, `count` uses, any
-arguments). Use it for compensations you know you will want to run, not for agent calls.
+## Who may approve: routing and quorum
+
+By default any `approver` or above may decide. Name who must decide on the manifest or on a `require_approval` rule.
+
+```yaml tools.yaml
+- tool: payments.refund
+  effect: reversible
+  permission: payments:write
+  approval:
+    roles: [finance]          # Reversi roles or group names
+    quorum: 2                 # distinct approvers needed, 1 to 10
+    timeout: 15m
+    on_timeout: escalate      # deny (default) or escalate
+    escalate_to: [admin]
+```
+
+```yaml policy.yaml
+rules:
+  - id: big-refund
+    match: { tool: "payments.refund" }
+    when: [{ path: $args.amount, op: gt, value: 500 }]
+    action: require_approval
+    approvers: [finance]
+    quorum: 2
+    approval_timeout: 30m
+    on_timeout: escalate
+    escalate_to: [admin]
+    reason: large refund
+```
+
+- **Roles and groups.** An approver qualifies if they hold a listed role, or belong to a listed group. Groups come from
+  `groups` on an [API key](/operations/authentication) or, for OIDC, from the values of the role claim.
+- **Several requirements on one call** (manifest plus rules) are merged: any listed role may approve, the largest
+  quorum wins, the shortest timeout wins, and `deny` on timeout wins over `escalate`.
+- **Quorum.** Each approver counts once. One denial ends the request. A quorum above 1 needs `roles`. While votes are
+  missing the request stays `pending` and the message says `needs 2 approvers from finance`.
+- **No self-approval.** Whoever owns the run that asked cannot decide the request.
+- **Deciding as a group member.** Over HTTP and in the console your key's groups are used. With the CLI you state them:
+  `--groups finance` and `--roles operator` (default `operator`). A person who is not in the group is refused:
+  `this request needs an approver from: finance`. The CLI trusts the caller, so use it on the host that owns the data.
+- **The open console** acts as one role and has no groups, so it can decide only requests that name that role or no one.
+
+## Escalation on timeout
+
+With `on_timeout: escalate` an unanswered request does not simply expire. When its time is up it is widened once to
+`escalate_to` (or left as is if none is named), given a fresh time limit, an `escalated` ledger record is written and an
+`approval_escalated` notification is sent. If it expires again it is `expired`. The check happens when the queue is read,
+so it is only as prompt as the alert interval, console views or API reads.
+
+With `on_timeout: deny` (the default) the request becomes `expired`. The agent's next retry is told
+`approval … expired unanswered and was denied; the call must be requested again`, and a retry after that queues a new one.
+
+## Delegation
+
+An approver on leave can hand their authority to someone else for a while.
+
+```bash
+reversi delegate add --from fred --to dan --hours 24 --reason "on leave" --group finance -m tools.yaml -d ./reversi-data
+reversi delegate list -m tools.yaml -d ./reversi-data
+reversi delegate revoke dlg_… -m tools.yaml -d ./reversi-data
+```
+
+- **Who and how long.** `--from`, `--to`, a reason (required), and an end time at most 90 days away. You cannot delegate to
+  yourself.
+- **Scope.** `--group` (repeatable) limits it to requests routed to those groups. **Without it the delegation covers
+  every routed request**, so always pass `--group`.
+- **What happens.** The delegate approves as themselves; the decision records `on_behalf_of` and the basis
+  `delegated by fred (finance)`. It counts as fred's vote: fred cannot vote on the same request afterwards, and the
+  delegate cannot vote twice. The delegate still needs the `approver` role to reach the approve endpoint.
+- **Ends** at its expiry or when revoked.
+- **Where.** The CLI above, the Approvals page of the console (own authority, hours and reason), or the
+  `/v1/delegations` endpoints, which `reversi-server` serves ([admin API](/api-reference/admin)). Delegations apply
+  everywhere a decision is made, including `reversi approvals approve --as <delegate>`.
+
+## Break-glass
+
+An admin can force a pending request through when the usual approvers are unreachable. It skips routing and quorum, and
+it is loud on purpose.
+
+```bash
+reversi break-glass apr_… --reason "payments outage, customer escalated" --evidence INC-77 --by root -m tools.yaml -d ./reversi-data
+```
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  -d '{"reason":"customer is waiting on the line","evidence":"INC-42"}' \
+  http://localhost:7421/v1/approvals/apr_…/break-glass
+```
+
+- **Admin only** over HTTP and in the console (other roles get `403`). A reason of at least 10 characters and a pointer to
+  evidence (ticket or incident) are required (`400` otherwise). The CLI has no login, so it accepts `--by` as given.
+- **Recorded.** The approval keeps `break_glass` with who, why, the evidence reference and the time. The ledger gets an
+  `approved` record whose detail starts `BREAK-GLASS: … evidence: INC-77`.
+- **Notified.** A critical `break_glass` notification goes out, and a critical `break_glass` [alert](/operations/monitoring)
+  shows in the console.
+
+## What the approver sees
+
+The Approvals page lists each pending request with why approval is needed (rule and manifest), who may decide, the
+argument names and hash, the expiry and quorum progress. Each tool links to an **impact preview**, also at `GET /v1/impact`:
+what the manifest and policy say about the tool, the verdict, the risk score and how the call could be undone. Previews
+are about the tool, not the argument values, which are never stored.
 
 ## Notifications
 
-Set `REVERSI_APPROVAL_WEBHOOK` to an http(s) URL. Each new request is POSTed as JSON with a `text` field, so a Slack or
-Teams incoming-webhook URL works as is, plus the structured request. Set `REVERSI_CONSOLE_URL` to link the console in
-the message. Delivery is best effort with a 5 s timeout and never changes the decision.
+With [`notifications:`](/operations/notifications) configured, Reversi sends `approval_requested`, `approval_progress`
+(a quorum vote that is not the last), `approval_decided`, `approval_escalated` and `break_glass`. A Slack channel with
+`interactive: true` adds Approve and Deny buttons.
+
+The older single `REVERSI_APPROVAL_WEBHOOK` (or `approval.webhook`) still works: each new request is POSTed as JSON with a
+`text` field, so a Slack or Teams incoming-webhook URL works as is. Set `REVERSI_CONSOLE_URL` to link the console.
+Delivery is best effort with a 5 s timeout and never changes the decision. It goes through the
+[egress rules](/operations/retention), like channels do; a refused URL is logged as `approval webhook failed`.
+
+### Approving from Slack
+
+The Slack buttons post to `/integrations/slack/actions`, which verifies Slack's signature (`v0`, five-minute window) and
+maps the Slack user id to a Reversi person. `reversi-server` enables it when `REVERSI_SLACK_SIGNING_SECRET` and
+`REVERSI_SLACK_USERS` (a JSON file mapping Slack user ids to name, roles and groups) are set; see
+[authentication](/operations/authentication#slack-approvals-user-mapping). In code:
+
+```ts
+createApp({ /* … */ slack: { signing_secret, users: { U123: { name: "fiona", roles: ["approver"], groups: ["finance"] } } } });
+```
+
+An unmapped user, or a mapped user without the `approver` role or higher, gets "You are not set up as an approver in
+Reversi." The same routing, quorum and self-approval rules apply. Checked here with locally signed requests, not with real Slack.
+
+## Pre-approval
+
+An operator can grant standing approval for a tool in a run (`POST /v1/runs/{id}/approvals`, `count` from 1 to 100,
+any arguments). Use it for compensations you know you will want to run, not for agent calls.
 
 ## Who can decide
 
@@ -46,4 +184,4 @@ The `approver` role and up. Agents cannot approve anything, including their own 
 ## Storage
 
 Requests live in the data store (`approvals.json` for files, a table for SQLite and PostgreSQL), so the CLI, server
-and gateway see the same queue and a restart does not lose it.
+and gateway see the same queue and a restart does not lose it. Delegations live in the same store.

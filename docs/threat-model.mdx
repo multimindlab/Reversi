@@ -34,11 +34,18 @@ the tools act on.
 | Failed or partial compensation | Reported honestly, retried with the same idempotency key, optional verification probe | Some effects cannot be undone |
 | Stolen API key | Hashed at rest, rotation windows, expiry, disable, constant-time compare | A key is a bearer credential: use TLS and short lives |
 | Forged or confused OIDC token | Signature against JWKS, RS256/ES256 only, `iss`, `aud`, `exp`, `nbf`; unmapped roles rejected | Trust in the identity provider |
-| Web page driving a local gateway or console | Host and Origin validation; SameSite=Strict cookies; CSRF tokens; strict CSP | Misconfigured `allowed_hosts`/`allowed_origins` |
+| Web page driving a local gateway or console | Host and Origin validation; SameSite=Strict cookies; CSRF tokens; strict CSP. The open console (no login) answers only loopback hosts from the same origin, refuses to start on a non-loopback address, and is never admin | Misconfigured `allowed_hosts`/`allowed_origins`. Any other process or user on the same machine can reach an open console |
 | Console session theft or forgery | Signed HttpOnly cookies, 8 h lifetime, re-validated against the key ring every request, revoked on logout, per-session CSRF | XSS in a future page: output is escaped everywhere today |
-| Runaway agent | Kill switch (API, console, file), rate and budget limits | Latency until an operator notices |
+| An approval is stuck during an incident | Break-glass: admin only, a reason of at least 10 characters and an evidence reference, marked in the ledger and the console (decision note and a break-glass badge) | An admin can still abuse it; it is visible afterwards, not prevented |
+| An approver is unavailable | Delegation for a limited time, recorded; a delegate cannot add a second vote | A delegate with the wrong judgement |
+| An MCP server's annotations lie (a mutating tool marked read-only) | Annotations only seed draft manifests and the banner. Tools without a manifest are blocked in enforce mode. With `unclassified_reads: observe` a claimed read-only tool runs in a shadow run labelled "unverified" | With that option on, a lying server can run a mutating tool unblocked |
+| An upstream changes a tool's schema after review | `schema_hash` in the manifest: a changed input schema is a violation until the manifest is reviewed again. Arguments and structured results are checked against declared schemas; a result that breaks its schema is recorded and not used to build compensation arguments | Manifests without a `schema_hash` are not drift-checked. The schema checker is a subset of JSON Schema |
+| A manifest or policy is changed without review | Registry versions with author, approver, checksum and optional Ed25519 signature; drafts are not enforceable; four-eyes approval; `manifest_public_key` makes loading fail unless signed; `reversi apply` and the console record who published | Whoever holds the signing key or an admin credential. Policy versions are recorded but not signed |
+| Reversi is pointed at internal addresses (webhooks, anchors, trace export, upstream URLs) | `egress:` host allowlist; cloud metadata addresses always refused; `block_private` refuses loopback and private ranges; upstream URLs are checked at gateway start | `block_private` is off by default so local development works |
+| Evidence is deleted in the name of retention | Retention deletes run state, approvals and captures only, never ledger records; legal holds block it; an optional signed bundle is archived first | An administrator with direct store access |
+| Runaway agent | Kill switch (API, console, CLI, file), global or scoped by tool, actor, tenant or environment; rate and budget limits | Latency until an operator notices |
 | Two writers fork the ledger | `seq` primary key; losers retry or fail closed | None known |
-| Upstream MCP server compromised | Nothing: it is a trusted tool provider. Its results are content-checked for injection | A malicious upstream can lie about results |
+| Upstream MCP server compromised | Nothing: it is a trusted tool provider. Its results are content-checked for injection and schema-checked | A malicious upstream can lie about results |
 | Supply chain | Lockfile, dependency audit and SBOM in CI, provenance on release | Not independently reviewed |
 
 ## Out of scope

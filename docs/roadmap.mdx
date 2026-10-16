@@ -1,26 +1,56 @@
 ---
 title: Roadmap
-description: What is built, and what is not.
+description: What is built, what is built but unverified against real systems, and what is not built.
 ---
 
 ## Built
 
-Manifests, write-ahead ledger, dependency-aware rollback with retries, verification and reconciliation, scopes, approvals
-(queued, argument-bound, single-use, expiring, persisted, notified), observe mode, [policy as code](/concepts/policy),
-[content checks](/concepts/content-checks), kill switch, secret redaction, [signed evidence](/concepts/evidence) and reports,
-files / SQLite / PostgreSQL stores, HTTP API with [roles, key rotation and OIDC](/operations/authentication), the
-[operator console](/console), Prometheus metrics, the [MCP gateway](/gateway) (enforce and observe, multiple upstreams,
-allow/deny, approvals, operator endpoint with rollback tools, Streamable HTTP with auth), [connectors](/connectors) for
-filesystem, GitHub, Slack and Stripe, the CLI, the Python SDK, the trace viewer, Docker and CI definitions.
+**Core.** Manifests, write-ahead ledger, dependency-aware rollback with retries, verification read-backs and reconciliation,
+scopes, observe and advise modes, risk scoring, [policy as code](/concepts/policy) with tests and versions,
+[content checks](/concepts/content-checks), kill switches (global and scoped), secret redaction, [signed evidence](/concepts/evidence),
+reports (HTML, PDF, period reports) and files / SQLite / PostgreSQL stores.
+
+**Approvals.** Queued, argument-bound, single use, expiring, persisted; quorum and group routing, escalation on timeout,
+delegation, break-glass with a recorded reason and evidence reference ([approvals](/concepts/approvals)).
+
+**Manifests and policy as files.** Versioned, signable manifest registry with drafts, approval (four-eyes), deprecation and
+rollback; policy versions; `reversi lint`, `reversi test`, manifest suggestion from MCP tools, schema-drift detection;
+`reversi apply` for GitOps; hot reload ([GitOps](/operations/gitops)).
+
+**Gateway.** Observe-first start with no manifests, classification banner, enforce / advise / observe, input and output schema
+validation, per-manifest timeout and retry, verification through the upstream, several upstreams, allow/deny, approvals,
+operator endpoint with rollback tools, Streamable HTTP with auth, egress check of upstream URLs, the console on its own port
+([gateway](/gateway)).
+
+**What-if.** Capture of redacted calls, policy simulation, replay with changes, speculative comparison of plans, impact preview
+([simulation](/concepts/simulation)).
+
+**Operations.** HTTP API with [roles, key rotation and OIDC](/operations/authentication); the [operator console](/console) with
+three modes, manifest and policy editors, rollback execution, alerts, keys, holds and retention; Prometheus metrics, OpenTelemetry
+traces, structured logs and alerts; notification channels (Slack, Teams, email, PagerDuty, Opsgenie, signed webhook) with
+routing ([notifications](/operations/notifications)); retention, legal holds and ledger anchoring ([retention](/operations/retention));
+egress allowlist and data-residency labels.
+
+**Ecosystem.** The CLI ([cli](/cli)), TypeScript and Python SDKs, Pydantic bindings, [framework adapters](/integrations)
+(LangGraph, CrewAI, OpenAI Agents SDK, FastMCP, Claude Code hook), fourteen [connectors](/connectors) with a certification
+suite, the trace viewer, a Dockerfile, a Compose stack, a Helm chart (with an optional writable registry volume) and CI definitions.
+
+## Built, not yet verified against real systems
+
+Tested with fakes or local stand-ins only. See [limits](/limits) for the detail.
+
+- The fourteen connectors against live services (the filesystem connector is local and real).
+- Notification channels and OpenTelemetry export against the real products.
+- The Python framework adapters against installed LangGraph, CrewAI, OpenAI Agents and FastMCP.
+- The Dockerfile, Compose stack and Helm chart (never built or installed; `helm lint` was not run).
+- The GitHub workflows, and the CI example in [GitOps](/operations/gitops).
 
 ## Not built
 
-- OpenTelemetry traces (Prometheus metrics and JSON logs exist).
-- Risk scoring, delegated approval and break-glass flows beyond the single approver role.
-- Retention and purge tooling, legal hold, data residency controls.
-- Gateway: resources, prompts and sampling passthrough; clustering with run hand-off.
-- More connectors (Linear, Jira, Calendar, PostgreSQL, Salesforce, cloud providers) and a connector certification suite.
-- Framework adapters (LangGraph, CrewAI, OpenAI Agents) and Go/Java SDKs.
-- Speculative execution and branch comparison.
-- Helm chart, external anchoring service, hosted control plane.
-- An external security review of the code.
+- A Terraform provider and a Kubernetes operator. `reversi apply` and the Helm chart are the alternative.
+- OIDC browser redirect login for the console (login mode takes a pasted API key or OIDC access token).
+- A hosted control plane.
+- Go and Java SDKs.
+- Clustering with run hand-off between gateway or server processes.
+- Gateway passthrough of MCP resources, prompts and sampling.
+- An independent external security review of the code.

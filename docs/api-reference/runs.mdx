@@ -3,38 +3,86 @@ title: Agent endpoints
 description: Open runs, request calls, report outcomes. Agent role.
 ---
 
-Agents see only runs they opened (another agent's run is a 404). Auditors and above can read any run.
+Agents see only runs they opened (another agent's run is a 404). Auditors and above can read any run. Journaling on a run
+(`intents`, `outcome`) is only ever done by the principal that opened it, whatever other roles the key holds.
 
 ## `POST /v1/runs`
 
-```json
-{ "permissions": ["orders:write"], "run_id": "optional", "mode": "enforce", "reason": "why this run exists" }
+```bash
+curl -s -X POST http://127.0.0.1:7421/v1/runs \
+  -H "Authorization: Bearer $AGENT_KEY" -H 'content-type: application/json' \
+  -d '{"permissions":["notes:read","notes:write"],"run_id":"demo-1","reason":"docs example"}'
 ```
-→ `201 {"run_id","mode","scope_seal"}`. Permissions must fit within the key's `max_permissions`.
+```json
+{"run_id":"demo-1","mode":"enforce","scope_seal":"336f0ddd8ee69f57…"}
+```
+
+| Field | Meaning |
+|---|---|
+| `permissions` | Required. The run's scope. Must fit within the key's `max_permissions` (else 403) |
+| `run_id` | Optional (generated if omitted). Up to 128 characters: letters, digits, `.`, `_`, `-`, starting with a letter or digit. 400 otherwise, 409 if it exists |
+| `mode` | `enforce` (default), `observe` or `advise`. The last two let violating calls run, so a key needs `allow_observe` (else 403) |
+| `reason` | Optional free text recorded on the run |
+
+→ `201`. Mode and scope are sealed at this point and cannot be widened later.
 
 ## `POST /v1/runs/{id}/intents`
 
 Authorize a call and journal its intent. Execute the tool only on `allow` or `would_block`.
 
-```json
-{ "tool": "create_order", "args": {"sku": "BOOK-1"}, "reason": "customer asked", "depends_on": [0] }
+```bash
+curl -s -X POST http://127.0.0.1:7421/v1/runs/demo-1/intents \
+  -H "Authorization: Bearer $AGENT_KEY" -H 'content-type: application/json' \
+  -d '{"tool":"notes.write","args":{"name":"a"},"reason":"save note"}'
 ```
-→ `{"decision":"allow","step":3}` · `{"decision":"would_block","step":3,"reasons":[…]}` · `{"decision":"block","reasons":[…]}`
+```json
+{"decision":"allow","step":0}
+```
+
+`tool`, `args` (any JSON, hashed and never stored) and `reason` are required; `depends_on` is an optional list of earlier step
+numbers this call needs.
+
+→ `{"decision":"allow","step":3}` · `{"decision":"would_block","step":3,"reasons":[…]}` (observe or advise mode) · `{"decision":"block","reasons":[…]}`
 
 A call waiting for approval is a `block` whose reason names the request:
-`approval required: request apr_… is pending an operator decision; retry after it is approved`. After an approver decides it,
-send the same intent again ([approvals](/concepts/approvals)). Violations also come from [policy](/concepts/policy),
-[content checks](/concepts/content-checks) and the kill switch.
+
+```json
+{"decision":"block","reasons":["approval required: request apr_5f0b3a2e-… is pending an operator decision; retry after it is approved"]}
+```
+
+After an approver decides it, send the same intent again ([approvals](/concepts/approvals)). A different set of arguments needs
+a new approval. Violations also come from [policy](/concepts/policy), [content checks](/concepts/content-checks) and the kill switch.
 
 ## `POST /v1/runs/{id}/steps/{n}/outcome`
+
+```bash
+curl -s -X POST http://127.0.0.1:7421/v1/runs/demo-1/steps/0/outcome \
+  -H "Authorization: Bearer $AGENT_KEY" -H 'content-type: application/json' \
+  -d '{"status":"succeeded","result":{"backup_id":"b1"}}'
+```
+```json
+{"step":0,"status":"succeeded"}
+```
 
 ```json
 { "status": "succeeded", "result": {"order_id": "ord_1"} }
 { "status": "failed", "error": "…" }
 { "status": "uncertain", "error": "timeout" }
 ```
+
 `result` is used only to build the compensation arguments named in the manifest. It is hashed, not stored in the ledger.
+Reporting an outcome twice is a 409.
 
 ## `GET /v1/runs`, `GET /v1/runs/{id}`
 
-Run state, including `unresolved` step numbers.
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" http://127.0.0.1:7421/v1/runs
+curl -s -H "Authorization: Bearer $AUDIT_KEY" http://127.0.0.1:7421/v1/runs/demo-1
+```
+```json
+{"runs":["demo-1"]}
+```
+
+The run: `run_id`, `actor`, `mode`, `scope` (permissions and seal), `created_ms`, `steps[]` (tool, reason, effect, status,
+dependencies, compensation tool, handle, error, manifest version, risk score), and `unresolved`, the step numbers whose outcome
+is unknown. For a list with filters use [search](/api-reference/operator).

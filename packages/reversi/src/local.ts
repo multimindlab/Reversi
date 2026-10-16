@@ -7,6 +7,7 @@ import { join, extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { JsonlLedgerStore, Ledger } from "./ledger.js";
 import { ManifestError, Registry } from "./manifest.js";
+import { ManifestRegistry } from "./registry.js";
 import { Reversi, type Approver } from "./engine.js";
 import { FileRunStore } from "./store.js";
 
@@ -24,6 +25,7 @@ function filesIn(path: string): string[] {
 /** Load manifests from a file or a directory of `.json`/`.yaml`/`.yml` files. Each file holds one manifest or an array. */
 export function loadRegistry(path: string): Registry {
   if (!existsSync(path)) throw new ManifestError([`manifest path not found: ${path}`]);
+  if (statSync(path).isDirectory() && ManifestRegistry.isRegistry(path)) return new ManifestRegistry(path).load(); // a versioned registry: its current versions
   const reg = new Registry();
   const errors: string[] = [];
   for (const file of filesIn(path)) {

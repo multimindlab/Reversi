@@ -1,0 +1,228 @@
+---
+title: GitOps
+description: Keep manifests and policy in git, check them in CI, and make a registry match with `reversi apply`. The project file, hot reload, and why there is no Terraform provider.
+---
+
+Reversi's configuration is files. Keep them in git, review changes in pull requests, test them in CI, and apply the merged
+result with one command. This page covers the project file, the versioned folders, `reversi apply`, hot reload and a CI example.
+
+<Note>
+There is **no Terraform provider and no Kubernetes operator**. Neither is built. `reversi apply` (below) plus the
+[Helm chart](/operations/deployment) is the alternative: a directory in git is the desired state, `apply` publishes only the
+differences, and `--dry-run --detailed-exitcode` is the drift check.
+</Note>
+
+## The project file: `reversi.config.yaml`
+
+The CLI, the server and the gateway all read it. It is found in the current folder or any parent (or `REVERSI_CONFIG`, or
+`--config`). Every key is optional. `reversi init` writes a starter, and `reversi show-config` prints what was found.
+
+```yaml reversi.config.yaml
+manifests: ./manifests            # a folder of YAML/JSON, a registry folder, or an https URL of a served registry
+policy: ./policy.yaml             # a file, or a policy versions folder
+data:
+  dir: ./reversi-data
+  store: sqlite                   # files | sqlite | postgres
+  database_url: ${DATABASE_URL}   # only for postgres
+environment: dev                  # matched by policy rules
+kill_switch_file: ./KILL          # while this file exists, new calls are blocked
+approval:
+  ttl: 24h                        # lifetime of an approval request
+  webhook: ${APPROVAL_WEBHOOK}
+  console_url: https://reversi.example.com
+signing_key: ./sign.key           # Ed25519 private key for signed evidence
+manifest_public_key: ./sign.pub   # manifests must be signed by this key
+capture: { enabled: true, ttl: 7d, redact_pii: true }
+console: { mode: off }            # off | open | login; open takes role
+reload: { watch: true, interval: 2s }
+```
+
+The rest of the keys are described on their own pages: `notifications` (channels and routes,
+[notifications](/operations/notifications)), `otel` (`endpoint`, `headers`, `service_name`, [monitoring](/operations/monitoring)),
+`anchor` (`sinks` of `{type: file, path}` or `{type: webhook, url, secret}`, plus `interval`, [evidence](/concepts/evidence)),
+`egress` (`allow`, `block_private`, `allow_metadata`, `region`) and `alerts` (`interval`, `remind`, `denial_spike`).
+
+| Key | Meaning |
+|---|---|
+| `manifests`, `policy` | Where they live. A folder created by `reversi manifests publish` / `reversi policy publish` is a **registry** / **policy versions** folder (see below) |
+| `data.dir`, `data.store`, `data.database_url` | [Storage](/operations/storage) |
+| `environment` | Name matched by policy rules (`dev`, `staging`, `prod`) |
+| `kill_switch_file` | Path of the kill-switch file |
+| `approval.ttl`, `approval.webhook`, `approval.console_url` | Request lifetime, notification webhook, public URL linked from notifications |
+| `signing_key`, `manifest_public_key` | Evidence signing key; the key every manifest version must be signed with (loading fails if `manifests` is not a signed registry) |
+| `capture.enabled`, `capture.ttl`, `capture.redact_pii` | Keep redacted call arguments for [simulation and replay](/concepts/simulation). Off by default |
+| `notifications`, `otel`, `anchor`, `egress`, `alerts` | See the pages above |
+| `console.mode`, `console.role` | The [console](/console). `role` is `auditor`, `approver` or `operator`; never `admin` |
+| `reload.watch`, `reload.interval` | Hot reload (below). Default on, every 2 s |
+| `log.level`, `log.format` | Engine messages (reloads, failed notifications, anchors, traces). `level` is `debug`, `info`, `warn` or `error`; `format` is `json` (redacted JSON lines on stderr) or `pretty` (`reversi [warn] message`). The per-request lines of `REVERSI_LOG=json` are separate |
+
+- Relative paths resolve against the folder holding the file. `http(s)` URLs and absolute paths are kept.
+- `${NAME}` is replaced from the environment, and `${NAME:-default}` falls back. An unset variable without a default is an error, so secrets stay out of git.
+- Durations: `30s`, `15m`, `2h`, `7d`.
+- An unknown key is an error naming it. All problems are listed together.
+
+**Precedence:** command-line flags, then environment variables, then the file.
+
+| Environment variable | Overrides |
+|---|---|
+| `REVERSI_MANIFESTS`, `REVERSI_POLICY`, `REVERSI_ENV` | `manifests`, `policy`, `environment` |
+| `REVERSI_DATA`, `REVERSI_STORE`, `REVERSI_DATABASE_URL` | `data.*` |
+| `REVERSI_KILL_FILE`, `REVERSI_SIGNING_KEY`, `REVERSI_MANIFEST_PUBLIC_KEY` | `kill_switch_file`, `signing_key`, `manifest_public_key` |
+| `REVERSI_APPROVAL_WEBHOOK`, `REVERSI_CONSOLE_URL` | `approval.webhook`, `approval.console_url` |
+| `REVERSI_CAPTURE` (`1` or `on`), `REVERSI_CAPTURE_TTL_DAYS` | `capture` |
+| `REVERSI_OTLP_ENDPOINT` | `otel.endpoint` |
+| `REVERSI_EGRESS_ALLOW` (comma list), `REVERSI_EGRESS_BLOCK_PRIVATE=1`, `REVERSI_REGION` | `egress` |
+| `REVERSI_CONSOLE`, `REVERSI_CONSOLE_ROLE` (server) | `console` |
+
+## Registry and policy versions
+
+A plain folder of manifest YAML is fine for a start. For review, history and editing, publish into a **registry folder**: every
+change is a new numbered version with author, note, checksum, status (`draft`, `approved`, `deprecated`) and optionally an Ed25519
+signature. A **policy versions folder** does the same for the policy, with one active version.
+
+```bash
+reversi manifests publish ./manifests --status approved --registry ./registry --key sign.key
+reversi policy publish ./policy.yaml --dir ./policy-versions
+```
+
+```yaml reversi.config.yaml
+manifests: ./registry
+policy: ./policy-versions
+```
+
+- A folder counts as a registry once it holds `index.json`, and as policy versions once it holds `policy-index.json`. Both appear on the first publish. The server and gateway treat an empty folder as an editable registry or policy folder, so the first publish turns it into one.
+- The server, gateway and console only offer editing when those folders are in use. With plain files they are read-only.
+- Draft manifests are not enforceable, and a registry that holds only a draft of a tool simply has no manifest for it, so a call reports "no manifest" rather than "is a draft". Approving one writes a new, signed version; with `--four-eyes` the author cannot approve their own.
+- `reversi manifests verify --trust sign.pub` recomputes every checksum and checks every signature.
+- Deprecating keeps a tool working and rolling back but flags new calls.
+- `reversi validate`, `lint`, `test`, `doctor` and `plan` read a registry folder as well as a folder of files (for a registry, the current non-draft version of each tool).
+
+## `reversi apply`
+
+`apply` makes a registry (and policy folder) match a directory.
+
+```text
+state/
+  manifests/
+    orders.yaml          one manifest, or a list of manifests, per file
+    payments.yaml
+  policy.yaml            optional
+```
+
+If `state/manifests/` does not exist, the manifest files are read from `state/` itself. YAML and JSON both work. Every manifest
+is validated first and a bad one aborts before anything changes; the same tool twice is an error.
+
+```text
+$ reversi apply state --dry-run --detailed-exitcode; echo "exit $?"
++ manifest notes.read
++ manifest notes.write
++ manifest notes.restore
++ policy   policy
+4 changes (dry run: nothing applied)
+exit 2
+
+$ reversi apply state --key ci-key.key --note "from git" --by ci
+~ manifest notes.read  (was deprecated at v2)
+...
+applied notes.read v3 (approved)
+applied policy v1
+```
+
+| Symbol | Meaning |
+|---|---|
+| `+` | New tool or first policy |
+| `~` | Content differs (version and status are ignored when comparing, and both sides are normalized so defaults are not differences), or the tool was deprecated and is in the directory again |
+| `-` | With `--prune`: the tool is not in the directory and gets deprecated |
+| (blank) | Unchanged |
+
+- **Idempotent.** A second run prints `up to date` and changes nothing.
+- **Nothing is deleted.** `--prune` deprecates; the old versions stay in the registry.
+- **Status.** New versions are `approved` by default, on the basis that the directory is the reviewed source of truth. `--status draft` publishes drafts for a person to approve in the console or with `reversi manifests approve`.
+- **Signing.** `--key` signs each new manifest version. Policy versions are not signed.
+- **Not atomic.** Manifests are applied before the policy. If the policy step fails (for example the policy folder does not exist), the manifests are already applied; fix the cause and run again.
+- **`--detailed-exitcode`** exits 2 when there are changes, and only together with `--dry-run`. Without it a dry run exits 0.
+
+### Local or server
+
+| | Local | `--server <url> --token <key>` |
+|---|---|---|
+| Target | `--registry <dir>` and `--policy-dir <dir>`, or `manifests:` and `policy:` in the project file | A running server's `/v1/registry` API |
+| Credential | none (file access) | Admin API key to apply; an operator key is enough to dry-run. `--token` or `REVERSI_TOKEN` |
+| Running servers | Notice the change by file watch or on `SIGHUP` | The server writes the files and reloads itself |
+| Precondition | The registry folder is empty or already a registry. The policy folder must already exist | The server was started with `manifests:` pointing at a registry folder or an existing empty folder (and `policy:` at a policy versions folder or an empty one) |
+
+A server whose `manifests:` points to plain files refuses `apply --server` with `no manifest registry folder is configured`:
+start the server on an empty folder (the first `apply --server` turns it into a registry), or bootstrap with `reversi manifests publish` or a local `reversi apply`.
+Both modes were exercised by hand and by the `apply` tests; the server routes are in the [admin API](/api-reference/admin).
+
+## Hot reload
+
+The server and the gateway re-read manifests, the policy and the manifest public key while running. A configuration that
+fails to load is rejected and the previous one keeps serving. A successful change writes a `reloaded` record to the ledger.
+
+- **File watch**: on by default, polling every 2 s. Turn off or change with `reload: { watch: false }` or `reload: { interval: 10s }`.
+- **`SIGHUP`**: `kill -HUP <pid>`.
+- **On demand**: `POST /v1/reload` (admin) on the server, `reversi.reload` (admin) on the gateway's operator endpoint.
+- Publishing from the console, `apply --server` and the registry endpoints reload as part of the request. If the new configuration does not load, the request answers 409 `saved, but the new configuration did not load: ...`.
+
+API key files reload separately (`SIGHUP` or a change to the file). The gateway's own config file and `reversi.config.yaml` keys other than manifests and policy are read at start.
+
+## CI example
+
+Lint and test on every pull request; apply on merge; check for drift on a schedule. The commands are the ones run locally for
+this page; the workflow file itself has not been run on GitHub.
+
+```yaml .github/workflows/reversi.yml
+name: reversi
+on:
+  pull_request:
+  push: { branches: [main] }
+  schedule: [{ cron: "0 6 * * *" }]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install -g @multimindlab/reversi-cli
+      - run: reversi lint --strict state/manifests
+      - run: reversi test -m state/manifests --policy state/policy.yaml tests/manifests.test.yaml
+      - name: Would this change anything?
+        if: github.event_name == 'pull_request'
+        run: reversi apply state --server "$REVERSI_URL" --dry-run --detailed-exitcode || [ $? -eq 2 ]
+        env:
+          REVERSI_URL: ${{ vars.REVERSI_URL }}
+          REVERSI_TOKEN: ${{ secrets.REVERSI_OPERATOR_KEY }}
+      - name: Drift check
+        if: github.event_name == 'schedule'
+        run: reversi apply state --server "$REVERSI_URL" --prune --dry-run --detailed-exitcode
+        env:
+          REVERSI_URL: ${{ vars.REVERSI_URL }}
+          REVERSI_TOKEN: ${{ secrets.REVERSI_OPERATOR_KEY }}
+
+  apply:
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install -g @multimindlab/reversi-cli
+      - run: reversi apply state --server "$REVERSI_URL" --prune --note "git ${{ github.sha }}"
+        env:
+          REVERSI_URL: ${{ vars.REVERSI_URL }}
+          REVERSI_TOKEN: ${{ secrets.REVERSI_ADMIN_KEY }}
+```
+
+- `lint --strict` and `test` exit 1 on warnings or failures, which fails the job.
+- The pull-request step prints the pending changes and passes on exit 2; the scheduled step fails on exit 2, which is drift (someone changed the registry by hand).
+- Use a dedicated admin key for the apply job and keep it in the CI secret store. Keys are managed in the [console](/console) or [authentication](/operations/authentication).
+- The server must be reachable from the runner. Reaching a private server from GitHub-hosted runners needs a self-hosted runner or a tunnel, which is outside Reversi.
+
+## What is not built
+
+- A Terraform provider and a Kubernetes operator (custom resources reconciled in-cluster). Use `reversi apply` from CI.
+- Applying is a push. There is no agent in the cluster that pulls from git.

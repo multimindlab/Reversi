@@ -108,7 +108,10 @@ export function makeContext(program: Command, io: IO): Ctx {
         manifest_public_key: process.env.REVERSI_MANIFEST_PUBLIC_KEY ?? p?.manifest_public_key,
         signing_key: process.env.REVERSI_SIGNING_KEY ?? p?.signing_key,
         egress: p?.egress,
-        capture: p?.capture,
+        anchor: p?.anchor,
+        notifications: p?.notifications,
+        alerts: p?.alerts,
+        capture: process.env.REVERSI_CAPTURE === "1" || process.env.REVERSI_CAPTURE === "on" ? { enabled: true, ttl_ms: process.env.REVERSI_CAPTURE_TTL_DAYS ? Number(process.env.REVERSI_CAPTURE_TTL_DAYS) * 86_400_000 : p?.capture?.ttl_ms, redact_pii: p?.capture?.redact_pii } : p?.capture,
         ...extra,
       };
     },

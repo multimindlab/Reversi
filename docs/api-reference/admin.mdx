@@ -1,35 +1,197 @@
 ---
 title: Approvals, evidence and admin endpoints
-description: Decide approvals, download signed bundles, check status, flip the kill switch.
+description: Decide approvals, download signed bundles, flip kill switches, manage manifests, policy, keys, holds and retention.
 ---
+
+Examples use `$AUDIT_KEY`, `$APPROVER_KEY`, `$OPS_KEY` and `$ADMIN_KEY` for credentials of that role.
 
 ## Approvals
 
 ### `GET /v1/approvals?status=&run_id=` (auditor+)
-`{"approvals":[{"id","run_id","step","kind","tool","reason","triggers":[…],"arg_keys":[…],"args_hash","status","requested_ms","expires_ms","decided_by","decided_ms","decision_note"}]}`.
-`status`: `pending`, `approved`, `denied`, `consumed`, `expired`. Only argument **names** are stored.
+
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" 'http://127.0.0.1:7421/v1/approvals?status=pending'
+```
+```json
+{"approvals":[{"id":"apr_5f0b3a2e-…","run_id":"demo-2","step":null,"kind":"call","tool":"notes.purge_all","reason":"cleanup",
+ "triggers":["policy `no-destructive-names`: destructive name","manifest requires approval"],"arg_keys":["older_than"],
+ "args_hash":"0271c5d0…","status":"pending","requested_ms":1792171988196,"expires_ms":1792175588196,"decided_by":null,
+ "decided_ms":null,"decision_note":null,"requested_by":"agent1","required_roles":[],"quorum":1,"decision_count":0,
+ "decisions":[],"on_timeout":"deny","escalate_to":[],"escalated":false,"ttl_ms":3600000}]}
+```
+
+`status`: `pending`, `approved`, `denied`, `consumed`, `expired`. Only argument **names** are stored. `required_roles` (roles or
+groups that may decide; empty means any approver), `quorum`, `decisions`, `on_timeout` and `escalated` come from the manifest
+and policy ([approvals](/concepts/approvals)). A decided request also has `break_glass` when overridden that way.
 
 ### `POST /v1/approvals/{id}/approve` and `/deny` (approver+)
-Optional body `{"note":"…"}`. Returns the updated record. 409 if it is no longer pending, 404 if unknown.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $APPROVER_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/approvals/$ID/approve -d '{"note":"checked with the owner"}'
+```
+
+Optional body `{"note":"…"}`. Returns the updated record (with quorum, status stays `pending` until enough distinct approvers
+agree). Errors: 404 unknown; 403 you are not among the required roles or groups, the request was made by your own run, or you already voted; 409 no longer
+pending (`approval … is approved, not pending`). The caller's roles and groups are taken from the credential.
+
+### `POST /v1/approvals/{id}/break-glass` (admin)
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/approvals/$ID/break-glass \
+  -d '{"reason":"prod incident 42, owner unreachable","evidence":"INC-42"}'
+```
+
+Emergency override of a pending request. `reason` needs at least 10 characters (400 otherwise) and `evidence` a ticket or
+incident reference. The record becomes `approved` with `break_glass: {by, reason, evidence, ms}` and the console shows a break-glass badge on it.
+
+### Delegations
+
+`GET /v1/delegations` (auditor+), `POST /v1/delegations` (approver+), `DELETE /v1/delegations/{id}` (the delegator or an admin).
+Body of the POST: `{"to":"bob","hours":24,"reason":"on leave","groups":["finance"]}`; `from` defaults to you and only an admin may
+set another. → 201 with the delegation.
+
+`reversi-server` serves these routes. The same delegations are visible in the [console](/console) (Approvals page) and `reversi delegate`.
 
 ## Evidence
 
 ### `GET /v1/runs/{id}/bundle` and `GET /v1/ledger/bundle` (auditor+)
+
 A signed [evidence bundle](/concepts/evidence). 404 unless the server has `REVERSI_SIGNING_KEY`.
 
+```bash
+curl -s -H "Authorization: Bearer $AUDIT_KEY" http://127.0.0.1:7421/v1/runs/demo-1/bundle > bundle.json
+reversi verify-bundle bundle.json
+```
+
 ### `GET /v1/evidence/key` (auditor+)
-`{"alg":"ed25519","key_id":"…","public_key_pem":"…"}`.
+
+```json
+{"alg":"ed25519","key_id":"a1533ad58f5fb547","public_key_pem":"-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----\n"}
+```
+
+### `GET /v1/ledger/verify` (auditor+)
+
+`{"ok":true,"records":3,"head":"e3c2c625…"}` or `{"ok":false,"seq":7,"error":"…"}`.
 
 ## Status and kill switch
 
 ### `GET /v1/status` (auditor+)
-`{"halted": null | "reason","environment","runs","pending_approvals"}`.
+
+```json
+{"halted":null,"environment":"default","runs":1,"pending_approvals":0}
+```
 
 ### `POST /v1/halt` (admin)
-`{"reason":"incident 42"}`. Every new call is blocked until resumed; rollbacks still work. The caller's name is appended to the reason.
 
-### `POST /v1/resume` (admin)
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/halt -d '{"reason":"incident 42","tool":"notes.*"}'
+```
+```json
+{"halted":null,"halt":{"id":"halt_f3c9bd6f-…","reason":"incident 42 (by root)","scope":{"tool":"notes.*"},"by":"root","ts_ms":1792171503842}}
+```
+
+`reason` is required. Optional `tool`, `actor`, `tenant` and `environment` (globs) narrow the scope; with none, every new call is
+blocked. `halted` in the answer is the global halt message (null for a scoped halt). Rollbacks still work. The caller's name is
+appended to the reason.
+
+### `GET /v1/halts` (auditor+) and `POST /v1/resume` (admin)
+
+`GET` → `{"halts":[…]}`. `POST /v1/resume` with `{"id":"halt_…"}` lifts one; with no body it lifts all → `{"halted":null,"lifted":1}`.
+
+## Legal holds, retention, anchors
+
+| Route | Role | Notes |
+|---|---|---|
+| `GET /v1/holds?all=1` | auditor | `{"holds":[{id, scope, reason, by, ts_ms}]}`; `all=1` includes released |
+| `POST /v1/holds` | admin | `{"run_id"?, "tenant"?, "actor"?, "tool"?, "reason"}` at least one scope field; 201 |
+| `DELETE /v1/holds/{id}` | admin | Release. 404 if not active |
+| `GET /v1/retention/plan` | auditor | `{"config":{…},"runs":[…]}`, which runs are due and which are held. 404 without a `retention:` section in the policy |
+| `POST /v1/retention/apply` | admin | `{"dry_run"?: true, "archive_dir"?: "…"}`. Deletes run state, approvals and captures past retention; never the ledger |
+| `POST /v1/anchor` | admin | Write the ledger head to the configured sinks → `{"anchor","delivered","errors"}`; 404 with no sinks, 502 if a sink failed |
+
+See [retention](/operations/retention) and [evidence](/concepts/evidence).
+
+## Manifest and policy registry
+
+These are the routes `reversi apply --server` uses. They need a server started on a registry folder (and a policy versions
+folder for the policy routes), else 404 `no manifest registry folder is configured on this server`. See [GitOps](/operations/gitops).
+
+### `GET /v1/registry` (operator+)
+
+```json
+{"manifests":[{"tool":"notes.read","version":3,"status":"approved","checksum":"289e5d91…","manifest":{…}}],
+ "policy":{"version":1,"checksum":"263fab7a…","history":[…]}}
+```
+
+`policy` is null without a policy versions folder.
+
+### `POST /v1/registry/manifests`
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/registry/manifests \
+  -d '{"manifest":{"tool":"notes.purge_all","effect":"irreversible","permission":"notes:write"},"status":"approved"}'
+```
+```json
+{"tool":"notes.purge_all","version":1,"checksum":"d8f3d60c…"}
+```
+
+`status` `"draft"` needs **operator**; anything else publishes as `approved` and needs **admin**, then reloads the running
+configuration. 400 for an invalid manifest (the message lists the problems). Optional `note`. New versions are signed if the
+server has a signing key.
+
+### `POST /v1/registry/manifests/{tool}/approve` and `/deprecate` (admin)
+
+`approve` body `{"version"?: n, "four_eyes"?: true}` promotes a draft (the latest by default) to a new approved version; with
+`four_eyes` the author cannot be the approver. `deprecate` body `{"replaced_by"?: "tool"}`. Both → `{"tool","version"}` and reload.
+
+### `POST /v1/registry/policy` and `POST /v1/registry/policy/{version}/activate` (admin)
+
+`{"text":"<policy YAML>","note":"…","activate":true}` validates and stores a new version (activating it unless `activate` is
+false) → 201 with the version record. `activate` makes an older version current, which is how you roll back → `{"active":1}`.
+If the saved configuration fails to load the answer is 409 `saved, but the new configuration did not load: …` and the previous
+one stays active.
+
+### `POST /v1/reload` (admin)
+
+Re-read manifests and policy now.
+
+```json
+{"changed":false,"tools":3,"policy_checksum":"b9927db4…"}
+```
+
+`error` is present, with `changed: false`, if the new configuration was rejected.
+
+## API keys
+
+Need `REVERSI_KEYS` to point at a writable file (404 otherwise). Admin only.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  http://127.0.0.1:7421/v1/keys -d '{"name":"tmp","role":"auditor","expires_in_days":1}'
+```
+```json
+{"name":"tmp","roles":["auditor"],"key":"rv_9a8f0653…","note":"this is the only time the key is shown"}
+```
+
+- `GET /v1/keys` lists keys by `index` with name, roles, groups, tenant, expiry, `disabled`, `allow_observe`, `max_permissions` and a 12-character `fingerprint` (never the key).
+- `POST /v1/keys` body: `name`, `role` or `roles`, optional `groups`, `tenant`, `max_permissions`, `expires_in_days`. Only the SHA-256 is stored.
+- `PATCH /v1/keys/{index}` with `{"disabled": true}` and/or `{"expires_at": "<ISO date>" | null}`.
+- `DELETE /v1/keys/{index}`.
+
+Changes take effect immediately.
+
+## Slack callback
+
+`POST /integrations/slack/actions` approves or denies from the buttons on a Slack notification, verifying Slack's signature and
+a 5-minute timestamp window. `reversi-server` enables it when `REVERSI_SLACK_SIGNING_SECRET` and `REVERSI_SLACK_USERS` (a JSON file mapping Slack user ids to
+names, roles and groups) are set, and otherwise answers `404 Slack approvals are not enabled`. A mapped user needs the
+`approver` role or higher to decide ([authentication](/operations/authentication#slack-approvals-user-mapping)).
 
 ## Operational
 
-`GET /healthz`, `GET /readyz`, `GET /metrics`: see [monitoring](/operations/monitoring).
+`GET /healthz` → `{"ok":true}`. `GET /readyz` → `{"ok":true,"ledger_head":"…","halted":null}`, 503 if the store cannot be read.
+`GET /metrics` (auditor, or open with `REVERSI_METRICS_PUBLIC=1`): see [monitoring](/operations/monitoring).

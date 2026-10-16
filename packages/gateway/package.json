@@ -28,8 +28,10 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@multimindlab/reversi": "0.1.0",
+    "@multimindlab/reversi-server": "0.1.0",
     "yaml": "^2.8.0"
   }
 }

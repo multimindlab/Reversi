@@ -1,28 +1,138 @@
 ---
 title: Operator console
-description: See what an agent changed, decide approvals, plan rollbacks and download evidence in a browser.
+description: See what an agent changed, decide approvals, run rollbacks, edit manifests and policy, and download evidence in a browser.
 ---
 
-The server serves a console at `/console`: server-rendered pages, no client-side JavaScript. Sign in with an API key or OIDC
-access token that has a console role (`auditor`, `approver`, `operator` or `admin`). Agent credentials are refused.
+The console is a set of server-rendered pages at `/console`, with no client-side JavaScript. The server, the gateway (on its
+own port) and `reversi console` can all serve it.
+
+## Modes
+
+The console is **off by default** and serves nothing until you choose a mode.
+
+| Mode | Login | Who may use it | Turn on with |
+|---|---|---|---|
+| `off` (default) | none | Nobody. `/console` answers 404 with a hint | nothing |
+| `open` | none | Your own browser on this machine. Fixed role (default `operator`, or `auditor` / `approver`), **never admin** | `REVERSI_CONSOLE=open`, `reversi console`, gateway `--console open` |
+| `login` | paste an API key or an OIDC access token | Anyone with an `auditor`, `approver`, `operator` or `admin` credential. Agent credentials are refused | `REVERSI_CONSOLE=login`, gateway `--console login` |
+
+```bash
+reversi console                                   # open mode on http://localhost:7421/console as operator
+reversi console --role auditor --port 7500        # read-only
+REVERSI_CONSOLE=login REVERSI_KEYS=./keys.json node packages/server/dist/main.js
+```
+
+The same setting can live in `reversi.config.yaml` (`console: { mode: login }`; for `open`, `role:`), and for the server
+`REVERSI_CONSOLE_ROLE=auditor|approver|operator` picks the open-mode role.
+
+**Open mode is for a laptop.** It has no login, so it is fenced:
+
+- Only requests whose `Host` is `localhost`, `127.0.0.1` or `::1` are answered, any `Origin` must equal the host, and `Sec-Fetch-Site` must be `same-origin` or `none`. Anything else gets a 403 page (tests cover foreign hosts and origins).
+- The server and the gateway **refuse to start** in open mode if they listen on a non-loopback address (`HOST` for the server, `listen.host` for the gateway; the Docker image sets `HOST=0.0.0.0`, so use `login` there). They also refuse the `admin` role.
+- It is labelled "open console, no login" in the header.
+
+**Login mode** takes an API key or OIDC *access token* pasted into a form. There is no browser redirect to an identity
+provider (OIDC redirect login is not built). The session is a signed cookie, re-checked against the key ring on every
+request, so disabling or demoting a key ends the session at once. An OIDC session never outlives its token.
+
+## Pages
 
 | Page | For |
 |---|---|
-| **Runs** | Filter by actor; "needs attention" shows runs with unresolved, failed-compensation or unrecoverable steps |
-| **Run detail** | Steps and statuses, the rollback plan as a dry run, the full event trail, pending approvals, the auditor report, a signed bundle, and a **Resolve** form for unknown outcomes (operator) |
-| **Approvals** | Pending queue with approve and deny forms, and recent decisions. Shows why approval is needed and the argument names, never values |
-| **Tools** | Every manifest with effect, permission, approval and compensation, plus tools called without a manifest |
-| **Evidence** | Ledger verification, signed whole-ledger bundle, and the kill switch (admin) |
+| **Runs** | Filter by actor, tenant, tool; "needs attention" shows runs with unresolved, failed-compensation or unrecoverable steps. Link to compare two runs |
+| **Run detail** | Steps and statuses with risk scores, the rollback plan (dry run), the full event trail, pending approvals, verification of the undo, report and bundle links, and the actions below |
+| **Approvals** | Pending queue and recent decisions, with approve, deny, break-glass and delegation |
+| **Alerts** | Live list of what needs attention: severity, what, since when, which run |
+| **Manifests** | Enforced manifests with version, owner, data class, undo and lint findings; a manifest editor |
+| **Policy** | The active policy, its own tests, a rule builder, an editor with simulation, and versions |
+| **Impact** | Preview a call to a tool: decision now, risk score, approvers, rollback outlook |
+| **Tools** | Inventory: manifests, tools the upstream offers now, use counts, which are unclassified |
+| **Connectors** | Each upstream: kind, health, tools, how many have manifests. Filled by the gateway |
+| **Compare** | Two runs side by side |
+| **Evidence** | Ledger verification, signed whole-ledger bundle, kill switches |
+| **Settings** | Roles, API keys, legal holds, retention, notification channels, integrations |
 
-The console shows the rollback plan but never **executes** compensations: it has no connection to the systems they act on. Run
-`reversi rollback`, the operator API, or `reversi.execute_rollback` on the gateway.
+### Run detail
+
+- **Auditor report** (HTML and PDF) and a **signed evidence bundle** (needs a signing key). **Replay with a change** appears when capture is on: change one argument and see which decisions would differ, in a sandbox that executes nothing.
+- **Resolve** (operator): for a step stuck at `intended` or `uncertain`, choose `succeeded` or `failed` and write how you checked. Recorded with your name.
+- **Rollback plan**: each action, the compensation tool, whether it needs approval, residue, and whether the undo is read back.
+- **Run the rollback / Retry the rollback** (operator): shown when a compensator is configured. It runs in the background, the page refreshes every 2 s, and the result lists compensated, failed and unverified steps. The checkbox "also approve compensations that need approval" works only if you hold the approver role too. Without a compensator the page says how to run it elsewhere.
+- **Escalate to on-call** (operator): shown when a compensation failed or a step is unrecoverable. Writes an `escalated` record and sends a critical notification.
+
+Where a compensator comes from:
+
+| Console served by | Executes rollbacks? |
+|---|---|
+| Server | Yes, if `REVERSI_COMPENSATOR_CMD` is set (a command that gets the call as JSON on stdin; exit 0 = undone). Declared read-backs run through `REVERSI_READER_CMD` (a command that gets `{"tool","arguments"}` as JSON on stdin and prints the result as JSON). Without it those steps stay `unverified` and the report says incomplete |
+| Gateway | Yes, always: compensations and read-backs are called on the upstream |
+| `reversi console` | No. It shows the plan; use `reversi rollback` |
+
+### Approvals
+
+Each row shows why approval is needed, the **who may decide** column (the required roles or groups, "any approver", the quorum
+progress such as `1/2`, an `escalated` badge) and argument **names** only, never values. Approve and deny take a note.
+A requester cannot approve their own request, and the server applies the same role, group and quorum rules as the API.
+**Break-glass** (admin) overrides a pending request with a reason of at least 10 characters and an evidence reference such as
+a ticket; it is marked `break-glass` on the approvals page and in the decision note. **Delegation** hands your approval authority to someone for 1 to 2160 hours;
+the delegate decides as themselves on your behalf. It appears only when the engine services are present.
+
+### Manifests
+
+Needs a **registry folder** (created by `reversi manifests publish`, or by `reversi apply`) as the `manifests:` setting. With
+plain YAML files the console shows manifests but they are **read-only**, and the page says so. With a registry:
+
+| Action | Role |
+|---|---|
+| New manifest (form builder or YAML), validate, see the diff against the current version | operator |
+| Save as **draft** (not enforced) | operator |
+| Draft from MCP tools (paste a `tools/list`, or the connected upstream's tools are prefilled) | operator |
+| Run contract tests (the `reversi test` format) | any console role |
+| **Publish as approved**, **approve** a draft (optionally "the author may not approve it"), **deprecate**, **restore** an older version | admin |
+
+Every save is a new version; history shows the author, approver and signature. An approve or restore reloads the running
+configuration, and if the new configuration does not load the page says so and the previous one stays active. Drafts from
+MCP tools come with a confidence level and notes; annotations are the server's claims and only ever produce drafts.
+
+A manifest's `approval:` object (roles, quorum, timeout, `escalate_to`) is kept as written by save, approve, deprecate and restore.
+
+### Policy
+
+Needs a **policy versions folder** (`reversi policy publish`) as the `policy:` setting; a single policy file is shown
+read-only. The rule builder (tool, effect, environment, tenant, data class, one argument condition, approver groups, quorum)
+adds a rule to the editor. Any console role can validate (runs the policy's own tests, shows a diff against the active
+version) and **simulate** against the last 7 days of captured calls (needs capture on): newly blocked, newly needing
+approval, newly allowed. **Publish and activate**, publish without activating, and **activate** an older version (which is how
+you roll back) need admin. Versions list the author, tests passed and note, with diffs between neighbours.
+
+### Settings
+
+| Section | Notes |
+|---|---|
+| Roles | What each role may do |
+| Users and API keys | Needs the server started with `REVERSI_KEYS` pointing at a writable file. Admin can create (the key is shown once), disable, enable and remove. Not available in the gateway console or with OIDC-only sign in |
+| Legal holds | List; admin can place and release ([retention](/operations/retention)) |
+| Retention | Needs a `retention:` section in the policy. Admin can dry-run or apply |
+| Notification channels | Names; admin can send a test ([notifications](/operations/notifications)) |
+| Integrations | Slack approvals, OpenTelemetry, anchoring, evidence signing and egress status |
+
+### What needs which role
+
+| Role | Gets |
+|---|---|
+| `auditor` | Everything read-only, contract tests, policy validate and simulate, report and bundle downloads |
+| `approver` | Plus approve, deny, delegate |
+| `operator` | Plus resolve, run or retry a rollback, escalate, replay, draft and save manifests, import from MCP tools |
+| `admin` | Plus publish approved manifests, approve or deprecate or restore, publish or activate policy, kill switches, break-glass, keys, holds, retention, test notifications |
+
+Buttons the role cannot use are hidden and the POST is refused anyway.
 
 ## Security
 
 - The session cookie is signed (HMAC-SHA-256), `HttpOnly`, `SameSite=Strict`, scoped to `/console`, and `Secure` with
   `REVERSI_SECURE_COOKIES=1`. It lasts 8 hours and ends on restart unless you set `REVERSI_SESSION_SECRET`.
-- Every action is a POST with a per-session CSRF token.
-- All values are HTML-escaped and responses carry a strict `Content-Security-Policy` (`default-src 'none'`).
-- Roles are checked on every page; an auditor sees no approve buttons and the POST is refused anyway.
+- Every action is a POST with a per-session CSRF token. The login form body is capped at 16 KB.
+- All values are HTML-escaped and responses carry a strict `Content-Security-Policy` (`default-src 'none'`, `form-action 'self'`).
+- Roles are checked on every page.
 
 Terminate TLS in front of the server. Do not expose the console to the internet without a reverse proxy and network controls.

@@ -18,6 +18,7 @@ import { ContentChecker } from "./content.js";
 import { openData, type Data, type DataOptions } from "./data.js";
 import { Delegations } from "./delegations.js";
 import { guardedFetch, type EgressConfig } from "./egress.js";
+import { createLogger } from "./logger.js";
 import { Reversi } from "./engine.js";
 import type { SigningKey } from "./evidence.js";
 import { approvalNotification, attachNotifications } from "./hub.js";
@@ -169,7 +170,7 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
         onNotifyError,
       )
     : undefined;
-  const legacyWebhook = cfg.approval_webhook ? webhookNotifier({ url: cfg.approval_webhook, console_url: cfg.console_url, on_error: (e) => log("warn", `approval webhook failed: ${e.message}`) }) : undefined;
+  const legacyWebhook = cfg.approval_webhook ? webhookNotifier({ url: cfg.approval_webhook, console_url: cfg.console_url, fetch: guardedFetch(egress), on_error: (e) => log("warn", `approval webhook failed: ${e.message}`) }) : undefined;
 
   const delegations = new Delegations(data.kv);
   const approvals = new Approvals(data.approvals, {
@@ -325,6 +326,21 @@ export function engineConfigFromEnv(env: Record<string, string | undefined>, dat
     anchor: project?.anchor,
     egress: { ...(project?.egress ?? {}), ...(env.REVERSI_EGRESS_ALLOW ? { allow: env.REVERSI_EGRESS_ALLOW.split(",").map((s) => s.trim()).filter(Boolean) } : {}), ...(env.REVERSI_EGRESS_BLOCK_PRIVATE === "1" ? { block_private: true } : {}), ...(env.REVERSI_REGION ? { region: env.REVERSI_REGION } : {}) },
     alerts: project?.alerts,
+    log: logFrom(project?.log),
+  };
+}
+
+const LEVEL_RANK = { debug: 10, info: 20, warn: 30, error: 40 } as const;
+
+/** The `log:` section of the project file: a minimum level, and JSON lines (secrets redacted) instead of plain text. */
+function logFrom(cfg: ProjectConfig["log"]): EngineConfig["log"] {
+  if (!cfg) return undefined;
+  const min = LEVEL_RANK[cfg.level ?? "info"];
+  const json = cfg.format === "json" ? createLogger({ level: cfg.level ?? "info", write: (l) => process.stderr.write(l + "\n") }) : undefined;
+  return (level, msg) => {
+    if (LEVEL_RANK[level] < min) return;
+    if (json) json[level](msg);
+    else console.error(`reversi [${level}] ${msg}`);
   };
 }
 

@@ -7,6 +7,11 @@
     "light": "#6E9BFF",
     "dark": "#1F5FD6"
   },
+  "logo": {
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
+  },
+  "favicon": "/logo/favicon.png",
   "navigation": {
     "groups": [
       {
@@ -14,7 +19,10 @@
         "pages": [
           "index",
           "quickstart",
-          "testing"
+          "testing",
+          "testing/adoption",
+          "testing/governance",
+          "testing/operations"
         ]
       },
       {
@@ -25,6 +33,7 @@
           "concepts/ledger",
           "concepts/policy",
           "concepts/approvals",
+          "concepts/simulation",
           "concepts/content-checks",
           "concepts/evidence",
           "concepts/security-model"
@@ -47,9 +56,12 @@
         "group": "Operate",
         "pages": [
           "operations/deployment",
+          "operations/gitops",
           "operations/storage",
           "operations/authentication",
-          "operations/monitoring"
+          "operations/monitoring",
+          "operations/notifications",
+          "operations/retention"
         ]
       },
       {

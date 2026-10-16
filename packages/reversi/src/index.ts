@@ -7,6 +7,7 @@ export {
   Registry,
   REF_PATTERN,
   resolveRef,
+  authorForm,
   validateManifest,
   type BlastRadius,
   type Compensation,

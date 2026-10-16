@@ -36,6 +36,8 @@ import { registerGovernanceCommands } from "./commands/governance.js";
 import { registerManifestCommands } from "./commands/manifests.js";
 import { registerSimulationCommands } from "./commands/simulate.js";
 import { registerProjectCommands } from "./commands/project.js";
+import { registerApplyCommand } from "./commands/apply.js";
+import { registerServeCommands } from "./commands/serve.js";
 
 export type { IO } from "./context.js";
 export { Fail };
@@ -60,6 +62,32 @@ function runCompensator(cmd: string, call: CompensationCall, timeoutMs: number):
     });
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(call));
+  });
+}
+
+/** Run a read-back: the command gets {"tool","arguments"} on stdin and prints the tool's JSON result. */
+function runReader(cmd: string, tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, { shell: true, stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs });
+    let out = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      if (out.length < 1_000_000) out += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      if (stderr.length < 500) stderr += String(d);
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (code !== 0) return reject(new Error(`reader ${signal ? `killed by ${signal}` : `exited ${code}`}${stderr ? `: ${stderr.trim()}` : ""}`));
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        reject(new Error("reader did not print JSON"));
+      }
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ tool, arguments: args }));
   });
 }
 
@@ -139,6 +167,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
   dataOpts(program.command("rollback <run_id>").description("undo a run with an operator-supplied compensator command"))
     .requiredOption("--compensator-cmd <cmd>", "shell command; receives the compensation call as JSON on stdin; exit 0 = undone")
     .option("--verify-cmd <cmd>", "shell command run after each compensation with the same JSON; exit 0 = the undo is confirmed")
+    .option("--reader-cmd <cmd>", "shell command that runs a manifest's declared read-back: gets {tool, arguments} as JSON on stdin, prints the result as JSON. Without it, steps that declare a verification end up unverified")
     .option("--approve-compensations", "approve compensations that require approval (operator decision)")
     .option("--retries <n>", "attempts per compensation, with exponential backoff and the same idempotency key", "1")
     .option("--timeout-ms <n>", "per-compensation timeout", "30000")
@@ -159,6 +188,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
           actor: "cli",
           retry: { attempts },
           compensate: (c) => runCompensator(o.compensatorCmd, c, timeout),
+          verifier: o.readerCmd ? (tool, args) => runReader(o.readerCmd, tool, args, timeout) : undefined,
           verify: o.verifyCmd ? (c) => runCompensator(o.verifyCmd, c, timeout).then(() => true, () => false) : undefined,
         });
         if (o.json) io.out(JSON.stringify(report, null, 2));
@@ -167,6 +197,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
           io.out(`skipped (no undo needed): ${report.skipped.join(", ") || "-"}`);
           for (const f of report.failed) io.out(`FAILED step ${f.step}: ${f.error}`);
           if (report.unrecoverable.length) io.out(`cannot be undone: ${report.unrecoverable.join(", ")}`);
+          if (report.unverified.length) io.out(`undone but not verified (declared read-back not run; pass --reader-cmd): ${report.unverified.join(", ")}`);
           if (report.unresolved.length) io.out(`outcome unknown, reconcile manually (reversi resolve): ${report.unresolved.join(", ")}`);
           if (report.unmanifested.length) io.out(`no manifest: ${report.unmanifested.join(", ")}`);
           for (const d of report.deferred) io.out(`deferred step ${d.step}: waits for ${d.blocked_by.join(", ")}`);
@@ -215,16 +246,21 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
     }
   });
   for (const decision of ["approve", "deny"] as const) {
-    storeOpts(approvals.command(`${decision} <id>`).description(`${decision} a pending request`).option("--note <text>", "recorded with the decision").option("--as <name>", "who is deciding", "cli")).action(async (id: string, o) => {
+    storeOpts(approvals.command(`${decision} <id>`).description(`${decision} a pending request`).option("--note <text>", "recorded with the decision").option("--as <name>", "who is deciding", "cli").option("--groups <list>", "groups you decide as, comma separated (for approvals routed to groups)").option("--roles <list>", "roles you decide as (default operator)")).action(async (id: string, o) => {
       dataExists(o);
-      const d = await openData(dataOptionsOf(o));
-      try {
-          const a = new Approvals(d.approvals);
-        const r = decision === "approve" ? a.approve(id, o.as, o.note) : a.deny(id, o.as, o.note);
+      // Through the engine, so the decision is journaled, delegations apply, and notifications go out like any other decision.
+      const m = (() => {
+        try {
+          return ctx.manifestsPath(o);
+        } catch {
+          return undefined;
+        }
+      })();
+      await ctx.withEngine({ ...o, manifests: m ?? "-" }, (e) => {
+        const who = { roles: o.roles ? String(o.roles).split(",") : ["operator"], groups: o.groups ? String(o.groups).split(",").map((x: string) => x.trim()).filter(Boolean) : [] };
+        const r = decision === "approve" ? e.approvals.approve(id, o.as, o.note, who) : e.approvals.deny(id, o.as, o.note, who);
         io.out(`${r.id} ${r.status} by ${r.decided_by}`);
-      } finally {
-        d.close();
-      }
+      }, { manifests: m ?? "", allow_empty_manifests: !m });
     });
   }
 
@@ -353,6 +389,8 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
   registerInspectCommands(program, ctx);
   registerSimulationCommands(program, ctx);
   registerGovernanceCommands(program, ctx);
+  registerApplyCommand(program, ctx);
+  registerServeCommands(program, ctx);
 
   try {
     await program.parseAsync(argv, { from: "user" });

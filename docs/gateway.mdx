@@ -5,36 +5,162 @@ description: Journal, police, approve and roll back any MCP server's tool calls,
 
 `reversi-gateway` is an MCP server that fronts one or more upstream MCP servers. Point your MCP client (Claude Code,
 Cursor, VS Code, your own agent) at the gateway instead of the upstream. Every `tools/call` goes through the Reversi
-engine before it is forwarded.
+engine before it is forwarded. The same program runs as `reversi gateway ...`.
 
 ```bash
+# Day one: no manifests. Everything runs and is journaled; nothing is blocked.
+reversi-gateway --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+
+# Later: enforce with manifests and a policy.
 reversi-gateway --manifests ./manifests --policy ./policy.yaml \
-  --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server        # stdio, enforcing
-reversi-gateway --config gateway.yaml --manifests ./manifests              # anything more
+  --upstream-cmd npx --upstream-arg -y --upstream-arg my-mcp-server
+reversi-gateway --config gateway.yaml --manifests ./manifests      # anything more
 ```
+
+## Observe first
+
+You do not need manifests to start. With no manifests the gateway starts in **observe** mode unless you set a mode:
+
+```text
+reversi-gateway: no manifests yet, so starting in observe mode: everything runs and is journaled. Run `reversi suggest-manifest` to draft manifests for what the upstream offers.
+```
+
+- Manifests come from `--manifests`, `REVERSI_MANIFESTS`, `manifests:` in `reversi.config.yaml`, or `./manifests` if that folder exists.
+- An explicit `--mode` or `mode:` always wins. Without one: observe when no manifests loaded, `enforce` otherwise.
+- The mode is read at start. After you add manifests, restart to leave the automatic observe mode.
+
+On start the gateway lists the upstream's tools and prints a **classification banner** on stderr. Output from a real run
+against the filesystem connector with no manifests:
+
+```text
+Reversi gateway running in observe mode.
+
+WARN   fs.read_file - no manifest; treated as a change that could not be undone
+WARN   fs.write_file - no manifest; treated as a change that could not be undone
+...
+
+0 classified, 0 unclassified reads, 9 unclassified changes, 0 destructive without a manifest.
+
+9 tools have no manifest. They run (nothing is blocked) and are journaled as unclassified. Draft manifests with: reversi suggest-manifest.
+```
+
+| Line | Meaning |
+|---|---|
+| `OK` | A manifest covers the tool (effect and status shown) |
+| `NOTE` | No manifest, but the server's annotations say it is read-only. Unverified |
+| `WARN` | No manifest. Treated as a change that could not be undone |
+| `BLOCK` | No manifest and the server says it is destructive |
+
+The same data is available any time as the `reversi.classification` tool, and in the [console](/console) under Tools and
+Connectors. To turn the picture into manifests, run `reversi suggest-manifest --upstream-cmd ...` (or the
+`reversi.suggest_manifest` tool), review the drafts, then publish them ([manifests](/concepts/manifests),
+[GitOps](/operations/gitops)).
+
+## Modes
+
+| Mode | A call that breaks a rule |
+|---|---|
+| `enforce` | Blocked. The model gets the reason as an `isError` result |
+| `advise` | Runs. The result carries one extra text block: `Reversi advisory (nothing was blocked): <reasons>`. The record is journaled as `would_block` |
+| `observe` | Runs and is journaled as `would_block`. No text is added to the result |
+
+In `enforce` mode a tool with no manifest is blocked. `unclassified_reads: observe` relaxes that for one case only: a tool
+without a manifest whose server annotations say `readOnlyHint: true` runs, in a separate shadow observe run named
+`<run id>-reads`, journaled with the note "unclassified read: the server says it is read-only; this is unverified".
+Unclassified changes stay blocked. The default is `block`.
 
 ## What happens to a call
 
-1. **Manifest and scope.** A tool with no manifest, or whose permission is outside the session's scope, is blocked.
-2. **Policy, content checks, kill switch** apply ([policy](/concepts/policy), [content checks](/concepts/content-checks)).
+1. **Manifest and scope.** A tool with no manifest (in enforce mode), a draft manifest, or a permission outside the session's scope is blocked.
+2. **Schema checks** (below), then **policy, content checks, kill switch** ([policy](/concepts/policy), [content checks](/concepts/content-checks)).
 3. **Approval** if required: the call is blocked with the approval id, and the agent retries after an approver decides
    ([approvals](/concepts/approvals)).
 4. **Journal the intent** (write-ahead), **forward** to the upstream, **journal the outcome**. The upstream result is returned
    unchanged. An `isError` result is journaled as `failed`; a transport error or timeout as `uncertain`.
 
-A blocked call returns an MCP result with `isError: true` and the reason in the text, so the model can read it. Compensation
-arguments (`$result.*`) resolve from `structuredContent`, or from a single text block holding JSON.
+A blocked call returns an MCP result with `isError: true` and `Blocked by Reversi: <reasons>` in the text, so the model can
+read it. Compensation arguments (`$result.*`) resolve from `structuredContent`, or from a single text block holding JSON.
 
 MCP has no field for "why", and every ledger record needs one. Clients may send it in `_meta["reversi/reason"]`; otherwise the
 record says `MCP tools/call <tool>`.
 
-**One session is one run**, with the actor taken from the credential (or `actor` in the config when unauthenticated).
+**One session is one run**, with the actor taken from the credential (or `actor` in the config when unauthenticated). A client
+that reconnects can continue its run: over HTTP send `Reversi-Run-Id: <id>`, over stdio pass `--run-id <id>`. Only the
+principal that opened a run may continue it.
+
+## Schema validation
+
+With `validate_schemas: true` (the default) the gateway compares each call with the schemas the upstream publishes in `tools/list`.
+
+| What | Checked against | If it does not match |
+|---|---|---|
+| Arguments | the tool's `inputSchema` | A violation, like a policy breach: `arguments do not match the tool's input schema: ...` (first five problems). Blocked in `enforce`, `would_block` in `observe` and `advise` |
+| Result | the tool's `outputSchema`, when the result has `structuredContent` | The call has already happened, so it is journaled as `succeeded` with a note `result does not match the tool's output schema: ...`. The result is **not** used to build compensation arguments, so that step cannot be rolled back automatically |
+
+The checker covers `type`, `enum`, `const`, `required`, `properties`, `additionalProperties`, `items`, numeric and string
+bounds, `pattern`, `multipleOf`, `allOf`, `anyOf` and `oneOf`. It is a small checker, not a full JSON Schema validator:
+`$ref` and `if/then/else` are not followed.
+
+The MCP SDK's own client would throw away a result that breaks the output schema even though the call took effect. The
+gateway turns that client-side validation off on purpose and does the check itself, so a mismatch is recorded instead of
+losing the result.
+
+## MCP annotations are hints
+
+Servers may annotate tools (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). Reversi reads them for the
+banner and to seed **draft** manifests (`reversi suggest-manifest`, console import). They never grant anything: a draft
+manifest is not enforceable until a person approves it, and an annotation alone never makes a mutating tool pass in
+`enforce` mode (only `unclassified_reads: observe` lets a read-only claim through, and only as an unverified shadow run).
+
+### Schema drift
+
+A manifest drafted from an upstream tool carries `schema_hash`, a hash of the tool's input schema. If the upstream later
+changes that schema, calls are flagged with `the tool's input schema changed since its manifest was approved: review the
+manifest again`. That is a violation (blocked in `enforce`) until someone reviews the tool and publishes a manifest with the new hash.
+
+## Timeout and retry
+
+Set per tool in its manifest:
+
+```yaml
+- tool: crm.lookup
+  effect: read_only
+  permission: crm:read
+  timeout_ms: 10s
+  retry: { attempts: 3, base_ms: 200, max_ms: 5s }
+```
+
+- `timeout_ms`: the gateway stops waiting after this long and journals the step as `uncertain` (the upstream may still have acted).
+- `retry` repeats a failed or timed-out forward with exponential backoff. It is accepted **only** for `read_only` and `idempotent` tools; the manifest is rejected otherwise, and the gateway ignores retries for any other effect. Retrying a change could repeat it.
+- Defaults when `retry` is given: 3 attempts, 200 ms base, 5 s cap (1 to 10 attempts).
+
+## Verification during rollback
+
+A manifest can declare a read-back (`compensation.verification`) such as "call `notes.read` and expect `restored: true`".
+When the gateway executes a rollback it runs that read-back **through the upstream** (the verifying tool is an ordinary
+upstream tool), retrying with backoff, and records `verified`, `verification_failed` or `unverified`. The same applies to
+rollbacks started from the gateway console. See [rollback](/concepts/rollback).
+
+## Hot reload
+
+Manifests, the policy and the manifest public key are re-read while the gateway runs. A configuration that fails to load is
+rejected and the previous one keeps serving. A successful change is written to the ledger as a `reloaded` record.
+
+| Trigger | Notes |
+|---|---|
+| File watch | On by default, polling every 2 s. `reload: { watch: false, interval: 10s }` in `reversi.config.yaml` |
+| `SIGHUP` | `kill -HUP <pid>` |
+| `reversi.reload` | Admin only, operator endpoint |
+
+The gateway's own config file (upstreams, `listen`, `auth`, `allow`, `deny`) is read at start; restart to change it. Mode is also fixed at start.
 
 ## Config
 
 ```yaml gateway.yaml
-mode: enforce                 # observe: journal and never block (violations become would_block)
-actor: dev-laptop             # for unauthenticated sessions
+mode: enforce                 # enforce | advise | observe
+unclassified_reads: block     # block | observe (see above)
+validate_schemas: true
+actor: dev-laptop             # for unauthenticated sessions (default mcp-client)
 permissions: [fs:read, fs:write]   # scope of each session; default: every permission in the manifests
 upstreams:
   - name: github
@@ -46,6 +172,7 @@ upstreams:
 allow: ["fs.*", "github.get_*"]               # if set, only these may be called (and listed)
 deny:  ["fs.remove_dir"]
 listen: { host: 127.0.0.1, port: 7431 }       # omit to speak MCP on stdio
+console: { mode: off }                        # off | open | login, with role for open
 resource_url: https://gateway.example.com     # public URL, for OAuth protected-resource metadata
 auth:
   keys: ./keys.json
@@ -54,11 +181,36 @@ allowed_hosts: [gateway.example.com]
 allowed_origins: []
 ```
 
+Unknown fields are rejected, with every error reported at once.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `enforce` (`observe` if no manifests and none named) | See [modes](#modes) |
+| `unclassified_reads` | `block` | `observe` lets server-claimed read-only tools without a manifest run as shadow observe runs |
+| `validate_schemas` | `true` | Check arguments and structured results against the upstream's schemas |
+| `console` | `{ mode: off }` | The [console](/console) on the gateway's own port. `mode`: `off`, `open`, `login`; `role` (open mode only): `auditor`, `approver`, `operator` |
+| `actor` | `mcp-client` | Principal for unauthenticated sessions |
+| `permissions` | all in the manifests | Scope of every session (capped by a key's `max_permissions`) |
+| `upstreams[]` | required | `name`, then exactly one of `command` (+ `args`, `env`, `cwd`) or `url` (+ `headers`); `namespace` |
+| `allow`, `deny` | empty | Tool-name globs |
+| `listen` | stdio | `host` (default `127.0.0.1`) and `port` |
+| `resource_url`, `allowed_hosts`, `allowed_origins` | derived | See below |
+| `auth.keys`, `auth.oidc` | none | API key file; OIDC `issuer`, `audience`, `role_map`, optional `role_claim`, `actor_claim`, `jwks_uri` |
+
+Command-line flags (`reversi-gateway --help`): `--config`, `--manifests`, `--policy`, `--data`, `--store`, `--database-url`,
+`--environment`, `--signing-key`, `--console`, `--console-role`, and for one upstream without a config file
+`--upstream-cmd` (+ repeatable `--upstream-arg`) or `--upstream-url`, `--mode`, `--actor`, `--run-id`. Everything else
+(notifications, capture, egress, anchors, reload) comes from `reversi.config.yaml`, found in the current folder or above
+(or `REVERSI_CONFIG`); see [GitOps](/operations/gitops).
+
 - **Several upstreams** are namespaced `<name>.<tool>` by default (`namespace: false` per upstream to keep names). Manifests use the
   exposed names. Two upstreams exposing the same name without namespacing is an error.
 - `${NAME}` in `args`, `env` and `headers` expands from the environment, so secrets stay out of the file. A stdio upstream does **not**
   inherit the gateway's environment, only what you list.
 - `allow`/`deny` globs are compiled into policy rules, so they also show up as `blocked` records.
+- **Egress check.** Before connecting, every `url` upstream is checked against the project's `egress:` rules (host allowlist,
+  `block_private`, and cloud metadata addresses, which are always refused). A refused upstream stops the gateway at start
+  with `upstream <name>: <reason>`. Stdio upstreams are not network destinations and are not checked.
 
 ## Endpoints (HTTP mode)
 
@@ -66,43 +218,66 @@ allowed_origins: []
 |---|---|---|
 | `/mcp` | `agent` role | The agent endpoint: upstream tools plus read-only `reversi.*` tools |
 | `/operator/mcp` | `auditor` and up | The operator endpoint: only `reversi.*` tools, limited by role |
-| `/healthz`, `/readyz` | anyone | Liveness; readiness pings every upstream |
+| `/console/*` | per console mode | The [console](/console), only if `console` is `open` or `login` |
+| `/healthz`, `/readyz` | anyone | Liveness; readiness pings every upstream (cached 2 s) and answers `{"ok","upstreams":[{"name","ok"}],"sessions"}`, 503 if any is down |
 | `/.well-known/oauth-protected-resource` | anyone | Points clients at the OIDC issuer |
 
 A 401 carries `WWW-Authenticate: Bearer resource_metadata="…"`. Tokens must have the configured `audience`. Sessions belong to
 one principal: using another's session id is a 403. `Host` is validated against `allowed_hosts` (default: loopback only when bound to
 loopback) and any `Origin` header is rejected unless allowed, which stops a web page driving a local gateway (DNS rebinding).
 The gateway **refuses to listen beyond loopback without authentication**, and never serves the operator endpoint without it.
+Idle MCP sessions are closed after 30 minutes.
+
+### Console on the gateway's port
+
+The [console](/console) can be served by the gateway itself, on the same port and with the same off/open/login switch:
+`--console open|login` (or `console:` in the gateway config or `reversi.config.yaml`). It needs HTTP mode (`listen`).
+
+- `open`: no login, only requests addressed to a loopback host from the same origin. The gateway refuses to start if `listen.host` is not loopback or if the role is `admin`. Default role `operator`; `--console-role` picks `auditor` or `approver`.
+- `login`: paste an API key or OIDC access token; needs `auth.keys` or `auth.oidc`.
+- Rollbacks started in this console run the compensations **on the upstream** with the idempotency key, and verification read-backs go through the upstream too. The Connectors page lists each upstream with its health and how many tools have manifests. Manifest and policy editing works only when `manifests:` / `policy:` point at a registry or policy-versions folder ([GitOps](/operations/gitops)).
 
 ## `reversi.*` tools
 
 On the **agent** endpoint (your own runs only):
 
-`reversi.list_runs`, `reversi.get_run`, `reversi.get_action_trace`, `reversi.plan_rollback`, `reversi.dry_run_rollback`,
-`reversi.validate_manifest`.
+| Tool | Does |
+|---|---|
+| `reversi.list_runs`, `reversi.get_run`, `reversi.get_action_trace` | Read your runs |
+| `reversi.plan_rollback`, `reversi.dry_run_rollback` | What a rollback would do. Executes nothing |
+| `reversi.validate_manifest` | Validate a manifest object |
+| `reversi.preview_impact` | `{tool, arguments?}`: would this call be allowed, need approval or be blocked, with risk, approvers and rollback outlook. Executes nothing |
+| `reversi.search` | Find your runs, or ledger records (`what: "records"`), by tool, status, text. `limit` up to 200 |
 
 On the **operator** endpoint, by role:
 
 | Tool | Role | Does |
 |---|---|---|
-| `reversi.list_approvals`, `reversi.export_evidence`, and the read tools above (any run) | auditor | Read |
+| The read tools above (any run, any actor) | auditor | Read |
+| `reversi.classification` | auditor | Every upstream tool, classified against the manifests, plus the banner text |
+| `reversi.suggest_manifest` | auditor | Draft manifests for upstream tools that have none. Drafts only |
+| `reversi.list_approvals`, `reversi.export_evidence` | auditor | Read approvals; ledger records, signed if the gateway has a signing key |
 | `reversi.approve_action`, `reversi.deny_action` | approver | Decide a request |
-| `reversi.execute_rollback` | operator | Dry run unless `confirm: true`; with `approve_compensations: true` also approves compensations that need it. Calls each compensation **on the upstream**, newest first, with retries and the idempotency key in `_meta["reversi/idempotency_key"]` |
+| `reversi.execute_rollback` | operator | Dry run unless `confirm: true`; with `approve_compensations: true` also approves compensations that need it. Calls each compensation **on the upstream**, newest first, 3 attempts with backoff, idempotency key in `_meta["reversi/idempotency_key"]`, read-backs through the upstream |
 | `reversi.halt`, `reversi.resume` | admin | Kill switch |
+| `reversi.reload` | admin | Re-read manifests and policy now. Returns `{changed, tools, policy_checksum, error?}` |
 
-The agent cannot reach any of these: they are not on its endpoint, and calling one by name fails with "unknown tool".
+The agent cannot reach the operator tools: they are not on its endpoint, and calling one by name fails with "unknown tool".
 Compensations bypass `allow`/`deny` and scope, since an operator is deliberately undoing something: keep permissions for
 destructive compensation tools out of agents' scopes.
 
-Over **stdio** the gateway is a single unauthenticated agent session. Operate it with the CLI against the same data store
-(`reversi approvals`, `reversi rollback`), or run it in HTTP mode.
+Over **stdio** the gateway is a single unauthenticated agent session with the agent tools only. Operate it with the CLI against
+the same data store (`reversi approvals`, `reversi rollback`), or run it in HTTP mode.
 
 ## Storage and notifications
 
 The gateway uses the same stores as the server (`--store files|sqlite|postgres`), so the console, CLI and gateway can all look
-at one ledger and one approval queue. `REVERSI_APPROVAL_WEBHOOK` notifies approvers. See [storage](/operations/storage).
+at one ledger and one approval queue. Approval and alert [notifications](/operations/notifications), traces and anchors are
+configured in `reversi.config.yaml`; `REVERSI_APPROVAL_WEBHOOK` still works. See [storage](/operations/storage).
 
 ## Limits
 
 The gateway journals and forwards `tools/call`. It does not proxy resources, prompts or sampling. `tools/list` results are cached
-for five seconds. Rollback executes against the upstream the compensation tool is exposed by.
+for five seconds. Rollback executes against the upstream the compensation tool is exposed by. The schema checker is a subset
+of JSON Schema. The behaviour on this page was exercised against stdio fakes and the filesystem connector in tests and by
+hand; no third-party hosted MCP server was used.

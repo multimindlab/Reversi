@@ -1,6 +1,6 @@
 ---
 title: Policy as code
-description: Rules, limits and tests that add restrictions on top of manifests and scopes.
+description: Rules, limits, budgets, freezes, time windows, risk scoring, approvers, versions and tests that add restrictions on top of manifests and scopes.
 ---
 
 A policy file adds rules to what manifests and scopes already enforce. It can **deny** a call, **require
@@ -26,47 +26,263 @@ limits:
     match: { effect: [reversible, compensable] }
     max_calls: 50
     window_seconds: 60
-    per: run                  # run | actor | global
+    per: run                  # run | actor | tenant | global
 tests:
   - name: small refund is fine
     input: { tool: stripe.create_refund, environment: prod, args: { amount: 100 } }
     expect: allow
 ```
 
+The top-level keys are `version`, `default`, `rules`, `limits`, `budgets`, `freezes`, `risk`, `retention`, `content` and
+`tests`. Anything else is an error. Rule and limit ids must be unique.
+
 ## Matching
 
-`match` fields (all optional, all must hold): `tool`, `permission`, `actor`, `environment` (globs: `*` any
-run of characters, `?` one), and `effect` (an exact effect class or a list). `when` conditions then look at the call
-arguments with `$args.path.to.value`:
+`match` fields (all optional, all must hold): `tool`, `permission`, `actor`, `environment`, `tenant`, `data_class`,
+`blast_radius` (globs: `*` any run of characters, `?` one; each may be a list), and `effect` (an exact effect class or a
+list). `data_class` and `blast_radius` come from the tool's manifest `risk`; a call to a tool without them does not match a
+rule that names them.
+
+`when` conditions then look at the call arguments with `$args.path.to.value`:
 
 `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `matches` (regular expression), `exists`, `contains`.
 
-A comparison on a missing or mistyped value is simply false, so a rule never fires by accident on bad input.
+Numbers and numeric strings both count as numbers, so an upstream that coerces `"5000"` cannot slip under `gt 1000`. A
+comparison on a **missing** value is false. For `deny` and `require_approval` rules a value that is present but of the wrong
+type for the operator (text under `gt`, a number under `matches`) counts as a match, so a restriction cannot be dodged by
+sending the wrong type. `allow` rules do not do this.
+
+### Tenants
+
+`tenant` matches the tenant of the run. The server sets it from the `tenant` on the API key that opens the run. Runs created by
+the gateway carry no tenant, so a rule with `tenant:` never matches there.
+
+```yaml
+rules:
+  - id: pii-tools
+    match: { data_class: [pii, financial], tenant: "acme-*" }
+    action: require_approval
+```
 
 ## Precedence
 
-`deny` beats `require_approval` beats `allow`. Every matching rule is evaluated and reported. Limits are sliding
-windows counted per run, per actor or globally; only calls that actually started count.
+`deny` beats `require_approval` beats `allow`. Every matching rule is evaluated and reported. With `default: deny`, a call
+that no `allow` rule matches is denied (`no allow rule matches this call (default deny)`).
 
-## Environments
+## Limits
 
-`environment` comes from `REVERSI_ENV` (or `--environment`). Use one policy file with rules per environment, so
-production can be stricter than staging.
+Sliding windows counted `per` run, actor, tenant or globally. Only calls that actually started count: a call that was
+blocked or is waiting for approval does not use up the window. Counters live in the data store, so every process sharing it
+shares the counts.
+
+## Budgets
+
+A limit counts calls. A budget can also add up an argument:
+
+```yaml
+budgets:
+  - id: daily-charge-total
+    match: { tool: stripe.create_charge }
+    metric: sum                 # calls | sum
+    path: $args.amount          # required for sum
+    max: 1000000
+    window_seconds: 86400
+    per: tenant                 # run | actor | tenant | global (default run)
+    action: require_approval    # deny (default) | require_approval
+    warn_at: 0.8                # default 0.8
+```
+
+A call that would take the total above `max` is denied or needs approval, and the reason says how much was used. Between
+`warn_at` and `max` the call goes through and the ledger notes `budget daily-charge-total at 85% (...)`. A call whose
+argument is not a number adds 0.
+
+## Time windows
+
+A rule applies only inside its window:
+
+```yaml
+rules:
+  - id: weekend-writes
+    match: { effect: [reversible, compensable, irreversible], environment: prod }
+    window: { days: [sat, sun], timezone: Europe/London }
+    action: deny
+    reason: weekend change restriction
+  - id: out-of-hours
+    match: { environment: prod }
+    window: { days: [mon, tue, wed, thu, fri], between: "09:00-17:00", timezone: America/New_York, outside: true }
+    action: require_approval
+```
+
+`days` is any of `sun`..`sat` (default every day), `between` is `HH:MM-HH:MM` and may wrap midnight (`22:00-06:00`), `timezone`
+is an IANA name (default `UTC`), and `outside: true` inverts the window. Checked with a fixed clock, the first rule denies on
+a Saturday and allows on a Friday; the second asks for approval at 19:00 New York time and not at 11:00.
+
+## Freezes
+
+```yaml
+freezes:
+  - id: quarter-end
+    from: "2026-12-30T00:00:00Z"
+    to: "2027-01-02T00:00:00Z"
+    reason: quarter-end freeze
+    match: { environment: prod }      # optional: tool, effect, environment
+```
+
+During the period a matching call is denied: `freeze quarter-end: quarter-end freeze (until 2027-01-02T00:00:00Z)`. Without
+`match`, every call that is not `read_only` is frozen, which includes tools with no manifest. `to` must be after `from`.
+
+## Risk scoring
+
+A transparent 0 to 100 score from the call's effect, the manifest's `blast_radius` and `data_class`, the environment, an
+argument and the actor. Every factor is listed, so a reviewer sees why a call scored what it did. Add a `risk` section to turn
+it on:
+
+```yaml
+risk:
+  weights:
+    effect: { read_only: 0, idempotent: 5, reversible: 15, compensable: 35, irreversible: 60 }
+  amount:
+    path: $args.amount
+    bands:
+      - { over: 10000, points: 10 }
+      - { over: 100000, points: 25 }    # the highest band that is exceeded applies
+  actors: { new-agent: 20 }
+  thresholds: { approve: 50, deny: 90 }
+```
+
+At or above `approve` the call needs approval; at or above `deny` it is refused. `approve` cannot exceed `deny`. The score is
+clamped to 0..100 and recorded with the step and in the intent record:
+`risk 60 (effect compensable +35, amount over 100000 +25)`. A `$args.amount` call of 200000 by `new-agent` in `prod` scores
+`effect compensable +35, environment prod +10, amount over 100000 +25, actor new-agent +20` = 90, which is denied.
+
+Default weights, used for anything you do not override:
+
+| Factor | Points |
+|---|---|
+| effect | `read_only` 0, `idempotent` 5, `reversible` 15, `compensable` 30, `irreversible` 60 |
+| blast radius | `low` 0, `medium` 10, `high` 20, `critical` 35 |
+| data class | `public` 0, `internal` 5, `pii` 15, `financial` 20, `phi` 25, `secret` 25 |
+| environment | `prod` 10, `production` 10 |
+| no manifest | 40 (`weights.unclassified`) |
+
+<Warning>
+A map you give under `weights` replaces the default map for that key. If you set only `effect: { compensable: 35 }`,
+`irreversible` scores 0. List every class you care about, as above.
+</Warning>
+
+## Approvers and quorum
+
+A `require_approval` rule can say who may approve and how many must:
+
+```yaml
+rules:
+  - id: big-charges
+    match: { tool: "stripe.create_charge", environment: prod }
+    when: [{ path: $args.amount, op: gt, value: 50000 }]
+    action: require_approval
+    reason: large charge
+    approvers: [finance]          # roles or groups; empty means any approver
+    quorum: 2                     # 1 to 10
+    approval_timeout: 15m
+    on_timeout: escalate          # deny (default) | escalate
+    escalate_to: [cfo]
+```
+
+`approvers`, `quorum` and `approval_timeout` are only valid on `require_approval` rules. When several rules and the manifest's
+own [approval settings](/concepts/manifests#approval) apply to one call, they are merged: any listed role may approve, the
+largest quorum wins, the shortest timeout wins. See [approvals](/concepts/approvals).
+
+## Retention and content
+
+Two more sections live in the same file.
+
+```yaml
+retention:
+  default_days: 90
+  rules:
+    - { match: { data_class: financial }, days: 2555 }     # match: tool, tenant, environment, data_class
+content:
+  secrets: deny
+  pii: require_approval
+```
+
+`retention` says how long run state, approval requests and captured arguments are kept; a run is kept for the longest of the
+default, the matching rules and each tool's manifest `audit.retention_days`. The ledger itself is never purged. See
+[retention](/operations/retention). `content` configures the checks in [content checks](/concepts/content-checks)
+(`secrets`, `encoded_payloads`, `injection`, `pii`: `flag`, `require_approval` or `deny`; plus `cumulative` and
+`max_string_bytes`).
+
+## Modes
+
+Policy decisions are the same in every mode; the mode decides what happens to a violation.
+
+| Mode | Violation |
+|---|---|
+| `enforce` (default) | The call is refused and a `blocked` record names the rule |
+| `observe` | Journaled as `would_block`, and the call proceeds |
+| `advise` | Like `observe`, and the agent's result gets an extra text block: `Reversi advisory (nothing was blocked): ...` (gateway) |
+
+The [gateway](/gateway) sets the mode with `--mode` or `mode:` in its config. Use `observe` or `advise` first, read the
+`would_block` records or `reversi report` (with no run id, the period report), then switch to `enforce`. The [gateway](/gateway) turns a block into an MCP
+error result the agent can read.
+
+## More than one policy source
+
+The engine merges the policy file with the gateway's `allow` and `deny` lists, which it compiles into rules
+(`gateway-deny-0`, `gateway-allow`). Rules, limits, budgets, freezes and tests are concatenated, so ids must stay unique
+(a clash is an error). If any source says `default: deny`, the result is `deny`: a gateway `allow` list therefore makes the
+merged policy an allowlist. `risk`, `retention` and `content` come from the first source that has one, which is the policy file.
 
 ## Test it
 
 ```bash
 reversi policy check policy.yaml
+#   ok: 3 rules, 1 limits, default allow, content checks configured
 reversi policy test policy.yaml [more-cases.yaml]
+#   ok   small charge in prod is allowed
+#   ok   big charge needs approval
+#   2 passed
 ```
 
-`policy test` runs the inline `tests:` and any extra file of cases, and exits 1 on a failure. Put it in CI.
-A case may name the `rule` that must have fired.
+`policy test` runs the inline `tests:` and any extra file of cases, and exits 1 on a failure. Put it in CI. A case may name the
+`rule` that must have fired, which also covers limits, budgets and freezes by id. `input` takes `tool`, `effect`, `permission`,
+`actor`, `environment`, `tenant`, `data_class`, `blast_radius` and `args`; the defaults are actor `agent`, environment `dev` and
+empty `args`. Each case starts with fresh counters, so limits and budgets are tested on a single call, and windows and
+freezes use the real clock. An extra file is a list of the same cases:
 
-## What a block looks like
+```yaml more-cases.yaml
+- name: one charge over the daily budget asks for approval
+  input: { tool: stripe.create_charge, effect: compensable, environment: dev, args: { amount: 2000000 } }
+  expect: require_approval
+  rule: daily-charge-total
+- name: acme financial data needs approval
+  input: { tool: crm.export, effect: reversible, environment: dev, tenant: acme-eu, data_class: financial }
+  expect: require_approval
+  rule: pii-tools
+```
 
-In enforce mode a violation journals a `blocked` record naming the rule, and the call is refused. In observe mode it
-is journaled as `would_block` and the call proceeds. The [gateway](/gateway) turns a block into an MCP error result
-the agent can read.
+## Versioned policies
 
-Combining files: the gateway compiles its `allow` and `deny` lists into rules and merges them with your policy file.
+Point `policy:` at a folder and each change becomes a version with an author, a note, a checksum and a record of how many of its
+own tests passed. Publishing validates the policy and runs its tests; a policy whose tests fail is refused.
+
+```bash
+reversi policy publish policy.yaml --dir pol --by alice --note "initial"
+#   policy v1  2 tests passed  active  ac3740b71b29
+reversi policy publish policy2.yaml --dir pol --by alice --note "lower threshold" --no-activate
+#   policy v2  2 tests passed  66d6ed8eb871
+reversi policy history --dir pol
+#   v1  *active*  ...  by alice  2 tests  ac3740b71b29  - initial
+#   v2            ...  by alice  2 tests  66d6ed8eb871  - lower threshold
+reversi policy diff 1 2 --dir pol
+#   -    when: [{ path: $args.amount, op: gt, value: 50000 }]
+#   +    when: [{ path: $args.amount, op: gt, value: 20000 }]
+reversi policy activate 2 --dir pol           # also how you roll back: activate an older version
+#   policy v2 is now active
+```
+
+`--dir` defaults to `policy:` in `reversi.config.yaml`. The engine loads the active version, and a running engine picks up a new one on reload
+(`POST /v1/reload`; the server and gateway also watch the files unless `reload: { watch: false }` is set). Each version's file is checked against its checksum when read, so a policy edited outside the history is refused. Over
+HTTP an admin can `POST /v1/registry/policy` (`text`, `note`, `activate`) and `POST /v1/registry/policy/{version}/activate`.
+The [console](/console) policy page validates, runs the tests and can
+[simulate the draft against captured history](/concepts/simulation#policy-simulation) before you publish.

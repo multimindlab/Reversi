@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "reversi.name" . }}
+  labels: {{- include "reversi.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reversi
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels: {{- include "reversi.labels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ if .Values.serviceAccount.create }}{{ include "reversi.name" . }}{{ else }}default{{ end }}
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      {{- if .Values.registry.persistence.enabled }}
+      initContainers:
+        - name: init-state
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["sh", "-c", "mkdir -p /state/manifests /state/policy"]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: state, mountPath: /state }]
+      {{- end }}
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          env: {{- include "reversi.env" . | nindent 12 }}
+            - { name: REVERSI_DATA, value: /data }
+          ports: [{ name: http, containerPort: {{ .Values.server.port }} }]
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 20, failureThreshold: 3 }
+          {{- with .Values.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+            {{- if .Values.registry.persistence.enabled }}
+            - { name: state, mountPath: /state }
+            {{- end }}
+            {{- if and (not .Values.registry.persistence.enabled) (or .Values.manifests.existingConfigMap .Values.manifests.inline) }}
+            - { name: manifests, mountPath: /config/manifests, readOnly: true }
+            {{- end }}
+            {{- if or .Values.policy.existingConfigMap .Values.policy.inline }}
+            - { name: policy, mountPath: /config/policy, readOnly: true }
+            {{- end }}
+            {{- if .Values.keys.existingSecret }}
+            - { name: keys, mountPath: /config/keys, readOnly: true }
+            {{- end }}
+            {{- if .Values.signing.existingSecret }}
+            - { name: signing, mountPath: /config/signing, readOnly: true }
+            {{- end }}
+        {{- if .Values.gateway.enabled }}
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "packages/gateway/dist/main.js", "--config", "/config/gateway/gateway.yaml", "--console", {{ .Values.gateway.console | quote }}]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          env: {{- include "reversi.env" . | nindent 12 }}
+            - { name: REVERSI_DATA, value: /data }
+          ports: [{ name: mcp, containerPort: {{ .Values.gateway.port }} }]
+          readinessProbe: { httpGet: { path: /readyz, port: mcp }, periodSeconds: 10 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+            - { name: gateway, mountPath: /config/gateway, readOnly: true }
+            {{- if .Values.registry.persistence.enabled }}
+            - { name: state, mountPath: /state }
+            {{- end }}
+            {{- if or .Values.manifests.existingConfigMap .Values.manifests.inline }}
+            - { name: manifests, mountPath: /config/manifests, readOnly: true }
+            {{- end }}
+            {{- if or .Values.policy.existingConfigMap .Values.policy.inline }}
+            - { name: policy, mountPath: /config/policy, readOnly: true }
+            {{- end }}
+            {{- if .Values.keys.existingSecret }}
+            - { name: keys, mountPath: /config/keys, readOnly: true }
+            {{- end }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.registry.persistence.enabled }}
+        - name: state
+          persistentVolumeClaim: { claimName: {{ include "reversi.name" . }}-state }
+        {{- end }}
+        - name: data
+          {{- if and .Values.store.persistence.enabled (ne .Values.store.kind "postgres") }}
+          persistentVolumeClaim: { claimName: {{ include "reversi.name" . }}-data }
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if or .Values.manifests.existingConfigMap .Values.manifests.inline }}
+        - name: manifests
+          configMap: { name: {{ include "reversi.manifestsCM" . }} }
+        {{- end }}
+        {{- if or .Values.policy.existingConfigMap .Values.policy.inline }}
+        - name: policy
+          configMap: { name: {{ include "reversi.policyCM" . }} }
+        {{- end }}
+        {{- if .Values.keys.existingSecret }}
+        - name: keys
+          secret: { secretName: {{ .Values.keys.existingSecret }} }
+        {{- end }}
+        {{- if .Values.signing.existingSecret }}
+        - name: signing
+          secret: { secretName: {{ .Values.signing.existingSecret }} }
+        {{- end }}
+        {{- if .Values.gateway.enabled }}
+        - name: gateway
+          configMap: { name: {{ required "gateway.existingConfigMap is required when the gateway is enabled" .Values.gateway.existingConfigMap }} }
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

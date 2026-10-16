@@ -31,7 +31,7 @@ function make(extra: Partial<Parameters<typeof createApp>[0]> = {}, keys: ApiKey
   const policy = Policy.from({ rules: [{ id: "refund-approval", match: { tool: "refund" }, action: "require_approval" }] });
   const reversi = new Reversi({ registry: Registry.from(MANIFESTS), ledger: new Ledger(), approver: approvals.asApprover(), policy, content: new ContentChecker() });
   const logs: LogEntry[] = [];
-  const app = createApp({ reversi, approvals, keys, logger: (e) => logs.push(e), session_secret: "test-secret", ...extra });
+  const app = createApp({ reversi, approvals, keys, logger: (e) => logs.push(e), session_secret: "test-secret", console: { mode: "login" }, ...extra });
   const call = async (key: string | null, method: string, path: string, body?: unknown) => {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (key) headers.authorization = `Bearer ${key}`;

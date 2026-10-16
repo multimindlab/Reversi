@@ -30,6 +30,8 @@ export interface HttpGatewayOptions {
   anonymous_actor: string;
   allowed_hosts?: string[];
   allowed_origins?: string[];
+  /** Serves `/console/*` (the server's console, mounted on this port). Its own checks guard it, so the MCP Origin rule does not apply. */
+  console?: (req: IncomingMessage, res: ServerResponse) => unknown;
   /** Idle sessions are closed after this long. Default 30 minutes. */
   session_ttl_ms?: number;
   max_body_bytes?: number;
@@ -157,10 +159,11 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
         const hostname = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0] ?? "";
         const hostOk = allowedHosts.size ? allowedHosts.has(host) || allowedHosts.has(hostname) : !isLoopback(o.host) || isLoopback(hostname);
         if (!hostOk) return json(res, 403, { error: "host not allowed" });
-        const origin = req.headers.origin;
-        if (origin && !allowedOrigins.has(origin)) return json(res, 403, { error: "origin not allowed" });
-
         const path = (req.url ?? "/").split("?")[0];
+        const origin = req.headers.origin;
+        const isConsole = o.console !== undefined && (path === "/console" || path?.startsWith("/console/"));
+        if (origin && !isConsole && !allowedOrigins.has(origin)) return json(res, 403, { error: "origin not allowed" });
+        if (isConsole) return void (await o.console?.(req, res));
         if (path === "/healthz") return json(res, 200, { ok: true });
         if (path === "/readyz") {
           // Unauthenticated, and it pings every upstream: answer from a two-second cache.

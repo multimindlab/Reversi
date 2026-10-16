@@ -29,7 +29,15 @@ export interface OidcConfig {
 
 export interface GatewayConfig {
   /** `observe` journals and never blocks; `enforce` blocks. Default enforce. */
-  mode: "observe" | "enforce";
+  mode: "observe" | "enforce" | "advise";
+  /** Whether the file or flags named a mode. Without one, a gateway that has no manifests yet starts in observe mode. */
+  mode_explicit?: boolean;
+  /** Tools with no manifest that the server calls read-only: `block` (default) or `observe` (run, journal as unclassified). */
+  unclassified_reads?: "block" | "observe";
+  /** Check arguments and results against each tool's declared schemas. Default true. */
+  validate_schemas?: boolean;
+  /** The operator console on the gateway's own port. `off` (default), `open` (no login, loopback only, fixed role) or `login`. */
+  console?: { mode: "off" | "open" | "login"; role?: Role };
   /** Actor recorded for unauthenticated sessions (stdio, or HTTP on loopback with no auth). */
   actor: string;
   /** Permissions for each session's scope. Default: every permission in the manifests. */
@@ -70,10 +78,21 @@ export function expandEnv(s: string, env: Record<string, string | undefined> = p
 export function parseGatewayConfig(raw: unknown): GatewayConfig {
   const errors: string[] = [];
   if (!isRec(raw)) throw new ConfigError(["config must be an object"]);
-  const known = ["mode", "actor", "permissions", "upstreams", "allow", "deny", "listen", "resource_url", "allowed_hosts", "allowed_origins", "auth"];
+  const known = ["mode", "unclassified_reads", "validate_schemas", "console", "actor", "permissions", "upstreams", "allow", "deny", "listen", "resource_url", "allowed_hosts", "allowed_origins", "auth"];
   for (const k of Object.keys(raw)) if (!known.includes(k)) errors.push(`unknown field \`${k}\``);
   const mode = raw.mode ?? "enforce";
-  if (mode !== "observe" && mode !== "enforce") errors.push("`mode` must be observe or enforce");
+  if (mode !== "observe" && mode !== "enforce" && mode !== "advise") errors.push("`mode` must be observe, advise or enforce");
+  if (raw.unclassified_reads !== undefined && raw.unclassified_reads !== "block" && raw.unclassified_reads !== "observe") errors.push("`unclassified_reads` must be block or observe");
+  if (raw.validate_schemas !== undefined && typeof raw.validate_schemas !== "boolean") errors.push("`validate_schemas` must be true or false");
+  let consoleCfg: GatewayConfig["console"];
+  if (raw.console !== undefined) {
+    const c = raw.console;
+    if (!isRec(c) || !["off", "open", "login"].includes(c.mode as string)) errors.push("`console.mode` must be off, open or login");
+    else {
+      if (c.role !== undefined && !["auditor", "approver", "operator"].includes(c.role as string)) errors.push("`console.role` must be auditor, approver or operator (the open console is never admin)");
+      consoleCfg = { mode: c.mode as "off" | "open" | "login", ...(c.role ? { role: c.role as Role } : {}) };
+    }
+  }
   if (raw.actor !== undefined && (typeof raw.actor !== "string" || !raw.actor)) errors.push("`actor` must be a non-empty string");
   for (const k of ["permissions", "allow", "deny", "allowed_hosts", "allowed_origins"]) {
     if (raw[k] !== undefined && !strList(raw[k])) errors.push(`\`${k}\` must be a list of strings`);
@@ -134,6 +153,10 @@ export function parseGatewayConfig(raw: unknown): GatewayConfig {
   if (errors.length) throw new ConfigError(errors);
   return {
     mode: mode as GatewayConfig["mode"],
+    mode_explicit: raw.mode !== undefined,
+    unclassified_reads: raw.unclassified_reads as GatewayConfig["unclassified_reads"],
+    validate_schemas: raw.validate_schemas as boolean | undefined,
+    console: consoleCfg,
     actor: (raw.actor as string | undefined) ?? "mcp-client",
     permissions: raw.permissions as string[] | undefined,
     upstreams,
