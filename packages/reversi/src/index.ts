@@ -137,6 +137,8 @@ export { Delegations, type Delegation } from "./delegations.js";
 export { WindowCounters } from "./counters.js";
 export { DEFAULT_WEIGHTS, parseRisk, scoreRisk, type RiskConfig, type RiskInput, type RiskResult } from "./risk.js";
 export { frozenAt, inWindow, type Day, type Freeze, type Window } from "./schedule.js";
+export { LegalHolds, applyRetention, parseRetention, planRetention, retentionDays, type Hold, type HoldScope, type RetentionConfig, type RetentionItem, type RetentionReport } from "./retention.js";
+export { searchRecords, searchRuns, summarizeRun, type RecordFilter, type RunFilter, type RunStatus, type RunSummary } from "./query.js";
 export { CaptureStore, DEFAULT_CAPTURE, redactForCapture, type CaptureConfig, type CaptureRecord } from "./capture.js";
 export { detectPii, maskPii, type PiiKind } from "./pii.js";
 export {
@@ -159,3 +161,6 @@ export {
   type SpeculationReport,
   type Verdict,
 } from "./simulate.js";
+export { EgressError, checkUrl, egressFromEnv, guardedFetch, isMetadataAddress, isPrivateAddress, type EgressConfig } from "./egress.js";
+export { anchorLedger, readAnchors, verifyAnchor, type AnchorCheck, type AnchorRecord, type AnchorSink } from "./anchor.js";
+export { renderPdf, renderReportPdf } from "./pdf.js";

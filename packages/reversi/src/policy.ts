@@ -8,6 +8,7 @@ import type { CheckAction, ContentConfig } from "./content.js";
 import { WindowCounters } from "./counters.js";
 import type { KvStore } from "./kv.js";
 import { EFFECTS, parseDuration, resolveRef, type Effect } from "./manifest.js";
+import { parseRetention, type RetentionConfig } from "./retention.js";
 import { parseRisk, scoreRisk, type RiskConfig, type RiskResult } from "./risk.js";
 import { frozenAt, inWindow, parseFreeze, parseWindow, type Freeze, type Window } from "./schedule.js";
 
@@ -101,6 +102,8 @@ export interface PolicyDoc {
   /** Change freezes: no non-read call in these periods. */
   freezes: Freeze[];
   risk?: RiskConfig;
+  /** How long run state, approvals and captured data are kept. */
+  retention?: RetentionConfig;
   tests: PolicyTestCase[];
   /** Content-check settings, if the file has a `content:` section. */
   content?: Partial<ContentConfig>;
@@ -214,7 +217,7 @@ function parseContent(raw: unknown, errors: string[]): Partial<ContentConfig> | 
 export function parsePolicy(raw: unknown): PolicyDoc {
   const errors: string[] = [];
   if (!isRec(raw)) throw new PolicyError(["policy must be an object"]);
-  for (const k of Object.keys(raw)) if (!["version", "default", "rules", "limits", "budgets", "freezes", "risk", "tests", "content"].includes(k)) errors.push(`unknown field \`${k}\``);
+  for (const k of Object.keys(raw)) if (!["version", "default", "rules", "limits", "budgets", "freezes", "risk", "retention", "tests", "content"].includes(k)) errors.push(`unknown field \`${k}\``);
   if (raw.version !== undefined && raw.version !== 1) errors.push("`version` must be 1");
   const def = raw.default ?? "allow";
   if (def !== "allow" && def !== "deny") errors.push("`default` must be allow or deny");
@@ -280,10 +283,11 @@ export function parsePolicy(raw: unknown): PolicyDoc {
     if (fr) freezes.push(fr);
   }
   const risk = parseRisk(raw.risk, errors);
+  const retention = parseRetention(raw.retention, errors);
   const tests = raw.tests === undefined ? [] : Array.isArray(raw.tests) ? (raw.tests as PolicyTestCase[]) : (errors.push("`tests` must be a list"), []);
   const content = parseContent(raw.content, errors);
   if (errors.length) throw new PolicyError(errors);
-  return { version: 1, default: def as "allow" | "deny", rules, limits, budgets, freezes, ...(risk ? { risk } : {}), tests, ...(content ? { content } : {}) };
+  return { version: 1, default: def as "allow" | "deny", rules, limits, budgets, freezes, ...(risk ? { risk } : {}), ...(retention ? { retention } : {}), tests, ...(content ? { content } : {}) };
 }
 
 function matches(m: Match, i: PolicyInput): boolean {
@@ -504,6 +508,7 @@ export function mergePolicyDocs(...docs: Array<PolicyDoc | undefined>): PolicyDo
     budgets: present.flatMap((d) => d.budgets),
     freezes: present.flatMap((d) => d.freezes),
     risk: present.find((d) => d.risk)?.risk,
+    retention: present.find((d) => d.retention)?.retention,
     tests: present.flatMap((d) => d.tests),
     content: present.find((d) => d.content)?.content,
   };

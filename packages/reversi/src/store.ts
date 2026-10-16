@@ -14,6 +14,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -84,6 +85,8 @@ export interface RunStore {
   get(run_id: string): RunState | undefined;
   put(state: RunState): void;
   list(): string[];
+  /** Remove a run's state (retention). The ledger records about it stay: the ledger is append-only. */
+  delete(run_id: string): boolean;
 }
 
 export const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -99,6 +102,9 @@ export class MemoryRunStore implements RunStore {
   }
   list(): string[] {
     return [...this.runs.keys()];
+  }
+  delete(run_id: string): boolean {
+    return this.runs.delete(run_id);
   }
 }
 
@@ -131,6 +137,13 @@ export class FileRunStore implements RunStore {
       closeSync(fd);
     }
     renameSync(tmp, f);
+  }
+
+  delete(run_id: string): boolean {
+    const f = this.file(run_id);
+    if (!existsSync(f)) return false;
+    unlinkSync(f);
+    return true;
   }
 
   list(): string[] {

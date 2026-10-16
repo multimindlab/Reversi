@@ -180,6 +180,9 @@ export class PgRunStore implements RunStore {
       JSON.stringify(state),
     ]);
   }
+  delete(run_id: string): boolean {
+    return this.pg.query("DELETE FROM runs WHERE run_id = $1 RETURNING run_id", [this.check(run_id)]).length === 1;
+  }
   list(): string[] {
     return this.pg.query<{ run_id: string }>("SELECT run_id FROM runs ORDER BY run_id").map((r) => r.run_id);
   }
@@ -195,6 +198,9 @@ export class PgApprovalStore implements ApprovalStore {
   }
   list(): ApprovalRecord[] {
     return this.pg.query<{ record: ApprovalRecord }>("SELECT record FROM approvals").map((r) => r.record);
+  }
+  delete(id: string): boolean {
+    return this.pg.query("DELETE FROM approvals WHERE id = $1 RETURNING id", [id]).length === 1;
   }
   transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean {
     const params: unknown[] = [JSON.stringify(patch), id, from];

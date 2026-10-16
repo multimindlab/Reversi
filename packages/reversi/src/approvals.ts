@@ -60,6 +60,8 @@ export interface ApprovalStore {
    * when several processes share a store.
    */
   transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean;
+  /** Remove a request (retention). */
+  delete(id: string): boolean;
 }
 
 export class MemoryApprovalStore implements ApprovalStore {
@@ -73,6 +75,9 @@ export class MemoryApprovalStore implements ApprovalStore {
   }
   list() {
     return [...this.items.values()].map((r) => structuredClone(r));
+  }
+  delete(id: string) {
+    return this.items.delete(id);
   }
   transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number) {
     const r = this.items.get(id);
@@ -108,6 +113,21 @@ export class FileApprovalStore implements ApprovalStore {
   }
   list() {
     return Object.values(this.read());
+  }
+  delete(id: string) {
+    const all = this.read();
+    if (!all[id]) return false;
+    delete all[id];
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    const fd = openSync(tmp, "w");
+    try {
+      writeSync(fd, JSON.stringify(all, null, 2));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, this.path);
+    return true;
   }
   /** Read, compare and rename-over: atomic enough for one host; use SQLite or PostgreSQL to share across hosts. */
   transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number) {

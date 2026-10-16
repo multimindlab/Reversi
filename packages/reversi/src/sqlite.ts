@@ -90,6 +90,9 @@ export class SqliteRunStore implements RunStore {
       .prepare("INSERT INTO runs (run_id, state) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET state = excluded.state")
       .run(this.check(state.run_id), JSON.stringify(state));
   }
+  delete(run_id: string): boolean {
+    return Number(this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(this.check(run_id)).changes) === 1;
+  }
   list(): string[] {
     return (this.db.prepare("SELECT run_id FROM runs ORDER BY run_id").all() as Array<{ run_id: string }>).map(
       (r) => r.run_id,
@@ -110,6 +113,9 @@ export class SqliteApprovalStore implements ApprovalStore {
   }
   list(): ApprovalRecord[] {
     return (this.db.prepare("SELECT record FROM approvals").all() as Array<{ record: string }>).map((r) => JSON.parse(r.record) as ApprovalRecord);
+  }
+  delete(id: string): boolean {
+    return Number(this.db.prepare("DELETE FROM approvals WHERE id = ?").run(id).changes) === 1;
   }
   transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean {
     const res = this.db
