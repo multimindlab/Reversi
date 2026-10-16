@@ -1,11 +1,38 @@
 ---
 title: Python SDK
-description: reversi-sdk: a client for the Reversi server, plus offline verification. Standard library only.
+description: reversi-sdk, a client for the Reversi server, offline ledger and manifest checks, agent-framework adapters. Standard library only.
 ---
 
+`reversi-sdk` lets a Python agent journal its tool calls through a [Reversi server](/operations/deployment), and lets any
+Python program verify ledgers and validate manifests offline. It needs Python 3.9 or later and has no runtime
+dependencies.
+
 ```bash
-pip install reversi-sdk
+pip install ./packages/sdk-py          # from a checkout of the repository
+pip install './packages/sdk-py[pydantic]'   # with the optional pydantic models
 ```
+
+<Note>
+The package is not published to PyPI by this repository. Install it from the checkout, or publish it yourself. The
+test suite (`npm run test:py`, 55 tests) runs against a live Reversi server as well as fakes.
+</Note>
+
+## What it covers
+
+| Area | In the SDK |
+|---|---|
+| Agent calls | Start or continue a run, journal each call before and after it runs, `Blocked` and `EffectUncertain` handling |
+| Approvals | `Blocked.approval_id`, and `approvals()`, `approve()`, `deny()` for approver keys |
+| Operator actions | `plan()`, `rollback()` with retries, `resolve()`, kill switch, signed evidence bundle, HTML report |
+| Offline checks | `verify_file` / `verify_records` for the hash chain, `validate_manifest` and `Registry` for manifests, `hash_payload` |
+| Webhooks | `verify_webhook_signature` |
+| Adapters | LangGraph, CrewAI, OpenAI Agents, FastMCP, and a Claude Code hook. See [integrations](/integrations) |
+
+It talks to the run, approval, halt and evidence endpoints. The newer governance endpoints (search, impact preview,
+simulate, replay, registry, holds, retention, keys and the rest of the [admin API](/api-reference/admin)) are **not
+wrapped yet**: call them over HTTP, or use the [CLI](/cli) or TypeScript SDK.
+
+## Journal a call
 
 ```python
 from reversi_sdk import ReversiClient, Blocked, EffectUncertain
@@ -20,8 +47,18 @@ except Blocked as e:
     print("refused:", e.reasons)       # the tool never ran
 ```
 
-`call` journals the intent **before** running your function and the outcome after. Raise `EffectUncertain` when you
-cannot tell whether the effect happened.
+`call` journals the intent **before** running your function and the outcome after. If the process dies in between, the
+server shows the step as unresolved rather than pretending it never happened. Raise `EffectUncertain` from your
+function when you cannot tell whether the effect happened (a timeout, a dropped connection): the step is recorded as
+`uncertain` and an operator settles it later.
+
+`start_run(permissions, run_id=None, mode="enforce", reason=None)` takes the run's permission scope. `mode` is
+`enforce` (violations block), `observe` (violations are journaled and the call runs; the key needs `allow_observe`) or
+`advise`. Pass `run_id` to start a run with a name you choose, and `client.run(run_id)` to pick up an existing one.
+
+Lower-level methods exist when you do not want `call` to run the function for you: `run.begin(tool, reason, args)`
+returns the decision (`allow` or `block`) and a step number, and `run.complete(step, status, result=…, error=…)` records
+the outcome. `run.state()` returns the steps and their statuses.
 
 Decorate tools so every call goes through the run:
 
@@ -34,7 +71,8 @@ create_order({"sku": "BOOK-1"})
 
 ## Approvals
 
-When a call needs approval, `Blocked.approval_id` holds the request id. Ask an approver to decide it, then retry the same call:
+When a call needs approval, `Blocked.approval_id` holds the request id. The approval is bound to the exact arguments
+and used once, so ask an approver to decide it, then retry the **same** call:
 
 ```python
 try:
@@ -47,28 +85,81 @@ approver.approvals(status="pending")
 approver.approve(approval_id, "checked the ticket")        # or approver.deny(...)
 ```
 
-## Operator methods
+Routing to groups, quorum, delegation and break-glass are configured on the server; see
+[approvals](/concepts/approvals). The Python client decides as the identity of its key, so a key with the right groups
+is what satisfies a group-routed request.
 
-With an operator key: `run.plan()`, `run.rollback(compensate, attempts=3)` (retries with backoff and the **same**
-`call["idempotency_key"]`; returns a report whose `complete` is true only if nothing was left undone), `run.resolve(step,
-"succeeded", note, result=…)` for unknown outcomes, `run.begin_compensation` / `complete_compensation` for custom workers,
-`run.export_jsonl()`, `run.report_html()`, `run.bundle()` (signed evidence). With an admin key: `client.halt(reason)` and
-`client.resume()`. Auditors can use `client.approvals()`, `client.status()`, `client.verify_ledger()`, `client.ledger_bundle()`.
+## Operator and admin methods
 
-Verify bundles with `reversi verify-bundle`: Ed25519 is not in the Python standard library.
+Each needs a key with the matching [role](/operations/authentication).
+
+| Method | Role | Does |
+|---|---|---|
+| `run.plan()` | operator | The rollback plan, a dry run |
+| `run.rollback(compensate, attempts=3)` | operator | Undo newest first. `compensate(call)` runs one undo and raises on failure. Retries with backoff and the **same** `call["idempotency_key"]`. Returns a report whose `complete` is true only if nothing was left undone |
+| `run.resolve(step, "succeeded", note, result=…)` | operator | Settle a step whose outcome was unknown, after checking the downstream system |
+| `run.begin_compensation(step)` / `run.complete_compensation(step, ok)` | operator | For a custom undo worker |
+| `run.approve(tool)` | operator | Pre-approve a call or compensation for this run |
+| `run.export_jsonl()`, `run.report_html()`, `run.bundle()` | auditor and up | Records, HTML report, signed evidence |
+| `client.halt(reason)`, `client.resume()` | admin | The kill switch |
+| `client.approvals()`, `client.status()`, `client.verify_ledger()`, `client.ledger_bundle()` | auditor and up | Read-only views |
+
+The rollback report lists `compensated`, `failed`, `deferred`, `awaiting_approval` and `not_undoable` steps. It does not
+run a manifest's declared read-back verification: that happens on the server side
+([rollback](/concepts/rollback)).
+
+Errors: `ReversiError` (with `status` and `message`) for any refused or failed request, `Blocked` for a policy refusal
+of a call, `EffectUncertain` raised by you.
 
 ## Offline tools (no server)
 
 ```python
-from reversi_sdk import verify_file, validate_manifest
+from reversi_sdk import verify_file, validate_manifest, Registry, hash_payload
+
 print(verify_file("ledger.jsonl"))
 manifest, errors = validate_manifest({"tool": "x", "effect": "read_only", "permission": "p"})
+reg = Registry.from_json_file("manifests.json"); print(reg.validate())
 ```
 
-`python -m reversi_sdk verify ledger.jsonl` works from a shell. The Python validator and verifier are tested against
-the TypeScript implementation on shared fixtures. Manifests are read from JSON; convert YAML first.
+`python -m reversi_sdk verify ledger.jsonl` checks a ledger's hash chain from a shell (exit 0 ok, 1 tampered, 64 usage).
+`validate_manifest` accepts the full manifest format (versions, status, risk, residue, verification, timeouts, retry,
+idempotency, approval rules) and returns the normalized manifest or a list of every error. It is tested against the
+TypeScript validator on shared fixtures, so the two agree.
+
+Two limits: manifests are read from **JSON**, so convert YAML first, and Ed25519 evidence bundles are not verified in
+Python (the standard library has no Ed25519). Verify bundles with `reversi verify-bundle`.
 
 <Note>
 Canonical JSON for payload hashing rejects non-whole floats outside 1e-4 to 1e16, where Python and JavaScript format
 numbers differently. Pass such values as strings.
 </Note>
+
+## Webhook signatures
+
+```python
+from reversi_sdk import verify_webhook_signature
+
+ok = verify_webhook_signature(secret, request_body_bytes, request.headers.get("X-Reversi-Signature"))
+```
+
+Pass the raw body before any JSON parsing. The header is `sha256=<hex>`, an HMAC-SHA256 of the body; the comparison is
+constant time and a missing or malformed header returns `False`. See [notifications](/operations/notifications) for the
+server side.
+
+## Pydantic models
+
+`reversi_sdk.pydantic_models` has pydantic v2 `ToolManifest`, `Compensation` and `Verification` models for IDE types and
+JSON Schema generation. They run the standard library validator first, so the two cannot disagree.
+
+```python
+from reversi_sdk.pydantic_models import ToolManifest
+
+m = ToolManifest.model_validate(raw)      # raises pydantic.ValidationError
+manifest = m.normalized()                 # the same dict validate_manifest returns
+```
+
+## Agent frameworks and Claude Code
+
+Adapters for LangGraph, CrewAI, the OpenAI Agents SDK and FastMCP, and the `reversi-claude-hook` command for Claude Code
+hooks, are in [integrations](/integrations). They are tested against fakes of those frameworks' interfaces, not
+against the frameworks themselves.
