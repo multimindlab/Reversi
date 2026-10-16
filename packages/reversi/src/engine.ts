@@ -351,11 +351,11 @@ function classify(state: RunState, s: StepState): PlanAction | null {
 }
 
 export class Reversi {
-  readonly registry: Registry;
+  registry: Registry;
   readonly ledger: Ledger;
   readonly runs: RunStore;
-  readonly policy: Policy | undefined;
-  readonly content: ContentChecker | undefined;
+  policy: Policy | undefined;
+  content: ContentChecker | undefined;
   readonly environment: string;
   private readonly approver: Approver | undefined;
   private readonly clock: () => number;
@@ -416,6 +416,16 @@ export class Reversi {
 
   runIds(): string[] {
     return this.runs.list();
+  }
+
+  /**
+   * Swap in new manifests, policy or content checks without a restart (hot reload). Calls already in flight finish under
+   * the rules they started with; the next call sees the new ones.
+   */
+  reload(parts: { registry?: Registry; policy?: Policy | undefined; content?: ContentChecker | undefined }): void {
+    if (parts.registry) this.registry = parts.registry;
+    if ("policy" in parts) this.policy = parts.policy;
+    if ("content" in parts) this.content = parts.content;
   }
 
   /**

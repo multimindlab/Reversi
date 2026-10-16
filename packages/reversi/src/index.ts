@@ -119,7 +119,8 @@ export {
 } from "./evidence.js";
 export { FileKvStore, KvConflictError, MemoryKvStore, kvUpdate, type KvEntry, type KvStore } from "./kv.js";
 export { dataOptionsFromEnv, openData, storeKindFrom, type Data, type DataOptions, type StoreKind } from "./data.js";
-export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle } from "./config.js";
+export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle, type ReloadResult } from "./config.js";
+export { CONFIG_NAMES, ProjectConfigError, findProjectConfig, loadProjectConfig, starterConfig, type ProjectConfig } from "./projectconfig.js";
 export {
   KeyRing,
   OidcVerifier,
@@ -167,7 +168,7 @@ export { renderPdf, renderReportPdf } from "./pdf.js";
 export { Notifier, createChannel, parseChannels, parseRoutes, type Channel, type ChannelConfig, type ChannelDeps, type NotifyMessage, type Route, type Severity } from "./channels.js";
 export { sendMail, type MailMessage, type SmtpConfig } from "./smtp.js";
 export { approvalNotification, attachNotifications, describeRecord } from "./hub.js";
-export { AlertManager, evaluateAlerts, type Alert, type AlertOptions } from "./alerts.js";
+export { AlertManager, evaluateAlerts, type Alert, type AlertManagerOptions, type AlertOptions } from "./alerts.js";
 export { OtelExporter, type OtelOptions } from "./otel.js";
 export { createLogger, redactFields, type Level, type Logger } from "./logger.js";
 export { diffLines, renderDiff, type DiffLine } from "./diff.js";

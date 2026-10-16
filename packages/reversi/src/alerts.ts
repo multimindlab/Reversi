@@ -77,16 +77,27 @@ interface AlertState {
 
 const NS = "alert-state";
 
+export interface AlertManagerOptions extends Omit<AlertOptions, "health"> {
+  remind_ms?: number;
+  console_url?: string;
+  /** Upstream health, asked for on every tick (the gateway supplies it). */
+  health?: () => Promise<Array<{ name: string; ok: boolean }>>;
+}
+
 export class AlertManager {
   constructor(
     private readonly rv: Reversi,
     private readonly approvals: Approvals | undefined,
     private readonly kv: KvStore,
     private readonly notifier: Notifier,
-    private readonly o: AlertOptions & { remind_ms?: number; console_url?: string; health?: () => Promise<Array<{ name: string; ok: boolean }>> } = {},
+    private readonly o: AlertManagerOptions = {},
   ) {}
 
   private timer: NodeJS.Timeout | undefined;
+
+  setHealth(fn: AlertManagerOptions["health"]): void {
+    this.o.health = fn;
+  }
 
   start(intervalMs = 60_000): void {
     this.stop();
@@ -99,8 +110,9 @@ export class AlertManager {
 
   /** Evaluate once: notify new alerts (and reminders), resolve cleared ones. Returns what was sent. */
   async tick(now = Date.now()): Promise<{ fired: string[]; resolved: string[] }> {
-    const health = this.o.health ? await this.o.health().catch(() => undefined) : this.o.health;
-    const alerts = evaluateAlerts(this.rv, this.approvals, { ...this.o, now, health: Array.isArray(health) ? health : undefined });
+    const health = this.o.health ? await this.o.health().catch(() => undefined) : undefined;
+    const { health: _fn, remind_ms: _r, console_url: _c, ...evalOpts } = this.o;
+    const alerts = evaluateAlerts(this.rv, this.approvals, { ...evalOpts, now, health });
     const remind = this.o.remind_ms ?? 3_600_000;
     const fired: string[] = [];
     const resolved: string[] = [];

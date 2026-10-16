@@ -32,7 +32,8 @@ export type LedgerEvent =
   | "verification_failed"
   | "unverified"
   | "escalated"
-  | "purged";
+  | "purged"
+  | "reloaded";
 
 export interface LedgerRecord {
   seq: number;
