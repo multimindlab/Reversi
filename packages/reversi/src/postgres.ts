@@ -12,6 +12,7 @@
 import { createRequire } from "node:module";
 import { MessageChannel, Worker, receiveMessageOnPort, type MessagePort } from "node:worker_threads";
 import type { ApprovalRecord, ApprovalStatus, ApprovalStore } from "./approvals.js";
+import type { KvEntry, KvStore } from "./kv.js";
 import { LedgerConflictError, type LedgerRecord, type LedgerStore } from "./ledger.js";
 import { RUN_ID_PATTERN, type RunState, type RunStore } from "./store.js";
 
@@ -114,6 +115,10 @@ export const MIGRATIONS: Array<{ version: number; sql: string }> = [
       CREATE TABLE approvals (id TEXT PRIMARY KEY, record JSONB NOT NULL);
     `,
   },
+  {
+    version: 2,
+    sql: `CREATE TABLE kv (ns TEXT NOT NULL, key TEXT NOT NULL, value JSONB NOT NULL, version BIGINT NOT NULL, PRIMARY KEY (ns, key));`,
+  },
 ];
 
 export function migrate(pg: SyncPg): number[] {
@@ -199,8 +204,33 @@ export class PgApprovalStore implements ApprovalStore {
   }
 }
 
-export function openPostgresStores(url: string): { pg: SyncPg; ledger: PgLedgerStore; runs: PgRunStore; approvals: PgApprovalStore } {
+export class PgKvStore implements KvStore {
+  constructor(private readonly pg: SyncPg) {}
+  get<T>(ns: string, key: string): KvEntry<T> | undefined {
+    const r = this.pg.query<{ value: T; version: string }>("SELECT value, version FROM kv WHERE ns = $1 AND key = $2", [ns, key])[0];
+    return r ? { key, value: r.value, version: Number(r.version) } : undefined;
+  }
+  put(ns: string, key: string, value: unknown): void {
+    this.pg.query("INSERT INTO kv (ns, key, value, version) VALUES ($1, $2, $3, 1) ON CONFLICT (ns, key) DO UPDATE SET value = EXCLUDED.value, version = kv.version + 1", [ns, key, JSON.stringify(value)]);
+  }
+  cas(ns: string, key: string, value: unknown, expected: number): boolean {
+    if (expected === 0) {
+      return this.pg.query("INSERT INTO kv (ns, key, value, version) VALUES ($1, $2, $3, 1) ON CONFLICT (ns, key) DO NOTHING RETURNING key", [ns, key, JSON.stringify(value)]).length === 1;
+    }
+    return this.pg.query("UPDATE kv SET value = $3, version = version + 1 WHERE ns = $1 AND key = $2 AND version = $4 RETURNING key", [ns, key, JSON.stringify(value), expected]).length === 1;
+  }
+  delete(ns: string, key: string): boolean {
+    return this.pg.query("DELETE FROM kv WHERE ns = $1 AND key = $2 RETURNING key", [ns, key]).length === 1;
+  }
+  list<T>(ns: string, prefix = ""): KvEntry<T>[] {
+    return this.pg
+      .query<{ key: string; value: T; version: string }>("SELECT key, value, version FROM kv WHERE ns = $1 AND left(key, $2) = $3 ORDER BY key", [ns, prefix.length, prefix])
+      .map((r) => ({ key: r.key, value: r.value, version: Number(r.version) }));
+  }
+}
+
+export function openPostgresStores(url: string): { pg: SyncPg; ledger: PgLedgerStore; runs: PgRunStore; approvals: PgApprovalStore; kv: PgKvStore } {
   const pg = new SyncPg(url);
   migrate(pg);
-  return { pg, ledger: new PgLedgerStore(pg), runs: new PgRunStore(pg), approvals: new PgApprovalStore(pg) };
+  return { pg, ledger: new PgLedgerStore(pg), runs: new PgRunStore(pg), approvals: new PgApprovalStore(pg), kv: new PgKvStore(pg) };
 }

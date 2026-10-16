@@ -104,6 +104,7 @@ export {
   type EvidenceBundle,
   type SigningKey,
 } from "./evidence.js";
+export { FileKvStore, KvConflictError, MemoryKvStore, kvUpdate, type KvEntry, type KvStore } from "./kv.js";
 export { dataOptionsFromEnv, openData, storeKindFrom, type Data, type DataOptions, type StoreKind } from "./data.js";
 export { engineConfigFromEnv, loadPolicyFile, openEngine, type EngineConfig, type EngineHandle } from "./config.js";
 export {
