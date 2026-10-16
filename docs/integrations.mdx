@@ -1,0 +1,229 @@
+---
+title: Framework integrations
+description: Put LangGraph, CrewAI, OpenAI Agents SDK, FastMCP and Claude Code tool calls behind Reversi with the Python SDK adapters.
+---
+
+The adapters live in `reversi_sdk.integrations`. Each one routes tool calls through a [run](/sdks/python), so every
+call is authorized, journaled before it executes, and given an outcome afterwards. The SDK core stays standard
+library only: each adapter imports its framework lazily, and `import reversi_sdk` never needs one.
+
+<Warning>
+**How these were tested.** The adapters are duck-typed against small fakes of each framework's interface (a tool with
+`name` and `invoke`, a `FunctionTool`-shaped dataclass, a `tool()` registrar, and so on), run against a fake Reversi
+server and, for the Claude Code hook, also the real built server. They were **not** run against installed copies of
+LangGraph, CrewAI, the OpenAI Agents SDK, the `mcp` package or Claude Code itself. The shapes below target the
+publicly documented interfaces of the current LangChain core `BaseTool`, CrewAI `BaseTool`, OpenAI Agents SDK
+`function_tool` and guardrails, MCP Python SDK `FastMCP`, and Claude Code hooks; no specific version range has been
+verified. If a release changes them, the adapter is the part to adjust. Treat a first run in your own environment as
+the real test.
+</Warning>
+
+Every tool name you pass must have a [manifest](/concepts/manifests) on the server, and the run must hold its
+permission. A refusal is a normal result, not an error: the adapters either return an explanation the model can read
+(`on_block="message"`, the default) or raise (`on_block="raise"`). When the refusal is a pending approval, the message
+carries the approval id so a human can approve it and the agent can retry once.
+
+```python
+from reversi_sdk import ReversiClient
+
+client = ReversiClient("http://127.0.0.1:7421", api_key="agent-key")
+run = client.start_run(["orders:write"], reason="support chat 4821")
+```
+
+## LangGraph and LangChain
+
+`reversible_tool` wraps a plain function (apply it under `@tool` so LangChain still sees the signature and docstring)
+or a `BaseTool`-like object that has `name` and `invoke(input)`. Async functions and `ainvoke` are supported.
+
+```python
+from langchain_core.tools import tool
+from reversi_sdk.integrations.langgraph import reversible_tool, rollback_node
+
+@tool
+@reversible_tool(run, "create_order", reason="customer asked")
+def create_order(sku: str) -> dict:
+    """Create an order."""
+    return shop.create_order(sku)
+
+# or wrap an existing tool object
+safe_search = reversible_tool(run, "search_orders", on_block="raise")(search_tool)
+```
+
+`rollback_node` returns a function you can add to a graph as a node. It runs `RunHandle.rollback` (needs an
+operator key) and puts the report in the state under `reversi_rollback`:
+
+```python
+from langgraph.graph import StateGraph
+
+ops = ReversiClient("http://127.0.0.1:7421", api_key="operator-key")
+graph.add_node("undo", rollback_node(ops, run.run_id, compensate=undo_one_call))
+```
+
+Limits: `ToolNode` and `create_react_agent` need real `BaseTool` instances. Wrap the function before `@tool`, as
+above; the proxy returned for an existing tool object is not itself a `BaseTool` subclass.
+
+## CrewAI
+
+`ReversibleCrewTool` has the shape of `crewai.tools.BaseTool` (`name`, `description`, `_run`) and wraps an existing
+tool. CrewAI validates its `tools=` list against the real `BaseTool` class, so call `to_crewai()` to get a genuine
+subclass instance that delegates to the adapter (it imports `crewai` at that moment).
+
+```python
+from reversi_sdk.integrations.crewai import ReversibleCrewTool
+
+lookup = ReversibleCrewTool(run, "lookup_order", inner=OrderLookupTool(), reason="support ticket")
+agent = Agent(role="support", goal="...", backstory="...", tools=[lookup.to_crewai()])
+```
+
+Limits: `to_crewai()` builds the subclass dynamically and copies `name`, `description` and `args_schema`; custom
+pydantic fields on your own tool class are not carried over.
+
+## OpenAI Agents SDK
+
+Put `reversi_function_tool` under `@function_tool`. A ready `FunctionTool` is also accepted: its
+`on_invoke_tool(ctx, input_json)` is wrapped and the parsed JSON arguments are journaled.
+
+```python
+from agents import Agent, function_tool
+from reversi_sdk.integrations.openai_agents import reversi_function_tool, tool_error_formatter, guardrail
+
+@function_tool(failure_error_function=tool_error_formatter)
+@reversi_function_tool(run, "create_order", on_block="raise")
+def create_order(sku: str) -> str:
+    return shop.create_order(sku)
+```
+
+With `on_block="raise"` the SDK hands the `Blocked` error to `tool_error_formatter`, which turns it into text for the
+model (including the approval id). With the default `"message"` the tool simply returns that text.
+
+`guardrail(client, run)` returns an input guardrail function that trips while the kill switch is on
+(`client.status()["halted"]`). It also trips if Reversi cannot be reached.
+
+```python
+from agents import InputGuardrail
+
+agent = Agent(
+    name="support",
+    tools=[create_order],
+    input_guardrails=[InputGuardrail(guardrail_function=guardrail(client, run))],
+)
+```
+
+The guardrail returns `agents.GuardrailFunctionOutput` when that package is installed. The kill switch is also
+enforced at every tool call, so the guardrail only stops a halted agent earlier.
+
+## FastMCP
+
+`reversible` replaces `@mcp.tool()`: it wraps the function and then registers it. `run_factory(ctx)` returns the run
+for the call; `ctx` is the tool's `Context` parameter (named `ctx` or `context`) or `None`. `per_session_runs` is a
+ready factory that opens one run per MCP session.
+
+```python
+from mcp.server.fastmcp import FastMCP, Context
+from reversi_sdk.integrations.fastmcp import reversible, per_session_runs, ReversiBlocked
+
+mcp = FastMCP("orders")
+runs = per_session_runs(client, ["orders:write"])
+
+@reversible(mcp, runs)
+def create_order(sku: str, ctx: Context) -> dict:
+    return shop.create_order(sku)
+```
+
+A refusal raises `ReversiBlocked` (with `approval_id` and `reasons`). FastMCP returns its message to the client as a
+tool error, so the model sees the approval id. Pass extra `mcp.tool` arguments as keyword arguments to `reversible`,
+or `tool_name=` when the Reversi manifest name differs from the function name.
+
+Limits: sessions are keyed by the identity of `ctx.session`; a run is kept in memory for the life of the process.
+
+## Claude Code hook
+
+`reversi-claude-hook` implements Claude Code's `PreToolUse` and `PostToolUse` hooks. It opens one Reversi run per
+Claude session (`claude-<session_id>`), asks Reversi before each tool call, and records the outcome afterwards.
+
+| Reversi says | Hook decision |
+| --- | --- |
+| `allow`, `would_block` | `allow` |
+| block with a pending approval | `ask`, with the approval id in the reason |
+| any other block | `deny`, with Reversi's reasons |
+| server unreachable, bad key, bad input | `deny` (fail closed) |
+
+Claude Code tool names are used as Reversi tool names (`Bash`, `Write`, ...), and `mcp__server__tool` becomes
+`server.tool`. Register a manifest for each one you want to allow; an unknown tool is blocked by the server.
+
+Install the package, export the configuration in the shell that starts Claude Code, and add the hooks:
+
+```bash
+pip install reversi-sdk
+export REVERSI_URL=http://127.0.0.1:7421
+export REVERSI_AGENT_KEY=...            # an agent key
+export REVERSI_PERMISSIONS=claude:read,claude:shell
+```
+
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "reversi-claude-hook" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "reversi-claude-hook --post" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "reversi-claude-hook --post" }] }
+    ]
+  }
+}
+```
+
+Keep the agent key out of the settings file, which is usually committed.
+
+| Variable | Meaning |
+| --- | --- |
+| `REVERSI_URL`, `REVERSI_AGENT_KEY` | Server address and agent key. Required. |
+| `REVERSI_PERMISSIONS` | Comma list granted to each new run. |
+| `REVERSI_HOOK_FAIL_OPEN=1` | Allow calls (unrecorded) when Reversi cannot be reached, for read-only exploration. Off by default. |
+| `REVERSI_HOOK_STATE` | Directory for the small state files that link a Post event to the step recorded at Pre time. Default: a temp directory. |
+| `REVERSI_TIMEOUT` | Seconds to wait for the server. Default 5. |
+
+Limits to know about:
+
+- `ask` shows Claude Code's own permission prompt. If the human says yes there, the tool runs even though the Reversi
+  approval is still pending, and no step is recorded for that call. For a hard gate, use `deny` semantics by not
+  granting the tool, or have the approver decide first and let the agent retry.
+- The Post hook never blocks. If it cannot reach Reversi it prints a note on stderr and the step stays unresolved,
+  which the server reports instead of hiding.
+- Reversi can only undo what a manifest describes. Claude Code's shell and file tools are usually `irreversible` or
+  `idempotent`, so rollback will list them as not undoable rather than undo them.
+- Hook input fields (`tool_use_id`, `PostToolUseFailure`) follow Claude Code's documented format; without a
+  `tool_use_id` the hook falls back to matching on the tool name and input.
+
+## Webhook signatures
+
+If your Reversi server signs outbound webhooks, verify them with the raw body bytes before parsing:
+
+```python
+from reversi_sdk import verify_webhook_signature
+
+ok = verify_webhook_signature(secret, request_body_bytes, request.headers.get("X-Reversi-Signature"))
+```
+
+The header has the form `sha256=<hex>`, the HMAC-SHA256 of the body under the shared secret. The comparison is
+constant time, and a missing or malformed header returns `False`. The header name depends on the server
+configuration; the helper only checks the value you pass.
+
+## Optional pydantic models
+
+`reversi_sdk.pydantic_models` provides pydantic v2 `ToolManifest` and `Compensation` models with the same rules as
+the standard library validator. Install with `pip install 'reversi-sdk[pydantic]'`. The SDK does not depend on pydantic
+and the standard library validator (`validate_manifest`) stays authoritative; a test checks both against the shared
+conformance cases.
+
+```python
+from reversi_sdk.pydantic_models import ToolManifest
+
+m = ToolManifest.model_validate(raw)      # raises pydantic.ValidationError
+manifest = m.normalized()                 # the same dict validate_manifest returns
+```

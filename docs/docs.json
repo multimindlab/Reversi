@@ -35,6 +35,7 @@
         "pages": [
           "gateway",
           "connectors",
+          "integrations",
           "console",
           "cli",
           "sdks/typescript",

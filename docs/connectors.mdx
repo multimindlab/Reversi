@@ -1,9 +1,9 @@
 ---
 title: Connectors
-description: Ready-made tools for the filesystem, GitHub, Slack and Stripe, each with a Reversi manifest and a compensation that really undoes it.
+description: Ready-made tools for the filesystem, GitHub, GitLab, Slack, Teams, Linear, Jira, Stripe, Google Calendar, Postgres, S3, Cloud Storage, Blob Storage and Kubernetes, each with a Reversi manifest, a compensation that really undoes it, and a certification suite.
 ---
 
-`@multimindlab/reversi-connectors` ships four connectors. Every tool has a [manifest](/concepts/manifests), and every
+`@multimindlab/reversi-connectors` ships fourteen connectors. Every tool has a [manifest](/concepts/manifests), and every
 compensation named in a manifest is itself a tool in the same package that accepts exactly the arguments the
 `argument_map` produces. Rollback therefore works end to end, with no glue code.
 
@@ -34,16 +34,34 @@ retried rollback never repeats a side effect.
 
 | Command | Purpose |
 |---|---|
-| `serve <fs\|github\|slack\|stripe> [--root dir] [--backup-dir dir]` | MCP server on stdio |
+| `serve <name> [--root dir] [--backup-dir dir]` | MCP server on stdio |
 | `manifests <name\|all> [--format json\|yaml]` | Print manifests |
 | `compensate [--root dir] [--backup-dir dir]` | Run one compensation call from stdin |
+| `certify <name\|all>` | Print the twelve certification checks and where the test suite enforces them |
 
-| Connector | Environment variable |
+`<name>` is one of `fs`, `github`, `slack`, `stripe`, `gitlab`, `teams`, `linear`, `jira`, `gcalendar`, `postgres`, `aws`, `gcp`, `azure`, `kubernetes`.
+
+| Connector | Environment variables |
 |---|---|
 | `fs` | none; `--root` is the only directory it can touch |
 | `github` | `GITHUB_TOKEN` |
 | `slack` | `SLACK_BOT_TOKEN` |
 | `stripe` | `STRIPE_SECRET_KEY` |
+| `gitlab` | `GITLAB_TOKEN`; optional `GITLAB_BASE_URL` for a self-hosted instance |
+| `teams` | `TEAMS_TOKEN` (a Microsoft Graph access token) |
+| `linear` | `LINEAR_API_KEY` |
+| `jira` | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` |
+| `gcalendar` | `GOOGLE_CALENDAR_TOKEN` |
+| `postgres` | `POSTGRES_URL` |
+| `aws` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`; optional `AWS_SESSION_TOKEN` |
+| `gcp` | `GCP_ACCESS_TOKEN` |
+| `azure` | `AZURE_STORAGE_TOKEN`, `AZURE_STORAGE_ACCOUNT` |
+| `kubernetes` | `KUBE_API_SERVER`, `KUBE_TOKEN`; optional `KUBE_CA_CERT` (a path to the cluster CA, PEM) |
+
+Credentials are read from the environment only; a flag such as `--token` is not accepted. `compensate` enables every
+connector whose main credential variable is set (`GITHUB_TOKEN`, `SLACK_BOT_TOKEN`, `STRIPE_SECRET_KEY`,
+`GITLAB_TOKEN`, `TEAMS_TOKEN`, `LINEAR_API_KEY`, `JIRA_API_TOKEN`, `GOOGLE_CALENDAR_TOKEN`, `POSTGRES_URL`,
+`AWS_ACCESS_KEY_ID`, `GCP_ACCESS_TOKEN`, `AZURE_STORAGE_TOKEN`, `KUBE_API_SERVER`).
 
 Secrets are redacted from every error message.
 
@@ -53,6 +71,7 @@ In code:
 import { allConnectors, compensatorFor } from "@multimindlab/reversi-connectors";
 
 const connectors = allConnectors({ fs: { root: "./work" }, github: { token: process.env.GITHUB_TOKEN! } });
+// also: gitlab, teams, linear, jira, gcalendar, postgres, aws, gcp, azure, kubernetes
 const registry = Registry.from(connectors.flatMap((c) => c.manifests));
 // ... run.call({ tool, args, reason, execute: (a) => connectors[0].tools[tool](a, {}) })
 await run.rollback({ compensate: compensatorFor(connectors) });
@@ -142,3 +161,288 @@ Limits:
   and confirm them outside the agent.
 - A deleted Stripe customer cannot be restored, and its saved payment methods are gone. Rollback only deletes customers
   the run created.
+
+## GitLab (`gitlab`)
+
+Calls `https://gitlab.com/api/v4`. For a self-hosted instance set `GITLAB_BASE_URL` (or `baseUrl` in code) to its root; `/api/v4` is added. The token goes in the `PRIVATE-TOKEN` header. `project` is a numeric ID or a full path such as `group/project`.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `gitlab.get_issue` | read_only | `gitlab:issues:read` | |
+| `gitlab.create_issue` | reversible | `gitlab:issues:write` | `gitlab.close_issue` |
+| `gitlab.add_note` | reversible | `gitlab:issues:write` | `gitlab.delete_note` (404 is success) |
+| `gitlab.create_branch` | reversible | `gitlab:branch:write` | `gitlab.delete_branch` (404 is success) |
+| `gitlab.close_issue`, `gitlab.delete_note` | idempotent | `gitlab:issues:write` | |
+| `gitlab.delete_branch` | idempotent | `gitlab:branch:delete` | |
+
+Required token scopes: `read_api` for `get_issue`; `api` for everything else. The user behind the token needs at least the Developer role in the project.
+
+Limits:
+
+- The issue is closed, not deleted (as with GitHub): it stays visible in the project.
+- `gitlab.delete_branch` is idempotent so it can run as a compensation; an agent that calls it itself is not undone. Keep `gitlab:branch:delete` out of the agent's scope. Protected branches cannot be deleted without the Maintainer role.
+
+## Microsoft Teams (`teams`)
+
+Calls Microsoft Graph, `https://graph.microsoft.com/v1.0`, with a bearer token in `TEAMS_TOKEN`. Obtain the token yourself (the connector does not run an OAuth flow).
+
+| Tool | Graph request | Effect | Permission | Undone by |
+|---|---|---|---|---|
+| `teams.list_channels` | `GET /teams/{team-id}/channels` | read_only | `teams:channels:read` | |
+| `teams.post_message` | `POST /teams/{team-id}/channels/{channel-id}/messages` | reversible | `teams:messages:write` | `teams.delete_message` |
+| `teams.delete_message` | `POST /teams/{team-id}/channels/{channel-id}/messages/{message-id}/softDelete` | idempotent | `teams:messages:delete` | |
+
+Microsoft Graph permissions, as we read the Graph reference (confirm against the current reference for your tenant, since Microsoft changes these):
+
+| Tool | Graph permission |
+|---|---|
+| `teams.list_channels` | `Channel.ReadBasic.All` (delegated or application) |
+| `teams.post_message` | `ChannelMessage.Send`, delegated only. Application permissions cannot post to a channel except for data import. |
+| `teams.delete_message` | `ChannelMessage.ReadWrite`, delegated. The signed-in user must be allowed to delete that message. |
+
+Limits:
+
+- Posting needs a signed-in user (delegated token). A service principal with only application permissions cannot use `teams.post_message`.
+- `softDelete` marks the message deleted; members still see a "message deleted" placeholder in the channel, and the message remains in compliance exports. It is not a purge.
+- People may have read or replied to the message before it is deleted.
+- The Graph endpoints and permissions above are implemented from Microsoft's documentation and tested against a fake; they have not been run against a live tenant.
+
+## Linear (`linear`)
+
+One GraphQL endpoint, `https://api.linear.app/graphql`. A personal API key is sent as the whole `Authorization` value (no `Bearer ` prefix). To use an OAuth token instead, pass it prefixed with `Bearer `.
+
+| Tool | GraphQL operation | Effect | Permission | Undone by |
+|---|---|---|---|---|
+| `linear.get_issue` | `issue(id:)` | read_only | `linear:issues:read` | |
+| `linear.create_issue` | `issueCreate` | reversible | `linear:issues:write` | `linear.archive_issue` |
+| `linear.add_comment` | `commentCreate` | reversible | `linear:comments:write` | `linear.delete_comment` |
+| `linear.archive_issue` | `issueArchive` | idempotent | `linear:issues:write` | |
+| `linear.delete_comment` | `commentDelete` | idempotent | `linear:comments:write` | |
+
+OAuth scopes: `read` for `get_issue`; `write` (or `issues:create` and `comments:create` for the create calls) for the rest. A personal API key has the user's full access.
+
+Limits:
+
+- An archived issue still exists; it is hidden from boards and can be restored in the Linear UI. Linear sends notifications when an issue is created, and archiving does not recall them.
+- GraphQL errors come back with HTTP 200 or 400; both are treated as failures. "Entity not found" counts as success for the two compensations, since the goal (the thing is gone) is met.
+
+## Jira (`jira`)
+
+Jira Cloud REST API v3 at `JIRA_BASE_URL` (such as `https://yourco.atlassian.net`), with basic authentication: your account email and an API token. Descriptions and comments are sent as Atlassian Document Format paragraphs.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `jira.get_issue` | read_only | `jira:issues:read` | |
+| `jira.create_issue` | reversible | `jira:issues:write` | `jira.delete_issue` |
+| `jira.add_comment` | reversible | `jira:comments:write` | `jira.delete_comment` |
+| `jira.transition_issue` | compensable | `jira:issues:transition` | `jira.restore_status` |
+| `jira.delete_issue` | idempotent | `jira:issues:delete` | |
+| `jira.delete_comment` | idempotent | `jira:comments:write` | |
+| `jira.restore_status` | idempotent | `jira:issues:transition` | |
+
+`jira.transition_issue` is not reversible by itself. It reads the issue's current status first and returns `previous_status` and `previous_status_id`; rollback calls `jira.restore_status`, which finds a workflow transition that leads to that status and runs it. A transition can be given as an ID, a transition name, or the name of the status it leads to.
+
+Jira project permissions the account needs: Browse Projects, Create Issues, Add Comments, Transition Issues, Delete Issues (for the `create_issue` compensation), Delete Own Comments (for the `add_comment` compensation). With OAuth 3LO instead of basic auth the scopes are `read:jira-work` and `write:jira-work`.
+
+Limits:
+
+- Deleting an issue cannot be undone and the issue key number is not reused. `jira.delete_issue` is idempotent only so it can run as a compensation; keep `jira:issues:delete` out of the agent's scope. Jira refuses to delete an issue that has subtasks.
+- If the workflow has no transition back to the previous status, `jira.restore_status` fails and the rollback reports the step as failed. The issue history shows both transitions, and workflow post-functions (assignee changes, resolutions, notifications) run each time.
+
+## Google Calendar (`gcalendar`)
+
+Calls `https://www.googleapis.com/calendar/v3` with a bearer token in `GOOGLE_CALENDAR_TOKEN`. `calendar_id` defaults to `primary`. Every write passes `sendUpdates=none`, so no invitation or change emails go out.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `gcalendar.list_events` | read_only | `gcalendar:events:read` | |
+| `gcalendar.create_event` | reversible | `gcalendar:events:write` | `gcalendar.delete_event` (404 and 410 are success) |
+| `gcalendar.update_event` | reversible | `gcalendar:events:write` | `gcalendar.restore_event` |
+| `gcalendar.delete_event` | idempotent | `gcalendar:events:delete` | |
+| `gcalendar.restore_event` | idempotent | `gcalendar:events:write` | |
+
+`gcalendar.update_event` reads the event first and returns `previous`, holding the old value (or `null` if the field was empty) of exactly the fields it changed. `gcalendar.restore_event` patches those values back; a `null` removes the field. Fields: `summary`, `description`, `location`, `start`, `end`.
+
+OAuth scopes: `https://www.googleapis.com/auth/calendar.events.readonly` for `list_events`; `https://www.googleapis.com/auth/calendar.events` for the rest.
+
+Limits:
+
+- Attendees are not managed by this connector, and nothing is emailed. If you need invitations, do that outside the agent.
+- A deleted event goes to the calendar's trash for a while but is not restored by rollback of `create_event`; it is deleted.
+- Someone editing the event between `update_event` and rollback has those edits to the same fields overwritten by the restore.
+
+## Postgres (`postgres`)
+
+Connects with `POSTGRES_URL` through the `pg` package. Every tool takes parameters only:
+
+- Table, schema and column names must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$` and are always double-quoted.
+- Every value is a bound parameter (`$1`, `$2`, ...). No value is ever written into SQL text. The tests assert the exact SQL and parameters.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `postgres.query` | read_only | `postgres:rows:read` | |
+| `postgres.insert_row` | reversible | `postgres:rows:write` | `postgres.delete_row` (by the primary key from `RETURNING`) |
+| `postgres.update_row` | reversible | `postgres:rows:write` | `postgres.restore_row` |
+| `postgres.delete_row` | idempotent | `postgres:rows:delete` | |
+| `postgres.restore_row` | idempotent | `postgres:rows:write` | |
+
+How each works:
+
+- `insert_row` runs `INSERT INTO "t" ("a","b") VALUES ($1,$2) RETURNING "id"` (the key column is `id` unless `key_column` says otherwise) and returns the key.
+- `update_row` runs one transaction: `BEGIN`, `SELECT` of the old values of the columns being set with `FOR UPDATE`, `UPDATE`, `COMMIT`. It returns the old values; `restore_row` sets them back.
+- `query` takes one `SELECT` or `WITH` statement with `$n` placeholders and `values`. It runs between `BEGIN READ ONLY` and `ROLLBACK`, so a write hidden in a `WITH` is refused by the server. Statements containing `;` are rejected up front because a multi-statement string sent without parameters would run outside the guard. At most 1000 rows come back.
+- Objects and arrays are bound as JSON text (for `json` and `jsonb` columns). Binary columns are not supported.
+- A server error carries its SQLSTATE (`Postgres error 42501: ...`) and the transaction is rolled back. A lost connection after a write was sent is `EffectUncertainError`.
+
+Database privileges: `SELECT` for `query`; `INSERT` for `insert_row`; `UPDATE` for `update_row` and `restore_row`; `DELETE` for `delete_row`. Use a dedicated role.
+
+Limits:
+
+- `READ ONLY` stops writes to tables, not every side effect: `nextval()`, advisory locks and functions from extensions still run. Grant the role only what it needs.
+- Rollback of `insert_row` deletes the row, but sequences stay advanced (gaps in `serial` ids), triggers and `ON DELETE CASCADE` rules run, and rows other transactions linked to it meanwhile are affected.
+- `restore_row` writes the old values back, so `updated_at`-style triggers fire again and any change by others to those columns since is overwritten.
+- `postgres.delete_row` deletes data for good. It is idempotent so it can run as a compensation; keep `postgres:rows:delete` out of the agent's scope.
+
+## Amazon S3 (`aws`)
+
+Signs requests with AWS Signature Version 4, implemented here with `node:crypto` (no AWS SDK). Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, optional `AWS_SESSION_TOKEN`. Requests go to `https://<bucket>.s3.<region>.amazonaws.com` (path-style for bucket names containing dots, or against `endpoint` for MinIO and similar). Content is text by default, or base64 with `encoding: "base64"`; objects up to 5 MiB.
+
+| Tool | Effect | Permission | IAM actions | Undone by |
+|---|---|---|---|---|
+| `aws.get_object` | read_only | `aws:s3:read` | `s3:GetObject` | |
+| `aws.list_objects` | read_only | `aws:s3:read` | `s3:ListBucket` | |
+| `aws.put_object` | reversible | `aws:s3:write` | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | `aws.restore_object` |
+| `aws.delete_object` | reversible | `aws:s3:write` | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` | `aws.restore_object` |
+| `aws.restore_object` | idempotent | `aws:s3:write` | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | |
+
+How the undo works: before `put_object` overwrites or `delete_object` deletes an existing key, the connector copies it server-side to `.reversi-backups/<uuid>` in the same bucket and returns `backup_key` and `existed`. `restore_object` copies the backup back over the key, or deletes the key when there was no previous object (`backup_key` is `null`). Without `s3:ListBucket` S3 answers 403 instead of 404 for a missing key, so grant it.
+
+Limits:
+
+- Backup objects are kept (that is what makes the restore repeatable). Add a lifecycle rule that expires `.reversi-backups/`.
+- Copies use `CopyObject`, which is limited to 5 GiB per object; larger objects fail.
+- There is no precondition on S3 writes here, so a writer racing between the backup and the write can have its change restored over. The Cloud Storage and Blob Storage connectors guard this with generation and ETag preconditions.
+- Bucket event notifications, replication and versioning react to every write, copy and delete the connector makes.
+- `.reversi-backups/` keys cannot be written or deleted through the tools and are hidden from `list_objects`.
+
+## Google Cloud Storage (`gcp`)
+
+Calls the Cloud Storage JSON API at `https://storage.googleapis.com` with a bearer token in `GCP_ACCESS_TOKEN`. Same shape as S3, with preconditions: the connector reads the object's generation, copies that generation to `.reversi-backups/<uuid>` with `rewriteTo` (looping until `done`, so large objects work), and then writes or deletes with `ifGenerationMatch` set to that generation (`0` for a new object). If someone changed the object in between, the write is refused with 412 and nothing is overwritten.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `gcp.get_object`, `gcp.list_objects` | read_only | `gcp:storage:read` | |
+| `gcp.put_object`, `gcp.delete_object` | reversible | `gcp:storage:write` | `gcp.restore_object` |
+| `gcp.restore_object` | idempotent | `gcp:storage:write` | |
+
+Required: OAuth scope `https://www.googleapis.com/auth/devstorage.read_write` (`devstorage.read_only` for reads only) and the IAM permissions `storage.objects.get`, `storage.objects.list`, `storage.objects.create`, `storage.objects.delete`. The role `roles/storage.objectAdmin` covers them.
+
+Limits: as for S3, backup objects remain (add a lifecycle rule); object versioning and Pub/Sub notifications react to every write; `restore_object` overwrites whatever is at the key now.
+
+## Azure Blob Storage (`azure`)
+
+Calls `https://<AZURE_STORAGE_ACCOUNT>.blob.core.windows.net` (service version `2023-11-03`) with a Microsoft Entra bearer token in `AZURE_STORAGE_TOKEN` (audience `https://storage.azure.com/`). Same shape as S3, with ETag preconditions: the blob is copied synchronously to `.reversi-backups/<uuid>` only if its ETag is unchanged (`x-ms-source-if-match`), then written with `If-Match` (or `If-None-Match: *` for a new blob) or deleted with `If-Match`.
+
+| Tool | Effect | Permission | Undone by |
+|---|---|---|---|
+| `azure.get_blob`, `azure.list_blobs` | read_only | `azure:blob:read` | |
+| `azure.put_blob`, `azure.delete_blob` | reversible | `azure:blob:write` | `azure.restore_blob` |
+| `azure.restore_blob` | idempotent | `azure:blob:write` | |
+
+Required Azure roles: Storage Blob Data Reader for reads; Storage Blob Data Contributor for writes and deletes.
+
+Limits: the synchronous copy (`Copy Blob From URL`) is limited to 256 MiB; larger blobs fail. Backup blobs remain (add a lifecycle management rule). Soft delete, versioning and Event Grid events on the account react to each operation. Only block blobs are written.
+
+## Kubernetes (`kubernetes`)
+
+Calls the Kubernetes REST API at `KUBE_API_SERVER` with a bearer token in `KUBE_TOKEN`. With `KUBE_CA_CERT` (a path to the cluster CA in PEM) requests go through `node:https` with that CA; without it the connector uses the runtime's `fetch`. Namespaces must be DNS-1123 labels and names DNS-1123 subdomains, so they cannot contain a path or a query.
+
+| Tool | Effect | Permission | RBAC verbs | Undone by |
+|---|---|---|---|---|
+| `kubernetes.get_deployment` | read_only | `kubernetes:deployments:read` | `get` on `deployments.apps` | |
+| `kubernetes.list_pods` | read_only | `kubernetes:pods:read` | `list` on `pods` | |
+| `kubernetes.scale_deployment` | reversible | `kubernetes:deployments:scale` | `get`, `patch` on `deployments.apps/scale` | `kubernetes.restore_replicas` |
+| `kubernetes.create_configmap` | reversible | `kubernetes:configmaps:write` | `create` on `configmaps` | `kubernetes.delete_configmap` |
+| `kubernetes.restore_replicas` | idempotent | `kubernetes:deployments:scale` | `patch` on `deployments.apps/scale` | |
+| `kubernetes.delete_configmap` | idempotent | `kubernetes:configmaps:delete` | `delete` on `configmaps` | |
+| `kubernetes.rollout_restart` | irreversible, approval always | `kubernetes:deployments:restart` | `patch` on `deployments.apps` | nothing |
+| `kubernetes.delete_pod` | irreversible, approval always | `kubernetes:pods:delete` | `delete` on `pods` | nothing |
+
+- `scale_deployment` reads the current replica count through the scale subresource, scales with a merge patch, and returns `previous_replicas`; rollback sets it back.
+- `create_configmap` fails with 409 if the name exists, so rollback never deletes an object it did not create. Rollback deletes with a UID precondition, so a different ConfigMap that later took the same name is left alone (the 409 is treated as success).
+- `rollout_restart` stamps the pod template annotation `kubectl.kubernetes.io/restartedAt`, like `kubectl rollout restart`. Pods are replaced, so it is declared irreversible and always needs approval. `delete_pod` likewise.
+
+Limits: a HorizontalPodAutoscaler may scale back on its own; `restore_replicas` sets the saved count even if someone changed it since; pods that read a ConfigMap you created may have acted on it before it was deleted. The `KUBE_CA_CERT` transport is tested against a local HTTP server, not a TLS handshake with a real CA.
+
+## Certification
+
+Every connector is run through a twelve-check certification suite in `npm test`. The suite drives each tool against a fake backend with fault injection, using a real Reversi engine for the rollback checks. A connector that fails any check fails the test run. Each check records `pass`, `fail` or `not_applicable`, and `not_applicable` must carry a reason.
+
+| Check | What it verifies |
+|---|---|
+| Forward success | Every tool does its job; read-only tools change nothing and send no write |
+| Forward failure | A rejected call is an error naming the HTTP status, with the credential scrubbed, and the backend is unchanged |
+| Duplicate call | The same call with the same idempotency key a second time has no further effect (applies to idempotent tools and to tools that send the key, such as Stripe writes) |
+| Retry | A lost connection on a write is `EffectUncertainError`, a 5xx is an error naming the status, and running the call again succeeds |
+| Compensation success | A real engine rolls the step back; the backend is back in its prior state (or the documented residue); the compensation is a registered idempotent tool that takes exactly the arguments the manifest maps |
+| Compensation failure | A 500 during the undo leaves the step `compensation_failed` and the rollback incomplete; after the fault clears, a retry completes |
+| Verification failure | A `verify` callback that returns false makes the step report as failed and not compensated |
+| Permission denial | A 401 or 403 is an error naming the status, without the credential |
+| Timeout | A backend that never answers ends in `EffectUncertainError` for a write and a plain error for a read |
+| Redaction | The credential is in no error message, returned JSON, request URL or request body |
+| Dependency block | With a `requires` edge, rolling back while the later step stands defers the earlier one |
+| Manifest drift | A changed, added or removed tool input schema is detected against stored hashes |
+
+Results, generated from the test run (the test suite fails if this table or the reasons below drift from the actual results):
+
+| Connector | Forward success | Forward failure | Duplicate call | Retry | Compensation success | Compensation failure | Verification failure | Permission denial | Timeout | Redaction | Dependency block | Manifest drift |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fs | pass | pass | pass | n/a | pass | pass | pass | n/a | n/a | n/a | n/a | pass |
+| github | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| slack | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| stripe | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| gitlab | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| teams | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| linear | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| jira | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| gcalendar | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| postgres | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| aws | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| gcp | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| azure | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+| kubernetes | pass | pass | pass | pass | pass | pass | pass | pass | pass | pass | n/a | pass |
+
+Why a check is `n/a`:
+
+- fs, Retry: the local filesystem has no network transport that can fail transiently; errors are definite
+- fs, Permission denial: access control is the operating system's; the connector confines paths to its root instead (covered in filesystem.test.ts)
+- fs, Timeout: local file operations have no network wait to time out
+- fs, Redaction: the connector holds no credential
+- All connectors, Dependency block: no tool manifest declares `requires`
+
+The dependency block check is implemented and runs as soon as a manifest declares `requires`; the suite's self-test proves it with a synthetic connector that does. No shipped connector declares one yet, so for them it has not been exercised.
+
+Run `reversi-connectors certify all` for the checklist, and see `packages/connectors/test/certify.test.ts`, `test/certification.ts` and `test/fixtures/<name>.ts` for the suite. `test/certification.selftest.test.ts` shows the suite failing a deliberately broken connector (credential leak, lost uncertainty, an undo that does nothing, no timeout).
+
+### Manifest drift
+
+`connectorSchemaHashes(connector)` returns a SHA-256 of each tool's input schema (canonical JSON, so key order does not matter). Store it as a baseline; `detectManifestDrift(manifests, inputSchemas, baseline)` later returns the tool names that were `added`, `removed` or `changed`:
+
+```ts
+import { connectorSchemaHashes, detectManifestDrift } from "@multimindlab/reversi-connectors";
+
+const baseline = connectorSchemaHashes(connector);          // store this
+// later, after upgrading the package:
+const drift = detectManifestDrift(connector.manifests, connector.inputSchemas, baseline);
+if (drift.changed.length) throw new Error(`tool schemas changed: ${drift.changed.join(", ")}`);
+```
+
+The package does not store or compare a baseline for you yet; this is the building block for a gateway or CI step.
+
+## Honest limits of the certification
+
+- **Everything is tested against fakes, not live services.** Each fake is written from the vendor's API documentation. If a real service behaves differently from its fake, the suite cannot tell. The first run against a real account is the real test; start with a throwaway project, bucket or database.
+- **An HTTP 5xx on a write is reported as an HTTP error naming the status, not as `EffectUncertainError`.** The server answered, so the connector treats the call as failed. Only a lost connection or a timeout is uncertain. For a gateway timeout (502, 504) the write may in fact have been applied; check before retrying.
+- **Compensations that leave residue:** GitHub and GitLab issues are closed, not deleted; Stripe payment intents are canceled, not removed; Linear issues are archived; Teams messages become soft-deleted placeholders; S3, Cloud Storage and Blob Storage keep `.reversi-backups/` copies; the filesystem keeps its backup directory; Postgres sequences stay advanced; a Jira rollback leaves two transitions in the issue history. Where a fake backend does not return to its exact prior state after rollback, the fixture overrides the comparison in code (`restored`, or a fingerprint that ignores backups), so the difference is stated rather than hidden. Residue the fakes do not model (Jira history, Postgres sequences, notifications) is documented here but not tested.
+- **Irreversible tools are certified only for what they can be:** Stripe refunds, `kubernetes.rollout_restart` and `kubernetes.delete_pod` are checked for forward behaviour, failure, retry, permission, timeout and redaction. They have no compensation, so rollback reports them unrecoverable.
+- **Concurrent writers.** The restore tools put back what the connector saw. Someone else changing the same thing between the call and the rollback is overwritten, except where a precondition guards it (Cloud Storage generations, Blob Storage ETags, Kubernetes UIDs, Postgres row locks during `update_row`).

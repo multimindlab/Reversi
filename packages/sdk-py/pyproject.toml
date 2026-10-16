@@ -20,5 +20,11 @@ Homepage = "https://reversi.multimind.dev"
 Documentation = "https://reversi-docs.multimind.dev"
 Repository = "https://github.com/multimindlab/reversi"
 
+[project.optional-dependencies]
+pydantic = ["pydantic>=2"]
+
+[project.scripts]
+reversi-claude-hook = "reversi_sdk.integrations.claude_code_hook:main"
+
 [tool.setuptools]
-packages = ["reversi_sdk"]
+packages = ["reversi_sdk", "reversi_sdk.integrations"]
