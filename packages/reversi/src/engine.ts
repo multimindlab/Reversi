@@ -19,6 +19,7 @@ import { Ledger, type LedgerEvent } from "./ledger.js";
 import { redactSecrets } from "./redact.js";
 import { Registry, resolveRef } from "./manifest.js";
 import type { Verification } from "./manifest.js";
+import type { CaptureStore } from "./capture.js";
 import type { KvStore } from "./kv.js";
 import type { ApprovalRequirement, Policy, PolicyInput } from "./policy.js";
 import { globAny } from "./glob.js";
@@ -97,6 +98,8 @@ export interface ReversiOptions {
   environment?: string;
   /** If this file exists, every new call is blocked (rollback still works). */
   kill_switch_file?: string;
+  /** Opt-in capture of redacted arguments and results, for replay, simulation and impact previews. */
+  capture?: CaptureStore;
   /** Shared settings store: halts are kept here so every process using the same data store sees them. */
   kv?: KvStore;
 }
@@ -359,9 +362,11 @@ export class Reversi {
   private readonly killFile: string | undefined;
   private readonly memoryHalts = new Map<string, Halt>();
   private readonly kv: KvStore | undefined;
+  readonly capture: CaptureStore | undefined;
 
   constructor(opts: ReversiOptions) {
     this.kv = opts.kv;
+    this.capture = opts.capture;
     this.policy = opts.policy;
     this.content = opts.content;
     this.environment = opts.environment ?? "default";
@@ -622,6 +627,7 @@ export class Run {
     const enforce = state.mode === "enforce";
     if (violations.length && enforce) {
       this.emit("blocked", null, call.tool, call.args, call.reason, violations.join("; "));
+      this.captureCall(state, call, manifest?.audit?.redaction, null, "block", violations, riskScore, manifest?.version);
       return { decision: "block", reasons: violations };
     }
     const observed = [...violations];
@@ -654,6 +660,7 @@ export class Run {
               : "approval required but no approver is configured";
         if (enforce) {
           this.emit("blocked", null, call.tool, call.args, call.reason, `${msg} [${triggers.join("; ")}]`);
+          this.captureCall(state, call, manifest?.audit?.redaction, null, "block", [msg], riskScore, manifest?.version);
           return { decision: "block", reasons: [msg] };
         }
         observed.push(msg);
@@ -706,6 +713,7 @@ export class Run {
       ...(riskScore !== undefined ? { risk_score: riskScore } : {}),
     });
     this.rv.runs.put(st);
+    this.captureCall(state, call, manifest?.audit?.redaction, step, observed.length ? "would_block" : "allow", observed, riskScore, manifest?.version);
     return observed.length ? { decision: "would_block", step, reasons: observed } : { decision: "allow", step };
   }
 
@@ -736,6 +744,37 @@ export class Run {
       }
     }
     return { tool: v.tool, refs: v.arguments, args: resolved, expect: v.expect, retries: v.retries, backoff_ms: v.backoff_ms, missing: [...missing] };
+  }
+
+  private captureCall(
+    state: RunState,
+    call: BeginInput,
+    redact: string[] | undefined,
+    step: number | null,
+    decision: "allow" | "would_block" | "block",
+    reasons: string[],
+    risk: number | undefined,
+    manifest_version: number | undefined,
+  ): void {
+    if (!this.rv.capture?.enabled) return;
+    try {
+      this.rv.capture.record({
+        run_id: this.run_id,
+        step,
+        tool: call.tool,
+        actor: state.actor,
+        tenant: state.tenant,
+        environment: this.rv.environment,
+        args: call.args,
+        decision,
+        reasons,
+        manifest_version,
+        risk_score: risk,
+        redact_paths: redact,
+      });
+    } catch {
+      /* capture is a convenience: it must never stop a call */
+    }
   }
 
   /** Record the outcome of a call that {@link Run.begin} allowed. */
@@ -836,6 +875,13 @@ export class Run {
       s.error = error || null;
     }
     this.rv.runs.put(st);
+    if (this.rv.capture?.enabled && (s.status === "succeeded" || s.status === "failed" || s.status === "uncertain")) {
+      try {
+        this.rv.capture.complete(this.run_id, step, s.status, outcome.status === "succeeded" ? outcome.result : undefined, this.rv.registry.get(s.tool)?.audit?.redaction);
+      } catch {
+        /* see above */
+      }
+    }
     return { step, status: s.status };
   }
 

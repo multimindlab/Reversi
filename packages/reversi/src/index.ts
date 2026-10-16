@@ -137,3 +137,25 @@ export { Delegations, type Delegation } from "./delegations.js";
 export { WindowCounters } from "./counters.js";
 export { DEFAULT_WEIGHTS, parseRisk, scoreRisk, type RiskConfig, type RiskInput, type RiskResult } from "./risk.js";
 export { frozenAt, inWindow, type Day, type Freeze, type Window } from "./schedule.js";
+export { CaptureStore, DEFAULT_CAPTURE, redactForCapture, type CaptureConfig, type CaptureRecord } from "./capture.js";
+export { detectPii, maskPii, type PiiKind } from "./pii.js";
+export {
+  Sandbox,
+  previewImpact,
+  replayRun,
+  simulatePolicy,
+  speculate,
+  synthesizeResult,
+  type ArgChange,
+  type Change,
+  type ImpactPreview,
+  type PlanInput,
+  type PlanReport,
+  type ReplayReport,
+  type SandboxCall,
+  type SandboxContext,
+  type SandboxStep,
+  type SimulationReport,
+  type SpeculationReport,
+  type Verdict,
+} from "./simulate.js";

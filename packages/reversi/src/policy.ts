@@ -183,9 +183,9 @@ function parseContent(raw: unknown, errors: string[]): Partial<ContentConfig> | 
   }
   const out: Partial<ContentConfig> = {};
   for (const k of Object.keys(raw)) {
-    if (!["secrets", "encoded_payloads", "injection", "cumulative", "max_string_bytes"].includes(k)) errors.push(`content: unknown field \`${k}\``);
+    if (!["secrets", "encoded_payloads", "injection", "pii", "cumulative", "max_string_bytes"].includes(k)) errors.push(`content: unknown field \`${k}\``);
   }
-  for (const k of ["secrets", "encoded_payloads", "injection"] as const) {
+  for (const k of ["secrets", "encoded_payloads", "injection", "pii"] as const) {
     if (raw[k] === undefined) continue;
     if (!CHECK_ACTIONS.includes(raw[k] as CheckAction)) errors.push(`content.${k} must be ${CHECK_ACTIONS.join(", ")}`);
     else out[k] = raw[k] as CheckAction;
