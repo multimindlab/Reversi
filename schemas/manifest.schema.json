@@ -4,51 +4,434 @@
   "title": "Reversi tool manifest",
   "description": "Declares how reversible one tool is, what undoes it, and which permission it needs. A manifest file is one of these or an array of them (JSON or YAML).",
   "type": "object",
-  "required": ["tool", "effect", "permission"],
+  "required": [
+    "tool",
+    "effect",
+    "permission"
+  ],
   "additionalProperties": false,
   "properties": {
-    "tool": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$" },
-    "description": { "type": "string" },
+    "tool": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$"
+    },
+    "description": {
+      "type": "string"
+    },
     "effect": {
-      "enum": ["read_only", "idempotent", "reversible", "compensable", "irreversible"],
+      "enum": [
+        "read_only",
+        "idempotent",
+        "reversible",
+        "compensable",
+        "irreversible"
+      ],
       "description": "read_only: no external change. idempotent: safe to retry, no undo needed. reversible: a true inverse exists. compensable: a counteraction exists but leaves residue (a refund appears on a statement). irreversible: no safe undo."
     },
-    "permission": { "type": "string", "pattern": "^\\S{1,128}$", "examples": ["orders:write"] },
+    "permission": {
+      "type": "string",
+      "pattern": "^\\S{1,128}$",
+      "examples": [
+        "orders:write"
+      ]
+    },
     "approval": {
-      "enum": ["never", "always"],
-      "default": "never",
-      "description": "always makes a human approve each call. Forced to always for irreversible tools."
+      "description": "never | always, or an object naming who may approve, how many must, and what happens on timeout. Forced to always for irreversible tools.",
+      "oneOf": [
+        {
+          "enum": [
+            "never",
+            "always"
+          ],
+          "default": "never"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "quorum": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "timeout": {
+              "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+                }
+              ]
+            },
+            "on_timeout": {
+              "enum": [
+                "deny",
+                "escalate"
+              ]
+            },
+            "escalate_to": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
     },
     "compensation": {
       "type": "object",
-      "required": ["tool"],
+      "required": [
+        "tool"
+      ],
       "additionalProperties": false,
       "properties": {
-        "tool": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$" },
+        "tool": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$"
+        },
         "argument_map": {
           "type": "object",
           "description": "Compensation argument name to a reference: $args.path (the original call) or $result.path (what the tool returned).",
-          "additionalProperties": { "type": "string", "pattern": "^\\$(args|result)(\\.[A-Za-z0-9_-]+)+$" }
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^\\$(args|result)(\\.[A-Za-z0-9_-]+)+$"
+          }
         },
-        "requires_approval": { "type": "boolean", "default": false }
+        "requires_approval": {
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "enum": [
+            "inverse",
+            "compensation"
+          ],
+          "default": "compensation",
+          "description": "inverse restores the exact prior state; compensation makes amends and may leave residue."
+        },
+        "residue": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "What the undo cannot take back."
+        },
+        "timeout_ms": {
+          "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+            }
+          ]
+        },
+        "verification": {
+          "type": "object",
+          "required": [
+            "tool",
+            "expect"
+          ],
+          "additionalProperties": false,
+          "description": "Read back state after the undo and require it to match before calling the undo complete.",
+          "properties": {
+            "tool": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}$"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "^\\$(args|result)(\\.[A-Za-z0-9_-]+)+$"
+              }
+            },
+            "expect": {
+              "type": "object",
+              "minProperties": 1
+            },
+            "retries": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 3
+            },
+            "backoff_ms": {
+              "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+                }
+              ]
+            }
+          }
+        }
       }
     },
     "requires": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "tool"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "tool": {
+                "type": "string",
+                "minLength": 1
+              },
+              "status": {
+                "const": "succeeded"
+              }
+            }
+          }
+        ]
+      },
       "uniqueItems": true,
       "description": "Tools that must have succeeded earlier in the same run. Also creates rollback ordering edges."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "approved",
+        "deprecated"
+      ],
+      "default": "approved",
+      "description": "draft: not enforceable, calls are blocked. deprecated: still runs and still rolls back."
+    },
+    "replaced_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "oncall": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data_class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blast_radius": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "environment": {
+          "type": "string"
+        }
+      }
+    },
+    "timeout_ms": {
+      "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+        }
+      ]
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Only for read_only and idempotent tools.",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "base_ms": {
+          "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+            }
+          ]
+        },
+        "max_ms": {
+          "description": "A positive number of milliseconds, or a duration such as 500ms, 30s, 15m, 2h, 1d.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^\\d+(\\.\\d+)?\\s*(ms|s|m|h|d)$"
+            }
+          ]
+        }
+      }
+    },
+    "idempotency": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "\\{\\{\\s*args(\\.[A-Za-z0-9_-]+)+\\s*\\}\\}",
+          "description": "Template over the call arguments, e.g. {{args.order_id}}."
+        },
+        "scope": {
+          "enum": [
+            "run",
+            "actor",
+            "global"
+          ],
+          "default": "run"
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retention_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_export": {
+          "enum": [
+            "required",
+            "optional"
+          ]
+        },
+        "redaction": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\$(args|result)(\\.[A-Za-z0-9_-]+)+$"
+          }
+        }
+      }
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "effect": { "enum": ["reversible", "compensable"] } }, "required": ["effect"] },
-      "then": { "required": ["compensation"] },
-      "else": { "not": { "required": ["compensation"] } }
+      "if": {
+        "properties": {
+          "effect": {
+            "enum": [
+              "reversible",
+              "compensable"
+            ]
+          }
+        },
+        "required": [
+          "effect"
+        ]
+      },
+      "then": {
+        "required": [
+          "compensation"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "compensation"
+          ]
+        }
+      }
     },
     {
-      "if": { "properties": { "effect": { "const": "irreversible" } }, "required": ["effect"] },
-      "then": { "properties": { "approval": { "const": "always" } } }
+      "if": {
+        "properties": {
+          "effect": {
+            "const": "irreversible"
+          }
+        },
+        "required": [
+          "effect"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approval": {
+            "const": "always"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "retry"
+        ]
+      },
+      "then": {
+        "properties": {
+          "effect": {
+            "enum": [
+              "read_only",
+              "idempotent"
+            ]
+          }
+        }
+      }
     }
   ]
 }

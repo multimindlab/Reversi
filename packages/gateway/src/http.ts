@@ -180,8 +180,14 @@ export function createHttpGateway(o: HttpGatewayOptions): { server: HttpServer; 
       } catch (e) {
         const status = (e as { status?: number }).status ?? 500;
         if (!res.headersSent) {
-          // An oversized upload is not read to the end: close the connection once the answer is out.
-          if (status === 413) res.once("finish", () => req.destroy());
+          // An oversized upload is answered at once and the rest is read and discarded (never buffered), so the client sees
+          // the 413 instead of a reset connection. A slow sender is cut off after five seconds.
+          if (status === 413) {
+            req.resume();
+            const t = setTimeout(() => req.destroy(), 5000);
+            t.unref();
+            req.once("close", () => clearTimeout(t));
+          }
           json(res, status, { error: status === 500 ? "internal error" : (e as Error).message }, status === 413 ? { Connection: "close" } : {});
         }
         if (status === 500) console.error(e);

@@ -27,7 +27,11 @@ export type LedgerEvent =
   | "compensated"
   | "compensation_failed"
   | "unrecoverable"
-  | "deferred";
+  | "deferred"
+  | "verified"
+  | "verification_failed"
+  | "unverified"
+  | "escalated";
 
 export interface LedgerRecord {
   seq: number;

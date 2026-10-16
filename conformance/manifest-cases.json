@@ -11,7 +11,9 @@
       "effect": "read_only",
       "permission": "orders:read",
       "approval": "never",
-      "requires": []
+      "requires": [],
+      "version": 1,
+      "status": "approved"
     }
   },
   {
@@ -26,7 +28,9 @@
       "effect": "idempotent",
       "permission": "flags:write",
       "approval": "never",
-      "requires": []
+      "requires": [],
+      "version": 1,
+      "status": "approved"
     }
   },
   {
@@ -49,13 +53,17 @@
       "permission": "pay:write",
       "approval": "never",
       "requires": [],
+      "version": 1,
+      "status": "approved",
       "compensation": {
         "tool": "refund",
         "argument_map": {
           "charge_id": "$result.charge_id",
           "amt": "$args.amount"
         },
-        "requires_approval": false
+        "requires_approval": false,
+        "kind": "compensation",
+        "residue": []
       }
     }
   },
@@ -76,10 +84,14 @@
       "permission": "docs:write",
       "approval": "never",
       "requires": [],
+      "version": 1,
+      "status": "approved",
       "compensation": {
         "tool": "delete_draft",
         "argument_map": {},
-        "requires_approval": false
+        "requires_approval": false,
+        "kind": "compensation",
+        "residue": []
       }
     }
   },
@@ -95,7 +107,9 @@
       "effect": "irreversible",
       "permission": "mail:send",
       "approval": "always",
-      "requires": []
+      "requires": [],
+      "version": 1,
+      "status": "approved"
     }
   },
   {
@@ -111,7 +125,9 @@
       "effect": "irreversible",
       "permission": "mail:send",
       "approval": "always",
-      "requires": []
+      "requires": [],
+      "version": 1,
+      "status": "approved"
     }
   },
   {
@@ -131,7 +147,9 @@
       "approval": "never",
       "requires": [
         "a"
-      ]
+      ],
+      "version": 1,
+      "status": "approved"
     }
   },
   {
@@ -299,10 +317,14 @@
       "permission": "pay:write",
       "approval": "never",
       "requires": [],
+      "version": 1,
+      "status": "approved",
       "compensation": {
         "tool": "refund",
         "argument_map": {},
-        "requires_approval": false
+        "requires_approval": false,
+        "kind": "compensation",
+        "residue": []
       }
     }
   },
@@ -312,6 +334,374 @@
       "effect": "read_only",
       "permission": "p",
       "description": 5
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "pay.create",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "version": 3,
+      "status": "deprecated",
+      "replaced_by": "pay.create_v2",
+      "owner": "payments",
+      "oncall": "pager:pay",
+      "risk": {
+        "data_class": "financial",
+        "blast_radius": "high",
+        "environment": "production"
+      },
+      "timeout_ms": "30s",
+      "idempotency": {
+        "key": "{{args.order_id}}:{{args.amount}}",
+        "scope": "actor"
+      },
+      "audit": {
+        "retention_days": 400,
+        "evidence_export": "required",
+        "redaction": [
+          "$args.client_secret",
+          "$result.client_secret"
+        ]
+      },
+      "approval": {
+        "roles": [
+          "finance-approver"
+        ],
+        "quorum": 2,
+        "timeout": "15m",
+        "on_timeout": "escalate",
+        "escalate_to": [
+          "cfo"
+        ]
+      },
+      "requires": [
+        "a",
+        {
+          "tool": "b",
+          "status": "succeeded"
+        }
+      ],
+      "schema_hash": "abc123",
+      "compensation": {
+        "tool": "pay.cancel",
+        "argument_map": {},
+        "kind": "compensation",
+        "residue": [
+          "customer may get a notification"
+        ],
+        "timeout_ms": "10s",
+        "verification": {
+          "tool": "pay.get",
+          "arguments": {
+            "id": "$result.id"
+          },
+          "expect": {
+            "status": "canceled"
+          },
+          "retries": 4,
+          "backoff_ms": "2s"
+        }
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "pay.create",
+      "effect": "compensable",
+      "permission": "pay:write",
+      "approval": "always",
+      "requires": [
+        "a",
+        "b"
+      ],
+      "version": 3,
+      "status": "deprecated",
+      "approval_rules": {
+        "roles": [
+          "finance-approver"
+        ],
+        "quorum": 2,
+        "timeout_ms": 900000,
+        "on_timeout": "escalate",
+        "escalate_to": [
+          "cfo"
+        ]
+      },
+      "replaced_by": "pay.create_v2",
+      "owner": "payments",
+      "oncall": "pager:pay",
+      "schema_hash": "abc123",
+      "risk": {
+        "data_class": "financial",
+        "blast_radius": "high",
+        "environment": "production"
+      },
+      "timeout_ms": 30000,
+      "idempotency": {
+        "key": "{{args.order_id}}:{{args.amount}}",
+        "scope": "actor"
+      },
+      "audit": {
+        "retention_days": 400,
+        "evidence_export": "required",
+        "redaction": [
+          "$args.client_secret",
+          "$result.client_secret"
+        ]
+      },
+      "compensation": {
+        "tool": "pay.cancel",
+        "argument_map": {},
+        "requires_approval": false,
+        "kind": "compensation",
+        "residue": [
+          "customer may get a notification"
+        ],
+        "verification": {
+          "tool": "pay.get",
+          "arguments": {
+            "id": "$result.id"
+          },
+          "expect": {
+            "status": "canceled"
+          },
+          "retries": 4,
+          "backoff_ms": 2000
+        },
+        "timeout_ms": 10000
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {},
+        "kind": "inverse"
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p",
+      "approval": "never",
+      "requires": [],
+      "version": 1,
+      "status": "approved",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {},
+        "requires_approval": false,
+        "kind": "inverse",
+        "residue": []
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {},
+        "kind": "inverse",
+        "residue": [
+          "something"
+        ]
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "retry": {
+        "attempts": 4,
+        "base_ms": 100,
+        "max_ms": "2s"
+      }
+    },
+    "valid": true,
+    "normalized": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "approval": "never",
+      "requires": [],
+      "version": 1,
+      "status": "approved",
+      "retry": {
+        "attempts": 4,
+        "base_ms": 100,
+        "max_ms": 2000
+      }
+    }
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "compensable",
+      "permission": "p",
+      "retry": {
+        "attempts": 4
+      },
+      "compensation": {
+        "tool": "y",
+        "argument_map": {}
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "retry": {
+        "attempts": 0
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "idempotency": {
+        "key": "no template"
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "idempotency": {
+        "key": "{{args.id}}",
+        "scope": "galaxy"
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "status": "retired"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "version": 0
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "risk": {
+        "blast_radius": "enormous"
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "timeout_ms": "soon"
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "approval": {
+        "quorum": 3
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "approval": {
+        "roles": [
+          "a"
+        ],
+        "quorum": 11
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "read_only",
+      "permission": "p",
+      "audit": {
+        "redaction": [
+          "client_secret"
+        ]
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {},
+        "verification": {
+          "tool": "g",
+          "expect": {}
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "input": {
+      "tool": "x",
+      "effect": "reversible",
+      "permission": "p",
+      "compensation": {
+        "tool": "y",
+        "argument_map": {},
+        "verification": {
+          "tool": "g",
+          "expect": {
+            "a": 1
+          },
+          "retries": 99
+        }
+      }
     },
     "valid": false
   },
