@@ -2,5 +2,5 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "rootDir": "src", "outDir": "dist" },
   "include": ["src"],
-  "references": [{ "path": "../reversi" }]
+  "references": [{ "path": "../reversi" }, { "path": "../gateway" }, { "path": "../server" }]
 }

@@ -178,3 +178,4 @@ export { hasErrors, lintManifests, type KnownTool, type LintFinding } from "./li
 export { compensateMetaOf, hintsOf, schemaHash, suggestManifests, type CompensateMeta, type Hints, type McpToolInfo, type SuggestOptions, type Suggestion } from "./suggest.js";
 export { banner, classifyTools, type ClassifiedTool, type ToolClass } from "./classify.js";
 export { runManifestTests, type ManifestTestCase, type ManifestTestResult } from "./manifesttest.js";
+export { buildPeriodReport, renderPeriodHtml, renderPeriodMarkdown, type PeriodReport, type TopEntry } from "./weekly.js";

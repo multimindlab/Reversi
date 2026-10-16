@@ -20,6 +20,7 @@ import {
   parseJsonl,
   parsePolicy,
   renderReport,
+  renderReportPdf,
   runPolicyTests,
   storeKindFrom,
   toJsonl,
@@ -29,18 +30,20 @@ import {
   type EngineHandle,
   type RollbackPlan,
 } from "@multimindlab/reversi";
+import { Fail, makeContext, type EngineFlags, type IO } from "./context.js";
+import { registerInspectCommands, periodReportCommand } from "./commands/inspect.js";
+import { registerGovernanceCommands } from "./commands/governance.js";
+import { registerManifestCommands } from "./commands/manifests.js";
+import { registerSimulationCommands } from "./commands/simulate.js";
+import { registerProjectCommands } from "./commands/project.js";
 
-export interface IO {
-  out: (s: string) => void;
-  err: (s: string) => void;
-}
+export type { IO } from "./context.js";
+export { Fail };
 
 const DEFAULT_IO: IO = {
   out: (s) => process.stdout.write(s + "\n"),
   err: (s) => process.stderr.write(s + "\n"),
 };
-
-class Fail extends Error {}
 
 /** Run a shell command with the compensation call as JSON on stdin. Exit 0 means the undo succeeded. */
 function runCompensator(cmd: string, call: CompensationCall, timeoutMs: number): Promise<void> {
@@ -78,54 +81,15 @@ function formatPlan(p: RollbackPlan): string[] {
 
 export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number> {
   const program = new Command();
-  let code = 0;
   program
     .name("reversi")
     .description("Reversibility, approvals and tamper-evident evidence for AI agent tool calls")
     .exitOverride()
     .configureOutput({ writeOut: (s) => io.out(s.replace(/\n$/, "")), writeErr: (s) => io.err(s.replace(/\n$/, "")) });
 
-  const storeOpts = (c: Command) =>
-    c
-      .option("-d, --data <dir>", "data directory", "./reversi-data")
-      .option("--store <kind>", "files | sqlite | postgres (default: REVERSI_STORE or files)")
-      .option("--database-url <url>", "PostgreSQL URL (default: REVERSI_DATABASE_URL)");
-  const dataOpts = (c: Command) => storeOpts(c.requiredOption("-m, --manifests <path>", "manifest file or directory (.json, .yaml)"));
-
-  interface StoreFlags {
-    data: string;
-    store?: string;
-    databaseUrl?: string;
-  }
-  const dataOptionsOf = (o: StoreFlags) => {
-    const env = dataOptionsFromEnv();
-    return {
-      dir: o.data,
-      store: o.store ? storeKindFrom(o.store) : env.store,
-      postgres_url: o.databaseUrl ?? env.postgres_url,
-    };
-  };
-  const dataExists = (o: StoreFlags) => {
-    const d = dataOptionsOf(o);
-    if (d.store === "files" && !existsSync(o.data)) throw new Fail(`data directory not found: ${o.data}`);
-  };
-  /** Open the engine; the caller closes the store. Policy only matters for new calls, which the CLI never makes. */
-  const engine = async (o: StoreFlags & { manifests: string }): Promise<EngineHandle> => {
-    dataExists(o);
-    return openEngine({ manifests: o.manifests, data: dataOptionsOf(o) });
-  };
-  const withEngine = async <T>(o: Parameters<typeof engine>[0], fn: (e: EngineHandle) => Promise<T> | T): Promise<T> => {
-    const e = await engine(o);
-    try {
-      return await fn(e);
-    } finally {
-      e.data.close();
-    }
-  };
-  const readDoc = (path: string): unknown => {
-    const text = readFileSync(path, "utf8");
-    return extname(path).toLowerCase() === ".json" ? JSON.parse(text) : parseYaml(text);
-  };
+  program.option("--config <file>", "project configuration file (default: reversi.config.yaml in this or a parent folder)");
+  const ctx = makeContext(program, io);
+  const { storeOpts, dataOpts, dataOptionsOf, dataExists, withEngine, readDoc } = ctx;
 
   program
     .command("validate <path>")
@@ -157,20 +121,9 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
     if (v.ok) io.out(`ok: ${v.records} records, head ${v.head}`);
     else {
       io.err(`TAMPERED or corrupt at record ${v.seq}: ${v.error}`);
-      code = 1;
+      ctx.code = 1;
     }
   });
-
-  dataOpts(program.command("runs").description("list runs and their step counts")).action((o) =>
-    withEngine(o, (rv) => {
-      for (const id of rv.reversi.runIds()) {
-        const run = rv.reversi.openRun(id);
-        const s = run.state();
-        const un = run.unresolved();
-        io.out(`${id}  actor=${s.actor}  mode=${s.mode}  steps=${s.steps.length}${un.length ? `  UNRESOLVED=${un.join(",")}` : ""}`);
-      }
-    }),
-  );
 
   dataOpts(program.command("plan <run_id>").description("show what a rollback would do; executes nothing"))
     .option("--json", "machine-readable output")
@@ -179,7 +132,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
         const p = rv.reversi.openRun(run_id).plan();
         if (o.json) io.out(JSON.stringify(p, null, 2));
         else for (const l of formatPlan(p)) io.out(l);
-        if (!p.fully_reversible) code = 2;
+        if (!p.fully_reversible) ctx.code = 2;
       }),
     );
 
@@ -220,7 +173,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
           if (report.awaiting_approval.length) io.out(`awaiting approval: ${report.awaiting_approval.join(", ")}`);
           io.out(report.complete ? "rollback complete" : "rollback INCOMPLETE");
         }
-        if (!report.complete) code = 2;
+        if (!report.complete) ctx.code = 2;
       });
     });
 
@@ -301,7 +254,7 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
       for (const r of results) io.out(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `: expected ${r.expected}, got ${r.got}${r.message ? ` (${r.message})` : ""}`}`);
       const bad = results.filter((r) => !r.ok).length;
       io.out(bad ? `${bad} of ${results.length} failed` : `${results.length} passed`);
-      if (bad) code = 1;
+      if (bad) ctx.code = 1;
     });
   policy
     .command("check <policy>")
@@ -370,23 +323,40 @@ export async function main(argv: string[], io: IO = DEFAULT_IO): Promise<number>
       const r = verifyBundle(JSON.parse(readFileSync(file, "utf8")), { trusted_public_pem: o.pub ? readFileSync(o.pub, "utf8") : undefined });
       if (!r.ok) {
         io.err(`INVALID: ${r.error}`);
-        code = 1;
+        ctx.code = 1;
         return;
       }
       io.out(`ok: ${r.records} records, ${r.chain === "full" ? "hash chain verified" : "record hashes verified (single run)"}, key ${r.key_id}${r.trusted_key ? " (trusted)" : " (NOT checked against a trusted key)"}`);
     });
 
-  dataOpts(program.command("report <run_id>").description("write a self-contained HTML report for auditors").requiredOption("--out <file>", "output file")).action((run_id: string, o) =>
-    withEngine(o, (rv) => {
+  dataOpts(
+    program
+      .command("report [run_id]")
+      .description("an auditor report for one run (HTML or PDF by file extension), or with no run id the report for a period: what agents did, what was blocked or would have been, approvals, rollbacks")
+      .option("--out <file>", "output file (.html, .pdf, .md, .json)")
+      .option("--since <when>", "for the period report: 7d, 2026-10-01, ... (default 7d)")
+      .option("--format <fmt>", "for the period report: md | html | json"),
+  ).action(async (run_id: string | undefined, o: EngineFlags & { out?: string; since?: string; format?: string }) => {
+    if (!run_id) return periodReportCommand(ctx, o);
+    if (!o.out) throw new Fail("--out <file> is required for a run report");
+    await withEngine(o, (rv) => {
       const run = rv.reversi.openRun(run_id);
-      writeFileSync(o.out, renderReport({ run: run.state(), records: rv.reversi.ledger.forRun(run_id), plan: run.plan(), ledger_head: rv.reversi.ledger.head() }));
+      const args = { run: run.state(), records: rv.reversi.ledger.forRun(run_id), plan: run.plan(), ledger_head: rv.reversi.ledger.head() };
+      if (o.out?.toLowerCase().endsWith(".pdf")) writeFileSync(o.out, renderReportPdf({ ...args, region: rv.egress.region }));
+      else writeFileSync(o.out as string, renderReport(args));
       io.out(`wrote ${o.out}`);
-    }),
-  );
+    });
+  });
+
+  registerProjectCommands(program, ctx);
+  registerManifestCommands(program, ctx);
+  registerInspectCommands(program, ctx);
+  registerSimulationCommands(program, ctx);
+  registerGovernanceCommands(program, ctx);
 
   try {
     await program.parseAsync(argv, { from: "user" });
-    return code;
+    return ctx.code;
   } catch (e) {
     if (e instanceof CommanderError) return e.exitCode === 0 ? 0 : 64;
     if (e instanceof ManifestError || e instanceof PolicyError) {
