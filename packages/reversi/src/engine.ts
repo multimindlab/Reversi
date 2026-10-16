@@ -19,7 +19,9 @@ import { Ledger, type LedgerEvent } from "./ledger.js";
 import { redactSecrets } from "./redact.js";
 import { Registry, resolveRef } from "./manifest.js";
 import type { Verification } from "./manifest.js";
-import type { Policy, PolicyInput } from "./policy.js";
+import type { KvStore } from "./kv.js";
+import type { ApprovalRequirement, Policy, PolicyInput } from "./policy.js";
+import { globAny } from "./glob.js";
 import { SealedScope } from "./scope.js";
 import {
   MemoryRunStore,
@@ -69,6 +71,14 @@ export interface ApprovalRequest {
   triggers?: string[];
   /** Names of the arguments (never values). */
   arg_keys?: string[];
+  /** The actor of the run, so the requester cannot approve their own request. */
+  requested_by?: string;
+  /** Roles or groups that may approve; empty means any approver. */
+  required_roles?: string[];
+  quorum?: number;
+  timeout_ms?: number;
+  on_timeout?: "deny" | "escalate";
+  escalate_to?: string[];
 }
 /** `true`/`false`, or a decision with a message that is shown to the caller when not approved. */
 export type ApprovalDecision = boolean | { approved: boolean; message?: string };
@@ -87,6 +97,23 @@ export interface ReversiOptions {
   environment?: string;
   /** If this file exists, every new call is blocked (rollback still works). */
   kill_switch_file?: string;
+  /** Shared settings store: halts are kept here so every process using the same data store sees them. */
+  kv?: KvStore;
+}
+
+/** What a halt applies to. An empty scope halts everything. */
+export interface HaltScope {
+  tool?: string;
+  actor?: string;
+  tenant?: string;
+  environment?: string;
+}
+export interface Halt {
+  id: string;
+  reason: string;
+  scope: HaltScope;
+  by: string;
+  ts_ms: number;
 }
 
 export interface StartRunOptions {
@@ -96,6 +123,8 @@ export interface StartRunOptions {
   /** `enforce` blocks violations. `observe` journals them as `would_block` and lets the call run. */
   mode?: Mode;
   reason?: string;
+  /** Customer or team the run belongs to. */
+  tenant?: string;
 }
 
 export interface BeginInput {
@@ -196,6 +225,19 @@ export interface RollbackReport {
 
 export function idempotencyKey(run_id: string, step: number, tool: string): string {
   return sha256Hex(canonicalize([run_id, step, tool]));
+}
+
+/** Several approval requirements on one call: any listed role may approve, the biggest quorum wins, the shortest timeout wins. */
+export function mergeRequirements(reqs: ApprovalRequirement[]): Pick<ApprovalRequest, "required_roles" | "quorum" | "timeout_ms" | "on_timeout" | "escalate_to"> {
+  if (reqs.length === 0) return {};
+  const timeouts = reqs.map((r) => r.timeout_ms).filter((t): t is number => t !== undefined);
+  return {
+    required_roles: [...new Set(reqs.flatMap((r) => r.roles))],
+    quorum: Math.max(...reqs.map((r) => r.quorum)),
+    ...(timeouts.length ? { timeout_ms: Math.min(...timeouts) } : {}),
+    on_timeout: reqs.some((r) => r.on_timeout === "deny" || r.on_timeout === undefined) ? "deny" : "escalate",
+    escalate_to: [...new Set(reqs.flatMap((r) => r.escalate_to ?? []))],
+  };
 }
 
 /** `{{args.a.b}}` placeholders rendered from the call arguments; undefined if any is missing or not a scalar. */
@@ -315,9 +357,11 @@ export class Reversi {
   private readonly approver: Approver | undefined;
   private readonly clock: () => number;
   private readonly killFile: string | undefined;
-  private haltReason: string | null = null;
+  private readonly memoryHalts = new Map<string, Halt>();
+  private readonly kv: KvStore | undefined;
 
   constructor(opts: ReversiOptions) {
+    this.kv = opts.kv;
     this.policy = opts.policy;
     this.content = opts.content;
     this.environment = opts.environment ?? "default";
@@ -343,6 +387,7 @@ export class Reversi {
         parent_seal: opts.scope.parentSeal,
       },
       created_ms: this.clock(),
+      ...(opts.tenant ? { tenant: opts.tenant } : {}),
       steps: [],
     };
     this.ledger.append({
@@ -368,16 +413,46 @@ export class Reversi {
     return this.runs.list();
   }
 
-  /** Emergency stop: block every new call until {@link Reversi.resume}. Rollbacks are not affected. */
-  halt(reason: string): void {
-    this.haltReason = reason || "halted by operator";
+  /**
+   * Emergency stop: block new calls until {@link Reversi.resume}. With no scope it stops everything; a scope narrows it to
+   * a tool (glob), actor, tenant or environment. Rollbacks are never affected. Halts live in the shared settings store when
+   * there is one, so every process sees them.
+   */
+  halt(reason: string, scope: HaltScope = {}, by = "operator"): Halt {
+    const h: Halt = { id: `halt_${randomUUID()}`, reason: reason || "halted by operator", scope, by, ts_ms: this.clock() };
+    if (this.kv) this.kv.put("halts", h.id, h);
+    else this.memoryHalts.set(h.id, h);
+    return h;
   }
-  resume(): void {
-    this.haltReason = null;
+
+  /** Lift one halt by id, or all of them. Returns how many were lifted. */
+  resume(id?: string): number {
+    const all = this.halts().filter((h) => !id || h.id === id);
+    for (const h of all) {
+      if (this.kv) this.kv.delete("halts", h.id);
+      else this.memoryHalts.delete(h.id);
+    }
+    return all.length;
   }
-  /** The reason new calls are blocked, or null. Also true while the kill-switch file exists. */
-  halted(): string | null {
-    if (this.haltReason !== null) return this.haltReason;
+
+  halts(): Halt[] {
+    return this.kv ? this.kv.list<Halt>("halts").map((e) => e.value) : [...this.memoryHalts.values()];
+  }
+
+  /** The reason new calls (matching `ctx`, if given) are blocked, or null. The kill-switch file halts everything. */
+  halted(ctx?: { tool?: string; actor?: string; tenant?: string; environment?: string }): string | null {
+    for (const h of this.halts()) {
+      const s = h.scope;
+      const applies =
+        (s.tool === undefined || (ctx?.tool !== undefined && globAny(s.tool, ctx.tool))) &&
+        (s.actor === undefined || (ctx?.actor !== undefined && globAny(s.actor, ctx.actor))) &&
+        (s.tenant === undefined || (ctx?.tenant !== undefined && globAny(s.tenant, ctx.tenant))) &&
+        (s.environment === undefined || (ctx?.environment !== undefined && globAny(s.environment, ctx.environment)));
+      if (applies) {
+        const scope = Object.entries(s).map(([k, v]) => `${k}=${v}`).join(", ");
+        return scope ? `${h.reason} (scope: ${scope})` : h.reason;
+      }
+    }
     if (this.killFile && existsSync(this.killFile)) return `kill switch file ${this.killFile} exists`;
     return null;
   }
@@ -501,7 +576,7 @@ export class Run {
     const triggers: string[] = [];
     const notes: string[] = [...(call.extra_notes ?? [])];
     if (manifest?.status === "deprecated") notes.push(`manifest deprecated${manifest.replaced_by ? `; use ${manifest.replaced_by}` : ""}`);
-    const halted = this.rv.halted();
+    const halted = this.rv.halted({ tool: call.tool, actor: state.actor, tenant: state.tenant, environment: this.rv.environment });
     if (halted) violations.push(`kill switch: ${halted}`);
     const policyInput: PolicyInput = {
       tool: call.tool,
@@ -511,11 +586,26 @@ export class Run {
       run_id: this.run_id,
       environment: this.rv.environment,
       args: call.args,
+      tenant: state.tenant,
+      data_class: manifest?.risk?.data_class,
+      blast_radius: manifest?.risk?.blast_radius,
     };
+    const requirements: ApprovalRequirement[] = [];
+    let riskScore: number | undefined;
     if (this.rv.policy) {
       const d = this.rv.policy.evaluate(policyInput);
       violations.push(...d.deny);
       triggers.push(...d.approve);
+      requirements.push(...d.requirements);
+      notes.push(...d.warnings);
+      if (d.risk) {
+        riskScore = d.risk.score;
+        notes.push(`risk ${d.risk.score}${d.risk.factors.length ? ` (${d.risk.factors.join(", ")})` : ""}`);
+      }
+    }
+    if (manifest?.approval_rules) {
+      const a = manifest.approval_rules;
+      requirements.push({ roles: a.roles, quorum: a.quorum, timeout_ms: a.timeout_ms, on_timeout: a.on_timeout, escalate_to: a.escalate_to, source: `manifest \`${manifest.tool}\`` });
     }
     if (this.rv.content) {
       const succeeded = state.steps.filter((x) => x.status === "succeeded").map((x) => x.tool);
@@ -548,6 +638,8 @@ export class Run {
             args_hash: argsHash,
             triggers,
             arg_keys: isArgObject(call.args) ? Object.keys(call.args).slice(0, 50) : [],
+            requested_by: state.actor,
+            ...mergeRequirements(requirements),
           })
         : false;
       const approved = typeof decision === "boolean" ? decision : decision.approved;
@@ -611,6 +703,7 @@ export class Run {
           }
         : {}),
       ...(idemKey ? { idem_key: idemKey } : {}),
+      ...(riskScore !== undefined ? { risk_score: riskScore } : {}),
     });
     this.rv.runs.put(st);
     return observed.length ? { decision: "would_block", step, reasons: observed } : { decision: "allow", step };

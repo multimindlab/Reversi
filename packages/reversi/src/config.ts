@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { Approvals } from "./approvals.js";
+import { Delegations } from "./delegations.js";
 import { webhookNotifier } from "./notify.js";
 import { ContentChecker } from "./content.js";
 import { openData, type Data, type DataOptions } from "./data.js";
@@ -33,6 +34,7 @@ export interface EngineConfig {
 export interface EngineHandle {
   reversi: Reversi;
   approvals: Approvals;
+  delegations: Delegations;
   registry: Registry;
   data: Data;
 }
@@ -47,24 +49,42 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
   const registry = loadRegistry(cfg.manifests);
   const data = await openData(cfg.data);
   const ledger = new Ledger(data.ledger);
+  const delegations = new Delegations(data.kv);
   const approvals = new Approvals(data.approvals, {
-    on_decision: (rec, decision) =>
+    delegations,
+    on_decision: (rec, decision) => {
+      const bg = rec.break_glass;
+      const last = rec.decisions?.[rec.decisions.length - 1];
       ledger.append({
         ts_ms: Date.now(),
         run_id: rec.run_id,
         step: rec.step,
-        actor: rec.decided_by ?? "approver",
+        actor: last?.by ?? rec.decided_by ?? "approver",
         tool: rec.tool,
         reason: rec.decision_note || `operator ${decision} request ${rec.id}`,
         event: decision === "approved" ? "approved" : "blocked",
-        detail: `approval ${rec.id} ${decision} by ${rec.decided_by}${decision === "approved" ? "; the call must be retried" : ""}`,
+        detail: bg
+          ? `BREAK-GLASS: approval ${rec.id} forced by ${bg.by}; evidence: ${bg.evidence}`
+          : `approval ${rec.id} ${decision} by ${rec.decided_by}${last?.on_behalf_of ? ` (on behalf of ${last.on_behalf_of})` : ""}${(rec.quorum ?? 1) > 1 ? ` [quorum ${rec.quorum}]` : ""}${decision === "approved" ? "; the call must be retried" : ""}`,
+      });
+    },
+    on_escalate: (rec) =>
+      ledger.append({
+        ts_ms: Date.now(),
+        run_id: rec.run_id,
+        step: rec.step,
+        actor: "reversi",
+        tool: rec.tool,
+        reason: `approval ${rec.id} was not answered in time`,
+        event: "escalated",
+        detail: `escalated to ${(rec.required_roles ?? []).join(", ") || "any approver"}`,
       }),
     ttl_ms: cfg.approval_ttl_ms,
     on_request: cfg.approval_webhook ? webhookNotifier({ url: cfg.approval_webhook, console_url: cfg.console_url }) : undefined,
   });
   const file = cfg.policy ? loadPolicyFile(cfg.policy) : undefined;
   const merged = mergePolicyDocs(file?.doc, cfg.extra_policy);
-  const pol = merged ? { policy: new Policy(merged), content: merged.content ? new ContentChecker(merged.content) : undefined } : undefined;
+  const pol = merged ? { policy: new Policy(merged, undefined, data.kv), content: merged.content ? new ContentChecker(merged.content) : undefined } : undefined;
   const reversi = new Reversi({
     registry,
     ledger,
@@ -74,8 +94,9 @@ export async function openEngine(cfg: EngineConfig): Promise<EngineHandle> {
     content: pol?.content,
     environment: cfg.environment,
     kill_switch_file: cfg.kill_switch_file,
+    kv: data.kv,
   });
-  return { reversi, approvals, registry, data };
+  return { reversi, approvals, delegations, registry, data };
 }
 
 /** Engine settings from the environment (REVERSI_MANIFESTS, REVERSI_POLICY, REVERSI_ENV, REVERSI_KILL_FILE, plus the data variables). */

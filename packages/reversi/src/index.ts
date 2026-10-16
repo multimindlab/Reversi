@@ -50,9 +50,12 @@ export {
   ReversiError,
   Run,
   expectMismatch,
+  mergeRequirements,
   idempotencyKey,
   renderIdempotencyKey,
   type ApprovalDecision,
+  type Halt,
+  type HaltScope,
   type ApprovalRequest,
   type Approver,
   type BeginInput,
@@ -79,6 +82,8 @@ export {
   mergePolicyDocs,
   parsePolicy,
   runPolicyTests,
+  type ApprovalRequirement,
+  type Budget,
   type Condition,
   type Limit,
   type Match,
@@ -97,6 +102,7 @@ export {
   FileApprovalStore,
   MemoryApprovalStore,
   type ApprovalRecord,
+  type ApproverIdentity,
   type ApprovalStatus,
   type ApprovalStore,
   type ApprovalsOptions,
@@ -127,3 +133,7 @@ export {
   type Role,
 } from "./auth.js";
 export { approvalMessage, webhookNotifier, type WebhookOptions } from "./notify.js";
+export { Delegations, type Delegation } from "./delegations.js";
+export { WindowCounters } from "./counters.js";
+export { DEFAULT_WEIGHTS, parseRisk, scoreRisk, type RiskConfig, type RiskInput, type RiskResult } from "./risk.js";
+export { frozenAt, inWindow, type Day, type Freeze, type Window } from "./schedule.js";

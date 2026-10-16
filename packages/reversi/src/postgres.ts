@@ -196,11 +196,14 @@ export class PgApprovalStore implements ApprovalStore {
   list(): ApprovalRecord[] {
     return this.pg.query<{ record: ApprovalRecord }>("SELECT record FROM approvals").map((r) => r.record);
   }
-  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean {
-    return (
-      this.pg.query("UPDATE approvals SET record = record || $1::jsonb WHERE id = $2 AND record->>'status' = $3 RETURNING id", [JSON.stringify(patch), id, from])
-        .length === 1
-    );
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean {
+    const params: unknown[] = [JSON.stringify(patch), id, from];
+    let extra = "";
+    if (expectCount !== undefined) {
+      params.push(expectCount);
+      extra = " AND COALESCE((record->>'decision_count')::int, 0) = $4";
+    }
+    return this.pg.query(`UPDATE approvals SET record = record || $1::jsonb WHERE id = $2 AND record->>'status' = $3${extra} RETURNING id`, params).length === 1;
   }
 }
 

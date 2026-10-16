@@ -30,6 +30,10 @@ export interface Principal {
   /** Recorded as the ledger `actor` for agents and compensations. */
   name: string;
   roles: Role[];
+  /** Group names, for approval routing ("finance-approver"). From the key file or the identity provider. */
+  groups?: string[];
+  /** The customer or team this principal belongs to. Runs it opens carry it. */
+  tenant?: string;
   max_permissions?: string[];
   /** May open runs in `observe` mode. Observe mode lets violating calls run, so it is not for agents by default. */
   allow_observe?: boolean;
@@ -57,6 +61,8 @@ export interface ApiKey {
   max_permissions?: string[];
   /** Agent keys: allow opening runs in observe mode (default: enforce only). */
   allow_observe?: boolean;
+  groups?: string[];
+  tenant?: string;
   /** ISO date or epoch ms. The key is rejected before this time. Use with `expires_at` to rotate without downtime. */
   not_before?: string | number;
   /** ISO date or epoch ms. The key is rejected from this time on. */
@@ -79,6 +85,8 @@ interface Compiled {
   digest: Buffer;
   max_permissions?: string[];
   allow_observe: boolean;
+  groups: string[];
+  tenant?: string;
   not_before?: number;
   expires_at?: number;
   disabled: boolean;
@@ -107,6 +115,8 @@ export class KeyRing {
         digest,
         max_permissions: k.max_permissions,
         allow_observe: k.allow_observe === true,
+        groups: k.groups ?? [],
+        tenant: k.tenant,
         not_before: toMs(k.not_before, "not_before", k.name),
         expires_at: toMs(k.expires_at, "expires_at", k.name),
         disabled: k.disabled === true,
@@ -124,7 +134,7 @@ export class KeyRing {
   }
 
   private principal(k: Compiled): Principal {
-    return { name: k.name, roles: k.roles, max_permissions: k.max_permissions, allow_observe: k.allow_observe, via: "api_key", fingerprint: k.digest.toString("hex").slice(0, 32) };
+    return { name: k.name, roles: k.roles, groups: k.groups, ...(k.tenant ? { tenant: k.tenant } : {}), max_permissions: k.max_permissions, allow_observe: k.allow_observe, via: "api_key", fingerprint: k.digest.toString("hex").slice(0, 32) };
   }
 
   authenticate(token: string): Principal | null {
@@ -159,6 +169,8 @@ export interface OidcOptions {
   role_map: Record<string, Role>;
   /** Claim used as the principal name. Default `sub`. */
   actor_claim?: string;
+  /** Claim holding the tenant (customer or team). */
+  tenant_claim?: string;
   /** Caps for agent principals. */
   max_permissions?: string[];
   fetch?: typeof fetch;
@@ -260,7 +272,16 @@ export class OidcVerifier {
       if (roles.length === 0) return null;
       const name = claims[this.o.actor_claim ?? "sub"];
       if (typeof name !== "string" || !name) return null;
-      return { name, roles, max_permissions: this.o.max_permissions, via: "oidc", exp_ms: claims.exp * 1000 };
+      const tenant = this.o.tenant_claim ? claims[this.o.tenant_claim] : undefined;
+      return {
+        name,
+        roles,
+        groups: values, // every value of the role claim is also a group name, so approvals can be routed to it
+        ...(typeof tenant === "string" && tenant ? { tenant } : {}),
+        max_permissions: this.o.max_permissions,
+        via: "oidc",
+        exp_ms: claims.exp * 1000,
+      };
     } catch {
       return null;
     }

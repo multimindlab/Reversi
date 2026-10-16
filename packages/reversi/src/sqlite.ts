@@ -111,10 +111,12 @@ export class SqliteApprovalStore implements ApprovalStore {
   list(): ApprovalRecord[] {
     return (this.db.prepare("SELECT record FROM approvals").all() as Array<{ record: string }>).map((r) => JSON.parse(r.record) as ApprovalRecord);
   }
-  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>): boolean {
+  transition(id: string, from: ApprovalStatus, patch: Partial<ApprovalRecord>, expectCount?: number): boolean {
     const res = this.db
-      .prepare("UPDATE approvals SET record = json_patch(record, ?) WHERE id = ? AND json_extract(record, '$.status') = ?")
-      .run(JSON.stringify(patch), id, from);
+      .prepare(
+        `UPDATE approvals SET record = json_patch(record, ?) WHERE id = ? AND json_extract(record, '$.status') = ?${expectCount === undefined ? "" : " AND COALESCE(json_extract(record, '$.decision_count'), 0) = ?"}`,
+      )
+      .run(...([JSON.stringify(patch), id, from, ...(expectCount === undefined ? [] : [expectCount])] as [string, string, string]));
     return Number(res.changes) === 1;
   }
 }
